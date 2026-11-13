@@ -1,0 +1,384 @@
+e1	11
+e2	7
+e3	7
+e4	7
+e5	12
+e6	28
+a1	40
+a2	17
+g1	3
+s1	26
+h1	0
+f1	41
+r1	30
+l1	18
+m1	18
+fold_trait_object	91
+immutable_fold	63
+immutable_write_err	'immutable_write_err::N' is immutable, and here it is assigned to
+immutable_field_err	'immutable_field_err::ORIGIN' is immutable, and here it is assigned to
+immutable_method_err	is handed to 'Vec<long>.push', which writes its parameter 'self'
+immutable_lend_err	is lent with `&`
+immutable_nofold_err	'immutable_nofold_err::T' cannot be computed at compile time
+macro_value	63
+macro_assert	134
+macro_hygiene	37
+macro_runtime_err	needs a value the compiler can compute for 'x'
+macro_notmacro_err	'square!' names no macro
+macro_vec	19
+macro_map	47
+macro_vec_mismatch_err	'v' is a Vec<long>, and this gives it a Vec<int>
+macro_vec_syntax_err	an element is missing between two commas
+fold_heap_limit_err	a compile-time heap past 256 MiB (--fold-heap=MiB raises it)
+fnres/same_name	11
+fnres/ambiguous_err	'spell' is ambiguous between
+inferred_instance	2
+global_macro_late	45
+macro_no_ast_include	6
+typecheck_ok	228
+argcount_err	takes 1 argument(s), and this call gives 2
+argfew_err	takes 1 argument(s), and this call gives 0
+argtype_err	argument 0 of argtype_err::width is a int, but the parameter 's' is a str
+nofield_err	P has no field 'nosuch'
+nomethod_err	P has no method 'nomethod'
+noreturn_err	'noreturn_err::pick' returns a long, and control can reach the end of it without one
+assigntype_err	'n' is a long, and this gives it a P
+sumcast_err	cannot cast a struct to a long
+anybox_err	which `any` cannot carry
+lenddecay_err	`&` here lends a value rather than giving an address
+structbound_err	Plain does not implement 'Default', required by
+dupfn_err	is defined twice
+vis/pkg_ok	11
+vis/local_err	is file-private to selftests/vis/helpers.k
+vispkg_err	is package-private to 'vis'
+aliasclash_err	type name 'AtomicInt' is already a type alias, published by
+litrange_err	'c' is a char, and 300 is not one
+objsafe_static_err	'Maker' cannot be a trait object: 'make' takes no receiver
+objsafe_self_err	'Ord2' cannot be a trait object: 'cmp' takes a `Self` parameter
+implconv_err	does not fit 'Sink2': the trait lends parameter 0 ('r')
+retview_err	returns a borrowed view (Write)
+viewfield_err	'w' is Write, and storing one in a field
+retborrow_err	returns a borrow of this frame's own local ('r')
+retborrowsink_err	returns a borrow of a `sink` parameter
+dbllend_err	exclusivity violation in the call to dbllend_err::both
+borrowlocal_err	a borrow cannot be held in a local
+capwrite_err	a closure cannot assign to 's': a str is captured by value
+withaddr_err	can't take the address of 's' inside `with`
+extern_generic_err	'first' is generic, so it has no symbol to link against
+extern_local_err	'hidden' has no body, so it names something in another object
+fold_map_scalar_key	164
+derive_eq_enum_field	3
+ord_operators	6
+ordmissing_err	cannot order values of type
+arith_operators	41
+arithmissing_err	has no `Mul<
+not_operator	5
+notmissing_err	has no `Not`
+logicalnot_err	cannot apply `!` to
+fn_any_arity	37
+process_run	0
+hash128	0
+stdlib_review	0
+encode_roundtrip	0
+encode_handwritten	0
+derive_user_trait	0
+encode_rawptr_err	Link does not implement 'Encode', and 'deriveEncode' refused to derive it: Link.next is a raw pointer
+len_param	0
+len_param_fold	0
+len_negative_err	a length cannot be negative
+len_nonconst_err	so its value is not fixed — a length has to be a constant
+len_mismatch_err	is a Buf<16>, and this gives it a Buf<8>
+len_as_type_err	is a length parameter, not a type
+type_as_len_err	is a type parameter, not a length
+len_arg_kind_err	is a length parameter of Buf, and 'long' is a type
+encode_shapes	0
+stdlib_inline	0
+stdlib_net	0
+stdlib_sys	0
+stdlib_float	0
+match_borrow	0
+match_borrow_move_err	cannot move a Res out of a borrow
+match_borrow_write_err	while a match arm holds 'r', a borrow of the matched value's payload
+match_borrow_assign_err	it is a borrow of the matched value's payload
+borrow_sink_err	cannot move a W out of a borrow (handed to a parameter that takes it)
+match_global_write_err	'match_global_write_err::G' is immutable, and here it is handed to 'String.pushStr'
+cond_temps	0
+sizeof_value	0
+errpos_err	selftests/errpos_err.k:9:17: Error: 's' is a str, and this gives it a long
+errpos_move_err	selftests/errpos_move_err.k:10:9: Error: use of moved value 'r'
+errpos_request_err	selftests/errpos_request_err.k:7:5: Error: Plain does not implement 'Default'
+guard_variadic	0
+for_each	0
+for_hold_err	is handed to 'push', which writes it inside `for x in v`, which walks it
+for_readonly_err	in `for r in rs` an element is read-only
+for_lend_scalar_err	lends each element, which needs struct elements
+for_assign_err	cannot assign to 'r': it is a borrow of an element of rs
+for_slice_lend_err	writes through the slice 'xs', which is a read-only view
+for_call_err	walks a variable or a field of one
+for_move_err	cannot move a Res out of a borrow
+macro_format	0
+derive_refuse_format_err	Node2.next is a raw pointer (field 1 of 2)
+incl/list_ok	14
+incl/list_empty_err	an empty list includes nothing
+incl/list_dup_err	'vec' is listed twice
+incl/list_unknown_err	package 'stdlib' has no module 'nosuch'
+incl/list_nested_err	a brace list holds module names, not another list
+distinct_type	0
+distinct_assign_err	'm' is a Meters, and this gives it a int -- a distinct type converts only by `as`
+distinct_tobase_err	'x' is a long, and this gives it a Meters -- a distinct type converts only by `as`
+distinct_other_err	'f' is a Feet, and this gives it a Meters
+distinct_op_err	has no `Add<Meters>`
+distinct_eq_err	cannot compare values of type 'Meters'
+distinct_arg_err	but the parameter 'm' is a Meters
+distinct_struct_err	a distinct type is made over an integer, a `char` or a `bool`
+infer_from_param	0
+infer_from_param_err	cannot infer N for this call to 'fixedOf': no argument says what it is
+inout_assign	0
+inout_assign_scalar_err	receives the value itself (it is a scalar)
+inout_assign_move_err	out of a borrow (stored through a lent parameter)
+enum_backed_match	0
+guard_str_word	0
+infer_variant_param	0
+for_return	0
+for_return_err	inside `for x in v`, which walks it
+array_zero	0
+nomethod_bound_err	has no method 'extendSlice' here: it is declared for T: Copy only
+nomethod_field_err	has no method 'x' -- 'x' is a field
+traitobj_impl_err	which does not implement Write
+errmulti_err	3 errors
+errmulti_own_err	2 errors
+errnote_err	note: instantiated from selftests/errnote_err.k:9:5 (W<long>)
+errspell_err	is a Box<str>, but the parameter 'b' is a Box<long>
+tuple_any	0
+tuple_destructure	0
+tuple_encode	0
+tuple_ref_err	a tuple element is a value: '&P' cannot be one
+tuple_unit_err	`()` is not a type: a tuple has at least one element
+tuple_borrow_move_err	cannot move a Res out of a borrow (handed to a parameter that takes it)
+tuple_moved_err	use of moved value 't' in main
+tuple_arity_err	destructuring 3 name(s) from a 2-tuple
+tuple_notuple_err	destructuring needs a tuple, not 'P'
+partial_move	0
+partial_move_field_err	use of moved field 'acc.s' in main
+partial_move_whole_err	use of partly moved value 'acc' in main: its field 's' was moved out
+partial_move_cond_err	use of moved field 'acc.s' in main
+partial_move_loop_err	cannot move 'acc.t' inside a loop
+partial_move_nested_err	cannot move the Drop field 's' out of a nested field of 'o'
+partial_move_drop_err	Own implements Drop, whose `drop` must still run on the whole value, so it cannot be partly moved
+enum_static	0
+enum_static_clash_err	enum SA has a variant 'Unix', so it cannot also have a method of that name
+enum_static_infer_err	cannot infer T for this call to 'Option.nothing'
+method_generic	0
+method_generic_trait_err	a trait method with type parameters of its own is not supported
+method_generic_infer_err	cannot infer X for this call to
+method_generic_shadow_err	'T' is already a type parameter of the methods block
+partial_store_moved_err	cannot assign to the field 's' of 'acc': 'acc' was moved away
+partial_store_fresh_err	cannot assign to the field 's' of 'acc': 'acc' holds no value yet
+sibling_names	0
+init_sibling_err	use of possibly-uninitialized variable 'x'
+forg/walk	29
+forg/ambiguous_err	'gDup' is ambiguous
+sibling_moved	0
+index_widths	0
+str_index_store_err	cannot assign to a byte of the str 's': a str is an immutable view
+clone_rules	0
+clone_drop_err	Res has no Clone: it owns a resource (implements Drop)
+clone_field_err	Holder has no Clone: its field 'r' (Res) has no Clone: it owns a resource (implements Drop)
+clone_rawptr_err	Mixed has no Clone: its field 'p' is a raw pointer
+clone_vec_err	Vec<Res> has no method 'clone' here: it is declared for T: Clone only, and Res is not Clone
+sibling_moved_loops	0
+scalar_self	0
+scalar_self_store_err	cannot assign to 'self': a `&self` of long receives the value itself
+fn_bare_err	'twice' is a function: write `&twice` to use it as a fn value
+lit_field_type_err	b is a Box<Node>, and this gives it a Node
+asm_cycle	0
+raw_addr_drop	0
+move_then_read_err	use of moved value 'r' in main
+move_twice_err	use of moved value 'r' in main
+match_self_read	0
+fn_value_args	0
+match_borrow_explicit	0
+match_borrow_explicit_err	'x.k' is assigned to in main while a match arm holds 'r'
+omitted_fields	0
+omitted_drop_err	field 's' of type Sock must be given: it owns a resource and has no default
+destructure_assign	0
+destructure_mixed_err	'a' is a local here and 'b' is not
+destructure_mixed2_err	'b' is a local here and 'a' is not
+destructure_place_err	a destructure assigns to places
+coretr/main	42
+drop_no_include	3
+clone_drop_noinclude_err	R has no Clone: it owns a resource (implements Drop)
+trait_unknown_err	'Frob' is not a trait
+trait_unknown_hint_err	#include <stdlib::encode>
+trait_dup_impl_err	V already implements
+trait_own	0
+generic_unknown_err	Unknown type 'Result' -- the standard library has a module of that name: #include <stdlib::result>
+generic_unknown2_err	Unknown type 'Pear'
+generic_forward	9
+forg/later	43
+stmt_literal	12
+vis/global_local_err	gHidden' is file-private to selftests/vis/gdecl.k
+vis/global_plain_err	is file-private to selftests/vis/gdecl.k
+vis/global_ok	18
+for_global_write_err	'gItems' is written by
+for_global_write2_err	is written by 'step'
+match_arm_global_call_err	'gName' is written by 'reset'
+for_global_read	22
+fn_inout_err	parameter 0 is inout, and a fn type cannot lend a parameter to be written
+trait_inout	9
+trait_inout_err	the trait lends parameter 0 ('v') `inout`, and this implementation does not
+trait_inout2_err	this implementation declares parameter 0 ('v') `inout`, and the trait does not
+bounded_block_unmet	2
+generic_bound_err	needs T: Default, and int does not implement Default
+generic_bound_method_err	needs U: Show, and int does not implement Show
+generic_bound_ok	26
+array_lend	37
+array_lend_err	a type parameter or a struct cannot stand for an array
+macro_reads_macro_global	5
+array_zero_skip	0
+for_global_write3_err	is written by 'ping'
+lend_call_field	2
+bce_len_shrinks	134
+bce_index_bumped	134
+bce_inout_shrink	134
+bce_callee_clears	134
+bce_negative	134
+bce_wraps	134
+bce_array_past	134
+bce_same_index_moved	134
+bce_ok	0
+floats_basic	0
+floats_abi	0
+floats_fold	0
+float_int_literal_err	and this gives it a int
+float_mix_err	a float meets only a float of its own width
+float_mod_err	is not defined on f64
+float_widths_err	between a f32 and a f64
+float_bool_cast_err	cannot convert a f64 to a bool
+float_arg_width_err	but the parameter
+float_return_err	convert with `as`
+match_generic_field	25
+for_slice_generic	123
+for_elem_sibling_name	20
+for_vec_noinclude_err	Unknown type 'Vec' -- the standard library has a module of that name: #include <stdlib::vec>
+trait_same_method	50
+trait_same_method_err	P.text is ambiguous: Show and Debug2 each give P a 'text' -- say which, as `Show.text(x)`
+trait_same_method2_err	P.text is ambiguous: Show and Debug2
+trait_qualified_err	Q does not implement Show, so `Show.text(...)` has nothing to call
+trait_same_method3_err	P.text is ambiguous: Show, Debug2 and Later each give P a 'text'
+quote_splice_scalar	62
+quote_splice_call_err	splices a Node, or an integer, a bool or a str as a literal, and this is a long
+trait_own_static_generic	27
+flow_slot_root	80
+literal_wide_arith	7
+vis/private_ambig	30
+float_global_literal	31
+blanket_scalar	59
+blanket_dup_err	long already implements Twice
+blanket_category_err	'Number' is not a category of scalars
+enum_negative	45
+enum_negative_err	Bad.A = -1 does not fit the enum's u8
+literal_u64	63
+literal_u64_err	and 18446744073709551615 is not one
+literal_u64_neg_err	and -1 is not one
+literal_range_err	Integer literal '18446744073709551616' is out of range
+args_stack	74
+bool_box	0
+init_lend_field_err	use of possibly-uninitialized variable 'a'
+init_lend_whole_err	use of possibly-uninitialized variable 'p'
+init_lend_recv_err	use of possibly-uninitialized variable 'w'
+init_lend_unsafe_err	use of possibly-uninitialized variable 'a'
+init_lend_ok	36
+for_self_field_call	147
+for_self_field_call_err	handed to 'drop1', which writes it
+for_self_field_call2_err	handed to 'zap', which writes it
+for_self_field_call3_err	handed to 'wipe', which writes it
+len_call	128
+main_long	46
+main_type_err	its result is the process's exit status
+bool_not	13
+discard	43
+discard_void_err	discards a value, and this gives none
+match_expr	24
+match_expr_variant_err	enum Shape has no variant 'Square'
+match_expr_cover_err	does not cover Empty
+match_expr_arity_err	carries only 1 value(s)
+match_expr_type_err	`match` reads an enum, and this is a long
+match_expr_generic	82
+compound_assign	23
+compound_call_err	a compound assignment's place is reached through a call
+try_op	67
+try_kind_err	so the function must return a type implementing `Try` (a Result or an Option) -- this one returns int
+try_mismatch_err	this fails with a NoneResidual where the function returns Result<long, long>
+try_errtype_err	`?` hands the error back as it is, and this fails with a str
+try_order_err	and here a call or a store comes before it
+try_more	42
+inout_scalar	34
+inout_scalar_err	is an `inout` scalar -- lend it with '&'
+inout_scalar_type_err	lends a int, and the parameter 'n' is an `inout` long
+inout_scalar_raw_err	taking a raw address with '&'
+amp_uniform	21
+amp_sink_err	is a `sink`), and '&' lends
+distinct_with	92
+distinct_with_err	and 'Display' is not one of them
+ret_type_err	the return value of 'ret_type_err::f' is a int, and this gives it a str
+ret_narrow_err	is a int, and this gives it a long -- not every long is one: write `as int`
+ret_sign_err	is a u64, and this gives it a long
+ret_void_err	returns nothing, and this `return` gives it a int
+ret_missing_err	returns a long, and this `return` gives it nothing
+ret_struct_err	is a A, and this gives it a B
+ret_main_err	or declare `main -> long`
+static_missing_err	String has no static method 'from'
+ret_ok	42
+never_ok	42
+never_exit	42
+never_ret_err	is declared `-> never`, and this `return` would come back
+never_end_err	is declared `-> never`, and control can reach the end of it
+never_asm_err	is declared `-> never`, and control can reach the end of it
+builtin_syscall	42
+builtin_ct_exit_err	it met boom: odd
+builtin_ct_stdout_err	a write to stdout (fd 1)
+builtin_ct_refuse_err	the syscall 39 (getpid)
+builtin_macro_exit_err	macro 'check' stopped: check: too big
+builtin_bad_err	the compiler provides no builtin 'syscal'
+builtin_sig_err	`builtin atCompileTime` is declared `builtin atCompileTime -> bool`
+builtin_unsafe_err	so it is declared `unsafe`
+hooks	123
+hooks_exit	44
+hooks_sig_err	is a startup or shutdown hook
+attr_err	`@inline` is no attribute
+builtin_parse	42
+for_view	42
+for_view_err	may not
+try_trait	42
+try_trait_err	Absent
+thread_ok	42
+zero_tail	42
+for_view_nested	76
+global_move_err	cannot move the global
+global_move_ok	162
+float_global_agg	42
+array_assign	42
+array_assign_err	an array of 4 element(s) is given 3
+array_assign_scalar_err	it is assigned only to an array
+macro_float	42
+trait_core_same	42
+spell_payload_err	'args' is handed to 'push', which writes it inside `for a in args`
+spell_tuple_err	't.0' is handed to 'push', which writes it inside `for x in t.0`
+try_operand_err	`?` reads a value implementing `Try` (a Result or an Option) -- this is a long
+try_return_err	so the function must return a type implementing `Try` (a Result or an Option) -- this one returns P
+assert_nopanic_err	nothing is marked `@panic`
+trait_static	42
+trait_static_err	nothing says which type that is
+trait_static_ambig_err	say which, as `v: P = 
+struct_array_lit	42
+struct_array_lit_err	an array of 3 element(s) is given 2
+div_const	0
+bce_range_add_wraps	134
+bce_range_shl_wraps	134
+bce_range_mul_wraps	134
+bce_trans_past	134
+bce_trans_negative	134
+bce_trans_unsigned	134
+floats_xmm	0
+inline_shapes	0

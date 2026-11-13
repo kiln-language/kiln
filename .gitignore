@@ -1,0 +1,10 @@
+# Everything the build and test scripts write: gen1/gen2/gen3, the .klib cache, scratch output.
+/build/
+
+# Compiling a program by hand at the root.
+/*.s
+*.o
+a.out
+*.klib
+
+__pycache__/

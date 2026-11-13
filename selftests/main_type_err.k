@@ -1,0 +1,1 @@
+main -> str { return "no"; }

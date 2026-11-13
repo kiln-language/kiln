@@ -1,0 +1,23 @@
+Kiln compiler output exception
+
+This is an additional permission under section 7 of the GNU General Public
+License, version 3 ("GPL"), granted by the copyright holders of the Kiln
+compiler.
+
+When the Kiln compiler compiles a program, some of what it writes out (the
+program's startup routine, code templates and similar pieces) is copied from
+the compiler's own source. You may use, modify and distribute those pieces, as
+they appear in the compiler's output, under terms of your choice. The GPL does
+not apply to them.
+
+This permission covers only those pieces. The rest of the output stays under
+whatever license covers the program that was compiled. In particular:
+
+  - Code from the standard library (stdlib/) that is compiled into a program
+    stays under the Mozilla Public License 2.0; see stdlib/LICENSE.
+
+  - Compiling the Kiln compiler's own source produces a compiler that is still
+    covered by the GPL.
+
+If you modify the Kiln compiler, you may extend this permission to your
+version of it, but you are not obliged to.

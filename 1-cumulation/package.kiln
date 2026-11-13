@@ -1,0 +1,8 @@
+package cumul;
+
+depend support   ../0-support
+depend pre       ../2-preprocess
+depend lex       ../3-lex
+depend parse     ../4-parse
+depend transform ../5-transform
+depend codegen   ../6-codegen

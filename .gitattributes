@@ -1,0 +1,22 @@
+# Line endings: store text as LF in the repository and check it out as LF on every platform.
+# Kiln builds and runs under Linux (WSL), and the tools there (bash, nasm, the compilers'
+# own lexers) all expect LF. This overrides a local core.autocrlf.
+* text=auto eol=lf
+
+# Windows-only scripts keep CRLF.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Build products and other binaries: never touch.
+*.exe  binary
+*.o    binary
+*.obj  binary
+*.a    binary
+*.klib binary
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+
+# The seed compiler is an ELF binary; never touch its bytes.
+/bootstrap/kilnc binary
