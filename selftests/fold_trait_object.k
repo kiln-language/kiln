@@ -1,7 +1,7 @@
 // A global holding a trait object, folded at compile time: the object's data pointer relocates
 // to the global it borrows, its vtable word to the table's label (docs/comptime.md, step 3).
-// The C++ seed refuses this program -- a trait object stored in a global is a borrow that can
-// outlive its referent under its rules -- so it lives here, where only this compiler runs it.
+// The C++ seed refuses this program (under its rules, a trait object stored in a global is a
+// borrow that can outlive its referent), so it lives here, where only this compiler runs it.
 // The exit code is the two areas summed: 75 + 16.
 struct Circle { r: long }
 struct Square { side: long }

@@ -1,5 +1,5 @@
 // A flow miscompile: the optimizer keyed a hidden scratch slot's memory as 2^40 + its number, and
-// 2^40 was written `1 << 40`, which was computed as an `int` and came out 0 -- so scratch slot
+// 2^40 was written `1 << 40`, which was computed as an `int` and came out 0, so scratch slot
 // #137 and the local whose name is symbol 137 were one place to it, and `v.id` below was "known"
 // to hold the 1 a scratch slot was given for `Res { id: 1 }`. Which numbers meet depends on the
 // whole program; this is the program it was found in (tests/stdlib-option/option_own.k), with

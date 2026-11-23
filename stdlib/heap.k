@@ -1,4 +1,4 @@
-// Heap — a thread-cached segregated free-list allocator with an arena/slab fallback.
+// Heap: a thread-cached segregated free-list allocator with an arena/slab fallback.
 //
 //   [ TLS thread cache ]   fast:   size class -> pop from per-thread free list  (O(1), no lock)
 //        | empty
@@ -32,20 +32,20 @@ local SLAB_HEADER: long = 16;
 local ARENA:       long = 16777216;      // one mmap of slabs at a time
 local BATCH_BYTES: long = 32768;         // how much a batch moved between a thread and the pool holds
 
-// The large-region cache: at most this many regions and bytes held for reuse, none bigger than
-// CACHE_ONE. Past these, a freed region is unmapped as before.
+// The large-region cache holds at most this many regions and bytes for reuse, and no region
+// bigger than CACHE_ONE. A freed region beyond those limits is unmapped.
 local CACHE_COUNT: long = 32;
 local CACHE_BYTES: long = 67108864;      // 64 MiB
 local CACHE_ONE:   long = 16777216;      // 16 MiB
 // A large block at least this big grows by mremap, moving its pages rather than copying them.
-local REMAP_MIN:   long = 1048576;
+local REMAP_MIN:   long = 65536;         // grow a region this big by moving its pages, not copying
 
 // What the first word of a 64 KiB-aligned region says it is, beyond a size class (0..47).
 local LARGE_REGION:  long = 999;
 local STATIC_REGION: long = 1000;   // a block the compiler laid into .data (asm.k's emitBlocks)
 
 // The pool every thread shares, at [rel __heapCentral] (1 KiB the emitter reserves; this uses
-// 824 bytes of it). Per class a free-slot list head and a spinlock — so no lock is global — then
+// 824 bytes of it). Per class a free-slot list head and a spinlock (so no lock is global), then
 // the arena's bump pointer, its end, and the lock held while a fresh arena is mapped; then the
 // large-region cache: its lock, its list (linked through the regions' headers), and its totals.
 struct HeapCentral {
@@ -58,9 +58,13 @@ struct HeapCentral {
 struct LargeHeader { marker: long, base: long, size: long, next: long }
 local LARGE_PAYLOAD: long = 64;
 
-// Per thread, through fs: [cls*8] the free-list head, [TLS_COUNTS + cls*8] how many it holds.
-// The page is the TLS page heapInit maps; nothing else uses it.
+// Per thread, through fs: [cls*8] the free-list head, [TLS_COUNTS + cls*8] how many it holds,
+// [TLS_RECOVER] the innermost armed `recover` (0 when none). The page is the TLS page heapInit
+// maps. Every TLS page is a fresh mapping (the main thread's here, a spawned thread's in its
+// region), so each word starts at 0. `TLS_RECOVER` is package-visible for `recover.k`, which
+// keeps that chain.
 local TLS_COUNTS: long = CLASSES * 8;
+pkg TLS_RECOVER: long = 2 * CLASSES * 8;   // 768
 
 // mmap(2)'s protection and flag bits, the ones this file passes.
 enum MmapProt: long { Read = 1, Write = 2 }
@@ -91,7 +95,7 @@ local unsafe slotWord p:long -> *long { return p as *long; }
 // kernel refuses one, so that ends the program with a message rather than handing out address 0.
 local unsafe mapAnon size:long flags:long -> long {
     p: long = syscall6(Syscall.Mmap, 0, size, MmapProt.Read | MmapProt.Write, MmapFlag.Private | MmapFlag.Anonymous | flags, -1, 0);
-    if (p < 0) { panic("heap: the kernel refused memory (mmap failed)"); }
+    if (p < 0) { panic("heap: out of memory (mmap failed)"); }
     return p;
 }
 local roundUpTo v:long to:long -> long { return (v + to - 1) & ~(to - 1); }
@@ -132,11 +136,11 @@ local batchOf cls:long -> long {
 }
 
 // --- per-thread free list (fast path, no lock) ---
-// Each is one asm block rather than a call per thread-local word: this is the path every small
-// malloc and free takes. No labels (an inlined copy would repeat them), inputs in rdi/rsi only,
-// and no size keywords (a count is loaded, changed and stored through a register), so the same
-// text assembles under NASM and under LLVM (`--emit=llvm`). The count of class `cls` sits
-// TLS_COUNTS (384) bytes after its head; the asm spells the number.
+// Each is one asm block rather than a call per thread-local word, since every small malloc and
+// free takes this path. To assemble under both NASM and LLVM (`--emit=llvm`), the blocks use no
+// labels, since an inlined copy would repeat them, take inputs only in rdi/rsi, and use no size
+// keywords, loading and storing counts through a register instead. The count for class `cls`
+// sits TLS_COUNTS (384) bytes after its head, and the asm hardcodes that offset.
 local unsafe tlsPop cls:long -> long {
     off: long = cls * 8;
     h: long = tlsLoad(off);
@@ -189,18 +193,26 @@ local unsafe extendArena -> void {
         while (atomicLoad(l) != 0) { }               // another thread is mapping: wait for it
         return;
     }
-    if (c.bump == 0 || c.bump + SLAB > c.end) {      // none yet, or exhausted: a fresh segment
+    // Re-read under the lock: another thread may have mapped a segment since grabSlab looked.
+    // `grabSlab` moves `bump` with a CAS outside the lock, so these reads are atomic too.
+    bump: long = atomicLoad(&c.bump as *long);
+    end: long = atomicLoad(&c.end as *long);
+    if (bump == 0 || bump + SLAB > end) {            // none yet, or exhausted: a fresh segment
         base: long = mapAnon(ARENA, MmapFlag.NoReserve);
-        c.end = base + ARENA;
-        c.bump = roundUpTo(base, SLAB);
+        // `bump` first, then `end`; `grabSlab` reads them the other way round. A reader that
+        // sees the new end then also sees the new bump, so it never pairs an old, exhausted
+        // bump with the new end and claims a slab past the old segment.
+        atomicStore(&c.bump as *long, roundUpTo(base, SLAB));
+        atomicStore(&c.end as *long, base + ARENA);
     }
     atomicStore(l, 0);
 }
 local unsafe grabSlab -> long {
     c: *HeapCentral = central();
     loop {
-        bump: long = c.bump;
-        if (bump == 0 || bump + SLAB > c.end) { extendArena(); }
+        end: long = atomicLoad(&c.end as *long);         // `end` before `bump`: see extendArena
+        bump: long = atomicLoad(&c.bump as *long);
+        if (bump == 0 || bump + SLAB > end) { extendArena(); }
         else if (atomicCas(&c.bump as *long, bump, bump + SLAB) == bump) { return bump; }
     }
 }
@@ -255,8 +267,20 @@ local unsafe largeRoom p:long -> long {
     return h.base + h.size - p;
 }
 local unsafe largeAlloc n:long -> long {
+    q: long = largeFromCache(n);
+    if (q != 0) { return q; }
     size: long = roundUpTo(n + LARGE_PAYLOAD + SLAB, 4096);      // header + payload + alignment slack
-    // A cached region that fits and is not more than twice what is asked: the smallest such.
+    base: long = mapAnon(size, MmapFlag.NoReserve);
+    h: *LargeHeader = roundUpTo(base, SLAB) as *LargeHeader;
+    h.marker = LARGE_REGION;
+    h.base = base;
+    h.size = size;
+    return h as long + LARGE_PAYLOAD;
+}
+// A cached region that holds `n` bytes and is not more than twice what a fresh one would be:
+// the smallest such, taken out of the cache. 0 when none fits.
+local unsafe largeFromCache n:long -> long {
+    size: long = roundUpTo(n + LARGE_PAYLOAD + SLAB, 4096);
     c: *HeapCentral = central();
     largeLock();
     best: long = 0;
@@ -278,18 +302,13 @@ local unsafe largeAlloc n:long -> long {
         b: *LargeHeader = best as *LargeHeader;
         if (bestPrev == 0) { c.cacheHead = b.next; }
         else { bp: *LargeHeader = bestPrev as *LargeHeader; bp.next = b.next; }
-        c.cacheBytes = c.cacheBytes - b.size;
-        c.cacheCount = c.cacheCount - 1;
+        c.cacheBytes -= b.size;
+        c.cacheCount -= 1;
         largeUnlock();
         return best + LARGE_PAYLOAD;
     }
     largeUnlock();
-    base: long = mapAnon(size, MmapFlag.NoReserve);
-    h: *LargeHeader = roundUpTo(base, SLAB) as *LargeHeader;
-    h.marker = LARGE_REGION;
-    h.base = base;
-    h.size = size;
-    return h as long + LARGE_PAYLOAD;
+    return 0;
 }
 // Kept for the next large request while the cache has room; unmapped otherwise.
 local unsafe largeFree p:long -> void {
@@ -300,8 +319,8 @@ local unsafe largeFree p:long -> void {
         if (c.cacheCount < CACHE_COUNT && c.cacheBytes + h.size <= CACHE_BYTES) {
             h.next = c.cacheHead;
             c.cacheHead = h as long;
-            c.cacheBytes = c.cacheBytes + h.size;
-            c.cacheCount = c.cacheCount + 1;
+            c.cacheBytes += h.size;
+            c.cacheCount += 1;
             largeUnlock();
             return;
         }
@@ -319,7 +338,7 @@ local unsafe largeRemap p:long n:long -> long {
     resv: long = mapAnon(size + SLAB, MmapFlag.NoReserve);
     at: long = roundUpTo(resv + off, SLAB) - off;      // at >= resv, and the header lands aligned
     r: long = syscall6(Syscall.Mremap, h.base, h.size, size, MremapFlag.MayMove | MremapFlag.Fixed, at, 0);
-    if (r != at) { panic("heap: the kernel refused to move memory (mremap failed)"); }
+    if (r != at) { panic("heap: out of memory (mremap failed)"); }
     if (at > resv) { syscall2(Syscall.Munmap, resv, at - resv); }
     tail: long = resv + size + SLAB - (at + size);
     if (tail > 0) { syscall2(Syscall.Munmap, at + size, tail); }
@@ -329,7 +348,7 @@ local unsafe largeRemap p:long n:long -> long {
     return at + off + LARGE_PAYLOAD;
 }
 
-// Allocate n bytes — any size. Up to 8 KiB: lock-free TLS pop (refilled in batches from the
+// Allocate n bytes, any size. Up to 8 KiB: lock-free TLS pop (refilled in batches from the
 // shared pool); larger: a region of its own, from the cache when one fits.
 pub malloc n:long -> long {
     unsafe {
@@ -348,7 +367,7 @@ pub malloc n:long -> long {
 // Free a block. Slab blocks go to the lock-free thread cache; once it holds four batches, one
 // goes back to the shared pool (cross-thread reuse). Large regions go to the large cache, or back
 // to the OS, and a block the compiler laid into the binary is never ours to release. Freeing 0 is
-// a no-op, as in C. `unsafe`: freeing a bad/live/foreign address corrupts the heap — the caller
+// a no-op, as in C. `unsafe`: freeing a bad/live/foreign address corrupts the heap, so the caller
 // must vouch that p came from malloc and is done for good.
 pub unsafe free p:long -> void {
     if (p == 0) { return; }
@@ -371,7 +390,18 @@ pub unsafe realloc p:long old:long n:long -> long {
     if (marker == LARGE_REGION) {
         room: long = largeRoom(p);
         if (n <= room) { return p; }
-        if (room >= REMAP_MIN) { return largeRemap(p, n); }
+        // A cached region that fits has its pages already, so copying into it beats growing
+        // this one into fresh ones. Failing that, a big region moves its pages with mremap
+        // rather than have every page of a fresh copy faulted in.
+        if (room >= REMAP_MIN) {
+            q: long = largeFromCache(n);
+            if (q == 0) { return largeRemap(p, n); }
+            keep: long = old;
+            if (keep > n) { keep = n; }
+            if (keep > 0) { memcpy(q, p, keep); }
+            free(p);
+            return q;
+        }
     }
     return moveBlock(p, old, n);
 }
@@ -393,8 +423,8 @@ local unsafe dropInPlace<T> p:*T -> void {
 
 // ─── Box<T>: a heap-owned value ──────────────────────────────────────────────
 // A typed handle to a heap allocation holding one T. `newBox(v)` allocates and moves v in; the
-// value is read in place with `at`, copied with `get`/`set` when T is Copy, and released — the
-// value, then the block — when the Box is.
+// value is read in place with `at`, copied with `get`/`set` when T is Copy, and released (the
+// value, then the block) when the Box is.
 pub struct Box<T> { ptr: *T }
 
 pub newBox<T> v:T -> Box<T> {
@@ -405,15 +435,15 @@ pub newBox<T> v:T -> Box<T> {
     }
 }
 
-// get/set bitwise-copy the value in/out, so they exist only for Copy contents — copying a Drop
+// get/set bitwise-copy the value in/out, so they exist only for Copy contents: copying a Drop
 // value out would double-release its resource on the second drop.
 methods Box<T: Copy> {
     get &self -> T { unsafe { return *self.ptr; } }
     set &self v:T -> void { unsafe { *self.ptr = v; } }
 }
-// A borrow of the contents, whatever T is — the same borrow `Vec.at` hands out, and for the
-// same reason: an owning value is read in place rather than copied out. It is what makes a
-// `Box<Tree>` inside `Tree` walkable at all; `get` needs Copy, and a tree owns its subtrees.
+// A borrow of the contents, for any T. Like `Vec.at`, it reads an owning value in place instead
+// of copying it out. Without it a `Box<Tree>` inside `Tree` could not be walked, since `get`
+// needs Copy and a tree owns its subtrees.
 methods Box<T> {
     at &self -> &T { unsafe { return *self.ptr; } }
 }
@@ -433,11 +463,11 @@ methods Box<T: Clone> for Clone {
 }
 
 // ─── Raw: a manual, untyped heap block ───────────────────────────────────────
-// Every access is an offset into the `len`-byte block and is BOUNDS-CHECKED (out of range is a
-// panic naming the access, like a slice index) — that's what makes loadAt/storeAt genuinely
-// safe. The block is released when the Raw is dropped; `free` releases it early and leaves an
-// empty Raw behind, so a dropped Raw that was freed releases nothing twice. `address()` stays
-// `unsafe`: it leaks the raw pointer, which outlives nothing the checker can see.
+// Every access is an offset into the `len`-byte block and is bounds-checked, panicking with the
+// access named, like a slice index. That check is why loadAt/storeAt are safe. The block is
+// released when the Raw is dropped. `free` releases it early and leaves an empty Raw, so a freed
+// Raw releases nothing when it is later dropped. `address()` stays `unsafe` because it hands
+// out the raw pointer, which the checker cannot track.
 pub struct Raw { ptr: *u8, len: long }
 
 methods Raw {
@@ -458,7 +488,7 @@ methods Raw {
         self.check("Raw.storeAt", off, 8);
         unsafe { *((self.ptr + off) as *long) = v; }
     }
-    // Read/write a single byte at an offset — same bounds check, byte granularity.
+    // Read/write a single byte at an offset, with the same bounds check, byte granularity.
     loadByteAt &self off:long -> u8 {
         self.check("Raw.loadByteAt", off, 1);
         unsafe { return self.ptr[off]; }
@@ -515,7 +545,7 @@ methods Rc<T> {
     unsafe valuePtr &self -> *T    { return (self.ptr + 8) as *T; }
     count &self -> long { unsafe { return *self.countPtr(); } }
     // A borrow of the shared value, in place. Single-threaded, so nothing else is reading it
-    // while the borrow lasts — the same footing `Box.at` stands on.
+    // while the borrow lasts. `Box.at` stands on the same footing.
     at &self -> &T { unsafe { p: *T = self.valuePtr(); return *p; } }
 }
 methods Rc<T: Copy> {

@@ -22,7 +22,8 @@
 #include <transform::facts>
 #include <stdlib::{bytes, encode, map, mem, option, string, vec}>
 
-// A function node in DECLS whose body is in BODIES (and, read, one whose body has not been yet).
+// Marks a function node in DECLS whose body is in BODIES. Once loaded, it marks one whose body
+// has not been read yet.
 pub BODY_IN_CHUNK: long = BODY_LAZY;
 
 // ─── writing: the graft ──────────────────────────────────────────────────────
@@ -267,7 +268,7 @@ methods Graft for IdMap {
             }
             _ { }
         }
-        failStr(format("internal: a graft asked for one element of a run ({})", arena as long));
+        failStr(format("internal compiler error: a graft asked for one element of a run ({})", arena as long));
         return v;
     }
 
@@ -318,7 +319,7 @@ methods Graft for IdMap {
             }
             _ { }
         }
-        failStr(format("internal: a graft asked for a run of a node arena ({})", arena as long));
+        failStr(format("internal compiler error: a graft asked for a run of a node arena ({})", arena as long));
         return first;
     }
 }
@@ -376,10 +377,10 @@ pub snapshotModules inout p:Parser inout sc:Scanner -> void {
     gGraftShared = g.shared;
 }
 
-// One module's top-level statements `ids` (each a macro read at the end of the page or not,
-// `defs`) grafted out of `src`: DECLS appended to `declsOut`, each body as a tree of its own to
-// `bodiesOut`, and per function of DECLS where its body starts relative to where `bodiesOut` stood
-// (-1 for none) and how long it is, appended to `bodyAt`/`bodyLen`.
+// Graft one module's top-level statements `ids` out of `src` (`defs` says, per statement, whether
+// it is a macro read at the end of the page). DECLS is appended to `declsOut` and each body, as a
+// tree of its own, to `bodiesOut`. For each function of DECLS, `bodyAt` gets where its body
+// starts relative to where `bodiesOut` stood (-1 for none), and `bodyLen` how long it is.
 pub graftModule inout g:Graft src:Ast ids:Vec<long> defs:Vec<bool> inout declsOut:Encoder
                 inout bodiesOut:Encoder inout bodyAt:Vec<long> inout bodyLen:Vec<long> -> void {
     clearAst(&g.dst);
@@ -420,9 +421,10 @@ pub graftModule inout g:Graft src:Ast ids:Vec<long> defs:Vec<bool> inout declsOu
 }
 
 // ─── `--klib-verify` ─────────────────────────────────────────────────────────
-// Every module of the package, written as it would be and read back in this process: its
-// top-level statements dumped (`--emit=ast`'s form) must read as the parser's did, and grafted
-// again the read-back tree must write the same bytes. Answers the number of modules that differ.
+// Every module of the package is written as it would be and read back in this process. Its
+// top-level statements, dumped in `--emit=ast`'s form, must read as the parser's did, and the
+// read-back tree, grafted again, must write the same bytes. Answers the number of modules that
+// differ.
 
 pub verifyKlibTrees inout p:Parser -> long {
     // The names come back through the table they were written to.
@@ -436,7 +438,8 @@ pub verifyKlibTrees inout p:Parser -> long {
         scratch: Ast;
         view: [u8] = "";
         unsafe { view = gOutDecls.view(); }
-        d: Decoder = decoderOf(view[om.declsAt..om.declsAt + om.declsLen]);
+        d: Decoder;
+        unsafe { d = decoderOf(view[om.declsAt..om.declsAt + om.declsLen]); }
         rb: Rebase = rebaseOf();
         rb.sameBounds = true;
         rb.startAt(scratch);
@@ -449,7 +452,8 @@ pub verifyKlibTrees inout p:Parser -> long {
             at: long = gOutBodyAt.get(om.firstFn + f);
             if (at >= 0) {
                 s: long = om.bodiesAt + at;
-                bd: Decoder = decoderOf(view[s..s + gOutBodyLen.get(om.firstFn + f)]);
+                bd: Decoder;
+                unsafe { bd = decoderOf(view[s..s + gOutBodyLen.get(om.firstFn + f)]); }
                 rb.startAt(scratch);
                 decodeTree(&bd, &scratch, &rb);
                 root: long = bd.getVarint() + rb.base.get(Arena.Blocks as long);
@@ -535,7 +539,7 @@ pub writeModuleSection inout out:Encoder om:OutModule -> void {
     facts.putLen(om.globalCount);
     for k in 0..om.globalCount {
         gi: long = gOutFacts.globalFact(gOutGlobals.get(om.firstGlobal + k));
-        if (gi < 0) { failStr(format("internal: no fact for the global {}", nameOf(gOutGlobals.get(om.firstGlobal + k)))); }
+        if (gi < 0) { failStr(format("internal compiler error: no fact for the global `{}`", nameOf(gOutGlobals.get(om.firstGlobal + k)))); }
         gf: GlobalFact = gOutFacts.globals.get(gi);
         r: GlobalFactRec = GlobalFactRec { name: gf.name, state: gf.state, value: gf.value, image: gf.image };
         r.encode(facts);
@@ -556,14 +560,16 @@ pub writeModuleSection inout out:Encoder om:OutModule -> void {
 
 // ─── reading a module ────────────────────────────────────────────────────────
 
-// Where each chunk of one module section is, in it.
+// Where each chunk of one module section is, in it, and what is wrong with its framing ("" when
+// nothing is).
 pub struct Section { opsAt: long, opsLen: long, declsAt: long, declsLen: long, factsAt: long, factsLen: long,
-                     ixAt: long, ixLen: long, bodiesAt: long, bodiesLen: long }
+                     ixAt: long, ixLen: long, bodiesAt: long, bodiesLen: long, bad: str }
 
-pub sectionOf data:[u8] origin:str -> Section {
+pub sectionOf data:[u8] -> Section {
     s: Section = Section { opsAt: 0, opsLen: 0, declsAt: 0, declsLen: 0, factsAt: 0, factsLen: 0,
-                           ixAt: 0, ixLen: 0, bodiesAt: 0, bodiesLen: 0 };
-    d: Decoder = decoderOf(data);
+                           ixAt: 0, ixLen: 0, bodiesAt: 0, bodiesLen: 0, bad: "" };
+    d: Decoder;
+    unsafe { d = decoderOf(data); }
     while (d.remaining() > 0 && d.ok()) {
         tag: long = d.getUvarint() as long;
         n: long = d.getLen();
@@ -575,12 +581,15 @@ pub sectionOf data:[u8] origin:str -> Section {
         else if (tag == CHUNK_BODYIX) { s.ixAt = at; s.ixLen = n; }
         else if (tag == CHUNK_BODIES) { s.bodiesAt = at; s.bodiesLen = n; }
     }
-    if (!d.ok()) { damaged(origin, d.error()); }
+    if (!d.ok()) { s.bad = d.error(); }
     return s;
 }
 
-pub damaged origin:str why:str -> void {
-    failStr(format("{}: damaged .klib metadata ({}) -- rebuild it", origin, why));
+// A module section that cannot be read, which `loadModuleSection` answers with instead of reading
+// on. The compile handed the `.klib` stops on it (`Klib.cannotUse`); a build checks a `.klib`'s
+// body against its hash before handing it on, so what reaches here was written this way.
+local damaged why:str -> KlibCheck {
+    return klibDamaged(format("its module section is malformed: {}", why));
 }
 
 // ─── loading a module ────────────────────────────────────────────────────────
@@ -593,19 +602,21 @@ pub var gModulesLoaded: long = 0;
 // into the tree with every index shifted, its top-level statements put on the page (a macro
 // where a parsed one would go, after every module), and its facts filed under the indices its
 // functions got.
-pub loadModuleSection inout p:Parser kk:long mod:long -> void {
+pub loadModuleSection inout p:Parser kk:long mod:long -> KlibCheck {
     km: KlibModule = gKlibModules.get(kk);
     info: KlibInfo = gKlibs.get(km.klib);
     gSymInBase = info.symBase;
     gSymInCount = info.symCount;
     all: [u8] = info.body as [u8];
     data: [u8] = all[info.modulesAt + km.at..info.modulesAt + km.at + km.len];
-    s: Section = sectionOf(data, info.path);
+    s: Section = sectionOf(data);
+    if (s.bad.len > 0) { return damaged(s.bad); }
 
     // The facts first: a constant's value is what the parser reads a length from, and the
     // replay below puts it where the parser looks. A function's are filed once DECLS says where
     // the module's functions are.
-    fd: Decoder = decoderOf(data[s.factsAt..s.factsAt + s.factsLen]);
+    fd: Decoder;
+    unsafe { fd = decoderOf(data[s.factsAt..s.factsAt + s.factsLen]); }
     nf: long = fd.getLen();
     facts: Vec<long>;
     facts.reserve(nf);
@@ -625,20 +636,21 @@ pub loadModuleSection inout p:Parser kk:long mod:long -> void {
         globals.push(g);
         k = k + 1;
     }
-    if (!fd.done()) { damaged(info.path, fd.error()); }
+    if (!fd.done()) { return damaged(fd.error()); }
 
     // The registry, as the module's parse wrote it.
     file: Sym = intern(km.path);
     rp: Replay = replayOf(file, intern(km.pkg), true);
     rb: Rebase = rebaseOf();
-    od: Decoder = decoderOf(data[s.opsAt..s.opsAt + s.opsLen]);
+    od: Decoder;
+    unsafe { od = decoderOf(data[s.opsAt..s.opsAt + s.opsLen]); }
     rp.run(&od, &p.fnReturns, &p.ast, &rb.bounds);
-    if (!od.done()) { damaged(info.path, od.error()); }
+    if (!od.done()) { return damaged(od.error()); }
     // An integer constant's initializer is not carried, but the value it folded to is, and a
     // length written `nums::BASE` in a dependent is read from the declaration's initializer.
     for folded in globals {
         if (folded.state != GlobalState.Scalar) { continue; }
-        gi: long = gReg.findGlobal(nameOf(folded.name));
+        gi: long = gReg.findGlobalSym(folded.name);
         if (gi < 0) { continue; }
         def: GlobalDef = gReg.globalDef(gi);
         if (def.isVar || def.isArray || !isInteger(def.kind)) { continue; }
@@ -649,11 +661,12 @@ pub loadModuleSection inout p:Parser kk:long mod:long -> void {
     // The declarations.
     rb.startAt(p.ast);
     rb.fnBase = p.ast.fns.len();
-    dd: Decoder = decoderOf(data[s.declsAt..s.declsAt + s.declsLen]);
+    dd: Decoder;
+    unsafe { dd = decoderOf(data[s.declsAt..s.declsAt + s.declsLen]); }
     decodeTree(&dd, &p.ast, &rb);
     roots: Vec<long> = decodeVec(&dd);
     defs: Vec<bool> = decodeVec(&dd);
-    if (!dd.done() || roots.len() != defs.len()) { damaged(info.path, dd.error()); }
+    if (!dd.done() || roots.len() != defs.len()) { return damaged(dd.error()); }
     stmtBase: long = rb.base.get(Arena.Stmts as long);
     for k in 0..roots.len() {
         st: long = roots.get(k) + stmtBase;
@@ -661,13 +674,14 @@ pub loadModuleSection inout p:Parser kk:long mod:long -> void {
     }
     fnBase: long = rb.fnBase;
     nfn: long = p.ast.fns.len() - fnBase;
-    if (nfn != facts.len()) { damaged(info.path, "the facts do not match the functions"); }
+    if (nfn != facts.len()) { return damaged("the facts do not match the functions"); }
 
     // The bodies, each its own tree: a template's and a macro's read now (stamping an instance
     // and running a macro need them), every other one when something needs it (`ensureBody`).
-    xd: Decoder = decoderOf(data[s.ixAt..s.ixAt + s.ixLen]);
+    xd: Decoder;
+    unsafe { xd = decoderOf(data[s.ixAt..s.ixAt + s.ixLen]); }
     n: long = xd.getLen();
-    if (n != nfn) { damaged(info.path, "the body index does not match the functions"); }
+    if (n != nfn) { return damaged("the body index does not match the functions"); }
     bodies: [u8] = data[s.bodiesAt..s.bodiesAt + s.bodiesLen];
     bodiesAt: long = 0;
     unsafe { bodiesAt = bodies.ptr as long; }
@@ -676,7 +690,7 @@ pub loadModuleSection inout p:Parser kk:long mod:long -> void {
         at: long = xd.getVarint();
         len: long = xd.getVarint();
         if (at >= 0) {
-            if (at + len > bodies.len) { damaged(info.path, "a body past the end of its chunk"); }
+            if (at + len > bodies.len) { return damaged("a body past the end of its chunk"); }
             fi: long = fnBase + k;
             f: FnNode = p.ast.fns.get(fi);
             noteLazyBody(fi, LazyBody { at: bodiesAt + at, len: len, symBase: info.symBase, symCount: info.symCount,
@@ -685,12 +699,13 @@ pub loadModuleSection inout p:Parser kk:long mod:long -> void {
         }
         k = k + 1;
     }
-    if (!xd.done()) { damaged(info.path, xd.error()); }
+    if (!xd.done()) { return damaged(xd.error()); }
     for k in 0..nfn {
         if (facts.get(k) >= 0) { noteFnFact(fnBase + k, facts.get(k)); }
     }
     gModulesLoaded = gModulesLoaded + 1;
     if (gOpLogOn) { gOpOrder.push(-1 - kk); }
+    return klibUsable();
 }
 
 // The registry replayed from nothing in the order the compile applied it: this package's own
@@ -705,7 +720,7 @@ pub verifyPackageRegops inout p:Parser -> long {
         info: KlibInfo = gKlibs.get(km.klib);
         all: [u8] = info.body as [u8];
         data: [u8] = all[info.modulesAt + km.at..info.modulesAt + km.at + km.len];
-        s: Section = sectionOf(data, info.path);
+        s: Section = sectionOf(data);
         at: long = 0;
         unsafe { at = data.ptr as long; }
         parts.push(OpPart { at: at + s.opsAt, len: s.opsLen, symBase: info.symBase, symCount: info.symCount,

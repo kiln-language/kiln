@@ -144,7 +144,9 @@ methods CFG {
             mine: Vec<long>;
 
             fallsThrough: bool = true;
-            if (isBranch(last.op)) {
+            // A fault edge goes on to the next instruction and, should the call before it raise,
+            // to its `recover` handler.
+            if (isBranch(last.op) || last.op == IROp.FaultEdge) {
                 target: long = self.blockAtLabel(p, fn, last.name);
                 if (target >= 0) { mine.push(target); }
                 if (last.op == IROp.Jmp) { fallsThrough = false; }
@@ -184,6 +186,7 @@ methods CFG {
                 if (!in.bIsImm && in.b != NO_TEMP && !self.inSet(defAt, in.b)) {
                     self.addTo(useAt, in.b);
                 }
+                if (in.x != NO_TEMP && !self.inSet(defAt, in.x)) { self.addTo(useAt, in.x); }
                 for k in 0..in.argCount {
                     arg: Temp = p.args.get(in.firstArg + k);
                     if (arg != NO_TEMP && !self.inSet(defAt, arg)) { self.addTo(useAt, arg); }

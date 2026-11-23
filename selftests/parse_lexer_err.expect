@@ -1,0 +1,13 @@
+selftests/parse_lexer_err.k:7:23: error: a character literal holds exactly one character
+    7 | a -> long { x: char = 'ab'; return 1; }
+      |                       ^
+selftests/parse_lexer_err.k:9:22: error: expected `;`, found `}`
+    9 | b -> long { return 2 }
+      |                      ^
+selftests/parse_lexer_err.k:11:25: error: unexpected character `$`
+   11 | c -> long { y: long = 3 $ 4; return y; }
+      |                         ^
+selftests/parse_lexer_err.k:13:20: error: expected hexadecimal digits after `0x`
+   13 | d -> long { return 0x; }
+      |                    ^
+4 errors generated.

@@ -1,12 +1,12 @@
-// InlineVec<T, N> — a vector of at most N elements, held inline: no heap, ever.
+// InlineVec<T, N>: a vector of at most N elements, held inline: no heap, ever.
 //
 //     xs: InlineVec<long, 8>;              // Default: empty
 //     xs.push(3); xs.push(1);
 //     if (!xs.tryPush(9)) { ... }          // false once it holds 8
 //     first: long = xs[0];
 //
-// For small, bounded lists — a handful of operands, the arguments of one call, the last few
-// results — where a `Vec` would spend an allocation on a few words, and for code that runs where
+// For small, bounded lists (a handful of operands, the arguments of one call, the last few
+// results) where a `Vec` would spend an allocation on a few words, and for code that runs where
 // the allocator is not available. A local one lives on the stack; one inside a struct is part of
 // the struct.
 //
@@ -22,8 +22,8 @@ methods InlineVec<T, N> for Default {
     new -> InlineVec<T, N> { return InlineVec { count: 0 }; }       // data: zero-filled
 }
 
-local inlineFull what:str -> never { panicState(what, "the vector is full — its capacity is its type's N"); }
-local inlineEmpty what:str -> never { panicState(what, "the vector is empty"); }
+local inlineFull what:str -> never { panicState(what, "vector is full"); }
+local inlineEmpty what:str -> never { panicState(what, "vector is empty"); }
 
 methods InlineVec<T, N> for AsSlice<T> {
     asSlice &self -> [T] { return self.data[..self.count]; }
@@ -39,14 +39,14 @@ methods InlineVec<T, N> {
     tryPush &self v:T -> bool {
         if (self.count == N) { return false; }
         self.data[self.count] = v;
-        self.count = self.count + 1;
+        self.count += 1;
         return true;
     }
     push &self v:T -> void { if (!self.tryPush(v)) { inlineFull("InlineVec.push"); } }
 
     pop &self -> T {
         if (self.count == 0) { inlineEmpty("InlineVec.pop"); }
-        self.count = self.count - 1;
+        self.count -= 1;
         return self.data[self.count];
     }
     tryPop &self -> Option<T> {
@@ -72,7 +72,7 @@ methods InlineVec<T, N> {
         k: long = self.count;
         while (k > i) { self.data[k] = self.data[k - 1]; k = k - 1; }
         self.data[i] = v;
-        self.count = self.count + 1;
+        self.count += 1;
         return true;
     }
     // Remove element i, shifting the tail left to keep the order.
@@ -80,14 +80,14 @@ methods InlineVec<T, N> {
         if (i < 0 || i >= self.count) { panicIndex("InlineVec.removeAt", i, self.count); }
         r: T = self.data[i];
         for k in i..self.count - 1 { self.data[k] = self.data[k + 1]; }
-        self.count = self.count - 1;
+        self.count -= 1;
         return r;
     }
     // Remove element i by moving the last one into its place: O(1), order not kept.
     swapRemove &self i:long -> T {
         if (i < 0 || i >= self.count) { panicIndex("InlineVec.swapRemove", i, self.count); }
         r: T = self.data[i];
-        self.count = self.count - 1;
+        self.count -= 1;
         self.data[i] = self.data[self.count];
         return r;
     }

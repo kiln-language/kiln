@@ -1,0 +1,7 @@
+selftests/parse_unterm_err.k:6:24: error: expected `;`, found `}`
+    6 | one -> long { return 1 }
+      |                        ^
+selftests/parse_unterm_err.k:8:22: error: unterminated string literal
+    8 | name -> str { return "kiln; }
+      |                      ^
+2 errors generated.

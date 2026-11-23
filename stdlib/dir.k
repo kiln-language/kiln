@@ -42,8 +42,8 @@ pub enum EntryKind: u8 {
     Socket  = 12
 }
 
-// One name from a directory. The name is COPIED into the entry rather than pointed at the
-// read buffer, which the next batch overwrites — an entry you are still holding would
+// One name from a directory. The name is copied into the entry rather than pointed at the
+// read buffer, which the next batch overwrites. An entry you are still holding would
 // otherwise change under you, silently, and only for large directories.
 pub struct DirEntry {
     name: [u8; NAME_MAX],
@@ -141,10 +141,10 @@ methods Dir {
             k: long = 0;
             while (k < cap && b[19 + k] != 0) {
                 e.name[k] = b[19 + k];
-                k = k + 1;
+                k += 1;
             }
             e.len = k;
-            self.pos = self.pos + reclen;
+            self.pos += reclen;
             if (e.kind == EntryKind.Unknown) {
                 // The filesystem left the type out: ask (without following a link), relative to
                 // this directory. S_IFMT >> 12 is the d_type.
@@ -216,7 +216,7 @@ pub makeDirAll path:str -> Result<long, long> {
     return Result.Ok(0);
 }
 
-// Only an EMPTY directory; removing a populated one is a walk, and a walk that deletes should
+// Only an empty directory; removing a populated one is a walk, and a walk that deletes should
 // be written where you can see it.
 pub removeDir path:str -> Result<long, long> { return onPath(path, Syscall.Rmdir, 0); }
 
@@ -265,15 +265,10 @@ pub setPermissions path:str mode:long -> Result<long, long> { return onPath(path
 // Rust's fs::copy: the bytes and the permission bits, replacing `to`. The count copied. The
 // kernel copies in place (copy_file_range) where it can; read/write where it cannot.
 pub copyFile from:str to:str -> Result<long, long> {
-    r1: Result<File, long> = File.openRead(from);
-    if (r1.isErr()) { return Result.Err(r1.unwrapErr()); }
-    src: File = r1.unwrap();
-    md: Result<Metadata, long> = src.metadata();
-    if (md.isErr()) { return Result.Err(md.unwrapErr()); }
-    perms: long = md.unwrap().permissions();
-    r2: Result<File, long> = File.create(to);
-    if (r2.isErr()) { return Result.Err(r2.unwrapErr()); }
-    dst: File = r2.unwrap();
+    src: File = File.openRead(from)?;
+    md: Metadata = src.metadata()?;
+    perms: long = md.permissions();
+    dst: File = File.create(to)?;
     pr: Result<long, long> = dst.setPermissions(perms);
     s: long = src.fd as long;
     d: long = dst.fd as long;
@@ -287,7 +282,7 @@ pub copyFile from:str to:str -> Result<long, long> {
             if (copied == 0 && (n == -Errno.XDev || n == -Errno.NoSys || n == -Errno.Inval || n == -Errno.OpNotSupp)) { break; }
             return Result.Err(-n);
         }
-        copied = copied + n;
+        copied += n;
     }
     chunk: [u8; 16384];
     loop {
@@ -296,12 +291,12 @@ pub copyFile from:str to:str -> Result<long, long> {
         if (n == 0) { return Result.Ok(copied); }
         w: long = dst.writeBytes(chunk[..n]);
         if (w < 0) { return Result.Err(-w); }
-        copied = copied + n;
+        copied += n;
     }
     return Result.Ok(copied);
 }
 
-// The working directory, as a String you own. getcwd(2) returns the length INCLUDING the
+// The working directory, as a String you own. getcwd(2) returns the length including the
 // terminator, which is not part of the text.
 pub currentDir -> Result<String, long> {
     buf: [u8; PATH_MAX];

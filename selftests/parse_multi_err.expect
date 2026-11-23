@@ -1,0 +1,28 @@
+selftests/parse_multi_err.k:8:29: error: expected identifier, found `}`
+    8 | struct Broken { a: long, b: }
+      |                             ^
+selftests/parse_multi_err.k:10:26: error: expected identifier, found `3`
+   10 | enum Color { Red, Green, 3 }
+      |                          ^
+selftests/parse_multi_err.k:12:54: error: expected identifier, found `;`
+   12 | trait Shape { area &self -> long; perimeter &self -> ; }
+      |                                                      ^
+selftests/parse_multi_err.k:14:19: error: expected an expression, found `;`
+   14 | LIMIT: long = 4 * ;
+      |                   ^
+selftests/parse_multi_err.k:16:24: error: expected identifier, found `;`
+   16 | type Pair = (long, long;
+      |                        ^
+selftests/parse_multi_err.k:24:57: error: expected an expression, found `,`
+   24 | scale p:Point k:long -> Point { return Point { x: p.x * , y: p.y * k }; }
+      |                                                         ^
+selftests/parse_multi_err.k:26:79: error: expected `;`, found `}`
+   26 | methods Point { len2 &self -> long { return self.x * self.x + self.y * self.y } }
+      |                                                                               ^
+selftests/parse_multi_err.k:28:15: error: expected identifier, found `{`
+   28 | struct Wrap<T { v: T }
+      |               ^
+selftests/parse_multi_err.k:30:43: error: expected `;`, found `}`
+   30 | first<T: Copy> xs:[T] -> T { return xs[0] }
+      |                                           ^
+9 errors generated.

@@ -33,7 +33,7 @@ local decodeWith b:[u8] surrogates:bool -> Vec<long> {
         if (c < 0x80) { out.push(c); i = i + 1; continue; }      // the common case, inline
         at: Utf8At = decodeOne(b, i, surrogates);
         out.push(at.cp);
-        i = i + at.len;
+        i += at.len;
     }
     return out;
 }
@@ -70,7 +70,7 @@ local decodeOne b:[u8] i:long surrogates:bool -> Utf8At {
         lo = 0x80;
         hi = 0xBF;
         cp = (cp << 6) | (d & 0x3F);
-        j = j + 1;
+        j += 1;
     }
     return Utf8At { cp: cp, len: need + 1 };
 }

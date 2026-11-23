@@ -5,7 +5,7 @@
 #include <support::compiler>
 #include <parse::{ast, registry, upstream}>
 #include <transform::{check, guard, eval, facts}>
-#include <codegen::{asm, lower, irpack}>
+#include <codegen::{asm, lower, irpack, effects}>
 #include <pre::{Preprocessor, PackageMap}>
 #include <stdlib::{encode, file, hash128, path, pathbuf, map, option, result, string, vec}>
 
@@ -46,9 +46,9 @@ local fnFactHere inout a:Ast inout ck:Checker inout cg:ConstGuard at:long -> lon
                            ps, cg.depsOf(at));
 }
 
-// Every global this package declares, as the evaluator left it -- a scalar, an image, zero, or
-// built at startup -- with the images copied across and renumbered, and what the startup
-// initializers (this package's, and those beneath it) may write. After `foldGlobals`.
+// Every global this package declares, as the evaluator left it (a scalar, an image, zero, or
+// built at startup), with the images copied across and renumbered, and what the startup
+// initializers (this package's, and those beneath it) may write. Runs after `foldGlobals`.
 pub collectGlobalFacts inout a:Ast page:long inout ev:Evaluator -> void {
     remap: HashMap<long, long>;
     n: long = a.blockLen(page);
@@ -56,7 +56,7 @@ pub collectGlobalFacts inout a:Ast page:long inout ev:Evaluator -> void {
         st: Stmt = a.stmtAt(page, k);
         if (st.kind != StmtKind.VarDecl) { continue; }
         d: VarDeclNode = a.decls.get(st.at);
-        gi: long = gReg.findGlobal(nameOf(d.name));
+        gi: long = gReg.findGlobalSym(d.name);
         if (gi < 0 || gReg.globalDef(gi).pkg != gThisPkg) { continue; }
         state: GlobalState = GlobalState.Startup;
         value: long = 0;
@@ -97,7 +97,7 @@ local copyImage inout a:Ast im:long inout remap:HashMap<long, long> -> long {
             ph: Option<long> = gVtablePairs.find(nameOf(r.target));
             match ph {
                 Some(pi) { conc = gVtableConcrete.get(pi); tr = gVtableTrait.get(pi); }
-                None { failStr(format("internal: the vtable '{}' in a folded global has no recorded type", nameOf(r.target))); }
+                None { failStr(format("internal compiler error: the vtable `{}` in a folded global has no recorded type", nameOf(r.target))); }
             }
         }
         relocs.push(RelocFact { offset: r.offset, kind: r.kind, target: r.target, image: target,
@@ -159,7 +159,7 @@ pub writeKlibMeta path:str inout sc:Scanner compilerId:str root:str deps:Vec<str
     stamped: Vec<str>;
     for k in 0..gReg.requestCount() {
         rq: GRequest = gReg.requestAt(k);
-        if (gReg.isPatternRequest(rq) || !gReg.hasStruct(nameOf(rq.instance))) { continue; }
+        if (gReg.isPatternRequest(rq) || !gReg.hasStructSym(rq.instance)) { continue; }
         if (gKnownInstances.has(nameOf(rq.instance))) { continue; }
         stamped.push(nameOf(rq.instance));
     }
@@ -175,7 +175,7 @@ pub writeKlibMeta path:str inout sc:Scanner compilerId:str root:str deps:Vec<str
     for k in 0..gExportedInst.len() {
         n: Sym = gExportedInst.get(k);
         fi: long = gOutInstFact.getOr(nameOf(n), -1);
-        if (fi < 0) { failStr(format("internal: the instance function '{}' was compiled and has no facts", nameOf(n))); }
+        if (fi < 0) { failStr(format("internal compiler error: the instance function `{}` was compiled and has no facts", nameOf(n))); }
         n.encode(chunk);
         alias: Sym = intern(instanceAlias(nameOf(n)));
         alias.encode(chunk);
@@ -187,6 +187,9 @@ pub writeKlibMeta path:str inout sc:Scanner compilerId:str root:str deps:Vec<str
     // The IR of what this package exports that a dependent's inliner could copy.
     writeShipChunk(&chunk);
     putEncoded(&rest, CHUNK_IR, &chunk);
+    // What each function it exports may write, for a dependent's calls to it.
+    writeEffectsChunk(&chunk);
+    putEncoded(&rest, CHUNK_EFFECTS, &chunk);
     gOutFacts.poisonAll.encode(chunk);
     gOutFacts.poison.encode(chunk);
     putEncoded(&rest, CHUNK_POISON, &chunk);
@@ -249,7 +252,7 @@ pub writeKlibMeta path:str inout sc:Scanner compilerId:str root:str deps:Vec<str
     r: Result<long, long> = writeFileStr(path, v);
     match r {
         Ok(_)  { }
-        Err(e) { failStr(format("could not write {} (errno {})", path, e)); }
+        Err(e) { failStr(format("cannot write `{}` (errno {})", path, e)); }
     }
 }
 

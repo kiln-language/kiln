@@ -1,13 +1,13 @@
 #!/bin/bash
 # Four ways to build the same four kernels: Kiln's own back end, Kiln through LLVM, gcc and rustc.
 #
-# The kernels are the scalar ones from ../Kiln/benchmarks (sum, fib, collatz, primes). `sieve`,
-# `vector`, `records`, `higher` and `strings` are left out because the LLVM path does not do arrays
-# or aggregates yet, and a comparison one entrant cannot enter is not one.
+# The kernels are the scalar ones from ../Kiln/benchmarks (sum, fib, collatz, primes), written out
+# here in all three languages so the comparison needs nothing else. The nine programs against gcc
+# are `bench.sh`'s job; this is the quick look at what a scalar loop and a call cost.
 #
-# The answer comes back as an exit code rather than printed: printing needs the runtime, the
-# runtime is built on `asm`, and `asm` is one of the things the LLVM path still refuses. `% 251`
-# keeps the result inside an exit code AND keeps the computation live, so no optimizer deletes it.
+# The answer comes back as an exit code rather than printed, so that nothing but the kernel runs.
+# `% 251` keeps the result inside an exit code AND keeps the computation live, so no optimizer
+# deletes it.
 # Every build's answer is checked to agree before any of them is timed.
 cd "$(dirname "$0")/.."
 D=/tmp/four; rm -rf $D; mkdir -p $D
@@ -109,7 +109,7 @@ BENCH="sum fib collatz primes"
 echo "=== building ==="
 for b in $BENCH; do
     $K $D/$b.k -o $D/$b.s          > /dev/null 2>&1 && nasm -O1 -felf64 $D/$b.s -o $D/$b.o 2>/dev/null && ld $D/$b.o -o $D/$b.kiln 2>/dev/null
-    $K $D/$b.k --emit=llvm -o /dev/null > $D/$b.ll 2>$D/$b.llerr && clang -O2 -w $D/$b.ll -o $D/$b.llvm 2>/dev/null
+    $K $D/$b.k --emit=llvm -o /dev/null > $D/$b.ll 2>$D/$b.llerr && clang -O2 -w -nostdlib -static -no-pie $D/$b.ll -o $D/$b.llvm 2>/dev/null
     gcc -O2 -o $D/$b.gcc $D/$b.c 2>/dev/null
     rustc -O -o $D/$b.rust $D/$b.rs 2>/dev/null
     miss=""

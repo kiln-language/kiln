@@ -4,12 +4,12 @@
 //     for x: long in it { println("{}", x); }
 //
 // `Iter<T>` takes a type parameter, so `Iter<long>` and `Iter<int>` are different contracts
-// with different vtables — one trait serves every element type without erasing it.
+// with different vtables, so one trait serves every element type without erasing it.
 //
-// TAKE AN ITERATOR BY BOUND, NOT AS A TRAIT OBJECT:
+// Take an iterator by bound, not as a trait object:
 //
 //     sum<I: Iter<long>> inout it:I -> long      // direct calls; the inliner erases them
-//     sum inout it:Iter<long> -> long            // two vtable calls PER ELEMENT, forever
+//     sum inout it:Iter<long> -> long            // two vtable calls per element, forever
 //
 // A bound monomorphizes, and the inliner folds the two methods into the loop. A trait object's
 // indirect call has no known target and can never be inlined. Both compile; only one is free.
@@ -28,9 +28,9 @@ pub trait Iter<T> {
 }
 
 // Reading past the end is a caller bug, and there is no value of an arbitrary T that means
-// "nothing", so it ends the program — saying so, rather than as a bare SIGILL.
+// "nothing", so it ends the program with a message.
 local trapIter -> void {
-    panicState("Iter.next", "the iterator is exhausted — check hasNext first");
+    panicState("Iter.next", "iterator is exhausted");
 }
 
 // ─── Range: the half-open integer range [lo, hi) ─────────────────────────────
@@ -43,7 +43,7 @@ methods Range for Iter<long> {
     next &self -> long {
         if (self.i >= self.hi) { trapIter(); }
         v: long = self.i;
-        self.i = self.i + 1;
+        self.i += 1;
         return v;
     }
 }
@@ -65,23 +65,23 @@ methods StepRange for Iter<long> {
     next &self -> long {
         if (!self.hasNext()) { trapIter(); }
         v: long = self.i;
-        self.i = self.i + self.step;
+        self.i += self.step;
         return v;
     }
 }
 
 // ─── VecIter: a Vec's elements, in order ─────────────────────────────────────
-// Holds the buffer and length, not the Vec, so it is a BORROWED view with a slice's lifetime:
-// growing the vector mid-walk leaves it on the old allocation. That is why `vecIter` is
-// `unsafe` — the caller vouches for the vector outliving the walk. Everything after it is safe.
+// Holds the buffer and length, not the Vec, so it is a borrowed view with a slice's lifetime:
+// growing the vector mid-walk leaves it on the old allocation. So `vecIter` is `unsafe`, and the
+// caller vouches that the vector outlives the walk. Everything after that is safe.
 pub struct VecIter<T> { p: *T, n: long, i: long }
 
 pub unsafe vecIter<T> inout v:Vec<T> -> VecIter<T> {
     return VecIter { p: v.buf.ptr, n: v.len(), i: 0 };
 }
 
-// Yields a BORROW of each element (`Iter<&T>`), never a copy, so it walks a Vec<String> as
-// readily as a Vec<long> -- and for a scalar `&T` is the scalar, so `for x: long in it` is
+// Yields a borrow of each element (`Iter<&T>`), never a copy, so it walks a Vec<String> as
+// readily as a Vec<long>, and for a scalar `&T` is the scalar, so `for x: long in it` is
 // unchanged. An owning element is read in place: `for r: &Res in it { r.id }`.
 methods VecIter<T> for Iter<&T> {
     hasNext &self -> bool { return self.i < self.n; }
@@ -98,7 +98,7 @@ methods VecIter<T> for Iter<&T> {
 // something asks and no intermediate sequence is built:
 // `takeIter(mapIter(range(0, 1000000), &f), 3)` touches three elements, not a million.
 //
-// The parameters read `<T, I>` — element first, then the inner iterator — because a bound may
+// The parameters read `<T, I>` (element first, then the inner iterator) because a bound may
 // only mention parameters already introduced, and `I: Iter<T>` needs `T` to its left. Each
 // constructor learns `T` from `I`'s bound, so none has to be spelled out.
 //
@@ -116,7 +116,7 @@ methods Take<T, I: Iter<T>> for Iter<T> {
     hasNext &self -> bool { return self.left > 0 && self.inner.hasNext(); }
     next &self -> T {
         if (self.left <= 0) { trapIter(); }
-        self.left = self.left - 1;
+        self.left -= 1;
         return self.inner.next();
     }
 }
@@ -127,12 +127,11 @@ pub struct Skip<T, I> { inner: I, left: long }
 pub skipIter<T, I: Iter<T>> inner:I n:long -> Skip<T, I> { return Skip { inner: inner, left: n }; }
 
 methods Skip<T, I: Iter<T>> for Iter<T> {
-    // The skipping happens on the first question asked, not at construction — which is what
-    // makes it lazy, and why `hasNext` is the one that drains.
+    // The skipping is done lazily, by `hasNext` on its first call, not at construction.
     hasNext &self -> bool {
         while (self.left > 0 && self.inner.hasNext()) {
             self.inner.next();
-            self.left = self.left - 1;
+            self.left -= 1;
         }
         return self.inner.hasNext();
     }

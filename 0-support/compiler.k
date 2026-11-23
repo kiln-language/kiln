@@ -1,9 +1,7 @@
-// The three things every phase shares: interned names, the source text those names point into,
-// and how a problem is reported.
-//
-// Three globals and the policy for stopping. Everything that was general here moved into the
-// standard library, where the rest of the language can have it.
-#include <stdlib::{cmp, encode, heap, intern, mem, io, option, result, string, sys, textfile, time, vec}>
+// What every phase of the compiler shares: interned names (and how a name is written into a
+// `.klib`), the source text those names point into, where in that text the compiler is working,
+// and how a problem is reported and when the compile stops.
+#include <stdlib::{cmp, encode, heap, intern, mem, io, option, recover, result, string, sys, textfile, time, vec}>
 
 // A name, as an index into `gNames`. Comparing two is an integer compare, and a `Sym` is `Copy`,
 // so it can be a map key, an enum payload or a struct field without owning anything.
@@ -29,9 +27,8 @@ methods Sym for Ord {
 }
 methods Sym for Hash { hash &self -> u64 { return mixHash((self as long) as u64); } }
 
-// One interner for the whole compile. The C++ front end kept its registries in thread-local
-// globals for the same reason: every phase turns names into symbols, and threading an interner
-// through every signature buys nothing when there is exactly one.
+// One interner for the whole compile. Every phase turns names into symbols, and threading an
+// interner through every signature buys nothing when there is exactly one.
 pub var gNames: Interner;
 
 pub intern s:str -> Sym  { return gNames.intern(s); }
@@ -47,19 +44,37 @@ pub keep s:str -> str { return gNames.keep(s); }
 pub internString s:String -> Sym { return gNames.internString(s); }
 pub keepString   s:String -> str { return gNames.keepString(s); }
 
+// A name the compiler makes, `<pre><n><tail>` (`.GD12`, `.IL7_.L0`), interned without `format`:
+// the inliner makes one per site and per label, and boxing the arguments cost more than the name.
+pub madeName pre:str n:long tail:str -> Sym {
+    s: String;
+    s.pushStr(pre);
+    s.pushLong(n);
+    s.pushStr(tail);
+    return internString(s);
+}
+
+// The Sym `s` already is, or NO_SYM, without interning it. A table keyed by names' numbers is
+// asked this way when the caller holds only text: a name that was never interned cannot be in it.
+pub symIfAny s:str -> Sym {
+    hit: Option<long> = gNames.lookup(s);
+    match hit { Some(id) { return id as Sym; } None { } }
+    return NO_SYM;
+}
+
 // ─── names in a `.klib` ──────────────────────────────────────────────────────
 // A package's metadata holds every name it mentions once, in a string table, and a name anywhere
-// else in it is a position in that table plus one (0 is no name). Writing, the table is filled
-// in order of first use, so the same compile writes the same bytes. Reading, a position becomes
-// a name the first time something decodes it, and every later decode of it is a vector read:
-// a name the dependent never looks at is never interned.
+// else in it is a position in that table plus one (0 is no name). When writing, the table is
+// filled in order of first use, so the same compile writes the same bytes. When reading, a
+// position becomes a name the first time something decodes it, and every later decode of it is a
+// vector read, so a name the dependent never looks at is never interned.
 
 // Writing: per name, its position in the table, or -1; and the table, in order.
 pub var gSymOut: Vec<long> = vec![];
 pub var gSymTable: Vec<Sym> = vec![];
-// Reading: every loaded package's table, one after another. Per entry its spelling (a view into
-// the metadata, which is kept) and the name it was interned as, `SYM_UNREAD` until then. A
-// package's names are `gSymInBase` onward, `gSymInCount` of them: set while one is decoded.
+// Reading: every loaded package's table, one after another. Each entry has its spelling (a view
+// into the metadata, which is kept) and the name it was interned as, `SYM_UNREAD` until it is.
+// While a package is being decoded, its names are the `gSymInCount` entries from `gSymInBase`.
 pub var gSymInText: Vec<str> = vec![];
 pub var gSymIn: Vec<Sym> = vec![];
 pub var gSymInBase: long = 0;
@@ -107,17 +122,16 @@ pub symAt inp:&Decoder t:long -> Sym {
 
 // `stdlib` is a package like any other and is named like one: `<stdlib::io>`, the way Rust writes
 // `std::`. It is the one package nobody has to declare a dependency on, because a standalone
-// program has no manifest to declare it in: implicitly available, explicitly named. Here, where
-// every phase can reach it: the preprocessor resolves includes against it, the scanner pulls
-// `core` and `ast` from it, and an error names a module of it to include.
+// program has no manifest to declare it in: implicitly available, explicitly named. It is defined
+// here because every phase needs it: the preprocessor resolves includes against it, the scanner
+// pulls `core` and `ast` from it, and an error can name one of its modules to include.
 pub STDLIB_PKG:  str = "stdlib";
 pub STDLIB_ROOT: str = "stdlib";
 
 // ─── source text ─────────────────────────────────────────────────────────────
 // Every `str` the compiler holds (a token's spelling, a diagnostic's quoted line) points into
-// one of these, so they are kept for the life of the process. That is the same bargain the C++
-// front end made with its Arena: a compiler runs once and exits, so releasing is work with no
-// observer.
+// one of these, so they are kept for the life of the process. A compiler runs once and exits,
+// so freeing them would be work that nobody could observe.
 local var gSources: Vec<String>;
 
 // The text of `path`, or `None` if it cannot be opened. The caller decides whether a miss is an
@@ -148,7 +162,7 @@ pub holdSource text:String -> str {
 pub readSource path:str -> str {
     hit: Option<str> = tryReadSource(path);
     match hit { Some(t) { return t; } None { } }
-    failStr(format("could not open '{}'", path));
+    failStr(format("cannot open `{}`", path));
     return "";
 }
 
@@ -168,9 +182,9 @@ pub phaseEnd name:str -> void {
 }
 
 // ─── diagnostics ─────────────────────────────────────────────────────────────
-// There are no exceptions, so an error is not thrown and caught: it is written to stderr and the
-// process exits. That is what the C++ front end did anyway once the top-level handler printed
-// the message: the catch only ever added a frame.
+// There are no exceptions, so an error is not thrown and caught. It is written to stderr, and
+// then either the phase picks up again at the recovery point it armed (below) or the process
+// exits with `COMPILE_FAILED`.
 pub COMPILE_FAILED: long = 1;
 
 // ─── where in the source ─────────────────────────────────────────────────────
@@ -217,10 +231,11 @@ pub posCol p:long -> long { return p & 65535; }
 
 // ─── what a diagnostic says besides its message ──────────────────────────────
 // An error inside a generic instance or a derive also says where that instance was asked for,
-// back to the user's code; the compiler's own (`internal: ...`) says what it was doing. And a type
-// is named as it is written (`Option<long>`, not `option::Option_long`). The tables that know all
-// that are the registry's, above this module, so they reach the error path through two hooks
-// `parse::diag` installs (`installDiagnostics`); until then a message is printed as it is.
+// back to the user's code, and an internal compiler error says what the compiler was doing. A
+// type is named as it is written (`Option<long>`, not `option::Option_long`). The tables that
+// know all that belong to the registry, which sits above this module, so they reach the error
+// path through two hooks that `parse::diag` installs (`installDiagnostics`). Until then a
+// message is printed as it is.
 pub var gPhase: str = "";          // what the driver is running: "type-checking", "lowering", ...
 pub var gCtxFn: Sym = NO_SYM;      // the function the phase is working on, for the notes
 local spellAsIs msg:str -> String { return stringOf(msg); }
@@ -230,117 +245,161 @@ pub var gNoteHook: fn(str) -> void = &noNotes;
 local var gInFail: bool = false;   // a hook that fails is not given a second chance
 
 // ─── going on past an error ──────────────────────────────────────────────────
-// A phase that works function by function arms a recovery point around each one
-// (`armRecovery`): an error inside is reported, and the phase goes on with the next function
-// instead of stopping, up to `MAX_ERRORS`. At the end of that phase the compile stops if there was
-// any (`stopIfErrors`), so no later phase sees a function an error cut short. Work an error would
-// leave half done in a way the next function could trip over (a macro running in the evaluator,
-// an implementation being stamped) holds `gNoResume`, and an error there stops at once, as one
-// with no recovery point armed does.
+// A phase that works function by function runs each one in the body of a `recover`, and the
+// parser each top-level declaration: an error inside is reported, `fail` or `failAt` raises, and
+// the phase goes on with the next one instead of stopping, up to `MAX_ERRORS`. At the end of that
+// phase the compile stops if there was any (`stopIfErrors`), so no later phase sees a function or
+// a declaration an error cut short. Work an error would leave half done in a way the next function
+// could trip over (a macro running in the evaluator, an implementation being stamped) holds
+// `gNoResume`, and an error there stops at once, as one outside any `recover` does.
 pub var gErrorCount: long = 0;
 pub MAX_ERRORS: long = 20;
 pub var gNoResume: long = 0;
-local var gResumeArmed: bool = false;
-local var gJmp: [long; 8];         // the caller's rbp, resume address, rsp, then r12..r15
 
-// A recovery point, in the manner of `setjmp`: answers 0 when armed, and 1 a second time, later,
-// when an error under it was reported and the caller should abandon what it was doing. Saved from
-// this function's own frame (the prologue is `push rbp; mov rbp, rsp`): the caller's rbp, the
-// address the call returns to, the caller's rsp once it has, and r12-r15, the registers this
-// compiler's convention has a callee preserve; every other register a call clobbers anyway, so
-// the caller holds nothing there. Nothing in this body uses a callee-saved register, so those
-// four are still the caller's. Never inlined: a function holding `asm` is not. The caller must
-// arm immediately before the work it protects and change nothing it reads after a resume in
-// between, since a register holding such a value comes back as it was when armed.
-pub unsafe armRecovery -> long {
-    buf: long = &gJmp as long;
-    asm {
-        in rcx buf;
-        "mov rax, [rbp]"
-        "mov [rcx], rax"
-        "mov rax, [rbp + 8]"
-        "mov [rcx + 8], rax"
-        "lea rax, [rbp + 16]"
-        "mov [rcx + 16], rax"
-        "mov [rcx + 24], r12"
-        "mov [rcx + 32], r13"
-        "mov [rcx + 40], r14"
-        "mov [rcx + 48], r15"
-    }
-    gResumeArmed = true;
-    return 0;
-}
-pub disarmRecovery -> void { gResumeArmed = false; }
-// Whether a phase may arm one now: not inside another, and not past the cap.
-pub canRecover -> bool { return !gResumeArmed && gErrorCount < MAX_ERRORS - 1; }
-
-// Back to the armed point, as `armRecovery` answering 1 (`longjmp`).
-local unsafe resumeRecovery -> void {
-    gResumeArmed = false;
-    buf: long = &gJmp as long;
-    asm {
-        in rcx buf;
-        "mov r12, [rcx + 24]"
-        "mov r13, [rcx + 32]"
-        "mov r14, [rcx + 40]"
-        "mov r15, [rcx + 48]"
-        "mov rbp, [rcx]"
-        "mov rsp, [rcx + 16]"
-        "mov eax, 1"
-        "jmp qword [rcx + 8]"
-    }
-}
+// Whether a phase may run a function or a declaration under a `recover` of its own now: not
+// inside another, whose handler then takes the error, and not past the cap.
+pub canRecover -> bool { return !recoverArmed() && gErrorCount < MAX_ERRORS - 1; }
 
 // The end of a phase that went on past its errors: stop if there were any.
 pub stopIfErrors -> void {
     if (gErrorCount == 0) { return; }
-    if (gErrorCount > 1) { eprintln("{} errors", gErrorCount); }
+    if (gErrorCount > 1) { eprintln("{} errors generated.", gErrorCount); }
     flushErr();
     sysExit(COMPILE_FAILED);
 }
 
-// Every error past the parser says where, as the parser's own do: `file:line:col: Error: ...`,
-// then its notes (`note: ...`, one per line).
+// A count and its noun, for a message: "1 argument", "3 arguments". Only for the error path, since
+// the text is interned and kept.
+pub plural n:long noun:str -> str {
+    s: String;
+    s.pushLong(n);
+    s.push(' ');
+    s.pushStr(noun);
+    if (n != 1) { s.push('s'); }
+    return keepString(s);
+}
+
+// ─── how an error is printed ─────────────────────────────────────────────────
+// The layout gcc and clang use, which editors and terminals already know how to read:
+//
+//     app.k:12:5: error: mismatched types: expected `u8`, found `long`
+//        12 |     c = n;
+//           |     ^
+//     help: convert it explicitly with `as u8`
+//
+// The first line of a message is the error. Any line after it is a `note:` or `help:` its caller
+// wrote, printed under the source line. An error with no position (a command-line mistake, an
+// archive that cannot be read) is just `error: ` and the message.
+local printError file:str line:long col:long text:str -> void {
+    cut: long = strFind(text, "
+").unwrapOr(text.len);
+    first: str = strSlice(text, 0, cut);
+    if (file.len > 0) {
+        eprintln("{}:{}:{}: error: {}", file, line, col, first);
+        showSourceLine(file, line, col);
+    } else {
+        eprintln("error: {}", first);
+    }
+    if (cut < text.len) { eprintln("{}", strSlice(text, cut + 1, text.len - cut - 1)); }
+}
+
+// Line `line` of `file`, with a caret under column `col` (counted from 1). The file is read again,
+// which only an error pays for. Nothing is printed when it cannot be read (a module that came out
+// of a `.klib` may have no source beside it) or when the line is past its end. A tab before the
+// column is copied into the caret line so that the caret lands where a terminal shows the
+// character.
+pub showSourceLine file:str line:long col:long -> void {
+    if (line <= 0 || file == "<input>") { return; }
+    hit: Option<str> = tryReadSource(file);
+    text: str = "";
+    match hit { Some(t) { text = t; } None { return; } }
+    at: long = 0;
+    n: long = 1;
+    while (n < line) {
+        nl: long = strFind(strSlice(text, at, text.len - at), "
+").unwrapOr(-1);
+        if (nl < 0) { return; }
+        at = at + nl + 1;
+        n = n + 1;
+    }
+    rest: str = strSlice(text, at, text.len - at);
+    end: long = strFind(rest, "
+").unwrapOr(rest.len);
+    if (end > 0 && charAt(rest, end - 1) == 13) { end = end - 1; }
+    src: str = strSlice(rest, 0, end);
+    // The line number right-aligned in five columns, as gcc does.
+    num: String;
+    num.pushLong(line);
+    gutter: String;
+    if (num.length() < 5) { gutter.pushRepeated(' ', 5 - num.length()); }
+    gutter.pushString(num);
+    eprintln("{} | {}", gutter, src);
+    if (col <= 0) { return; }
+    mark: String;
+    mark.pushRepeated(' ', gutter.length());
+    mark.pushStr(" | ");
+    k: long = 0;
+    while (k < col - 1 && k < src.len) {
+        if (charAt(src, k) == 9) { mark.push('	'); } else { mark.push(' '); }
+        k = k + 1;
+    }
+    mark.push('^');
+    eprintln("{}", mark);
+}
+
+// Report an error at `gPos` (or with no position when it is 0), then its notes, and either raise to
+// the `recover` the phase is running the function under, or stop the compile.
 pub fail msg:str -> never {
     nested: bool = gInFail;
     gInFail = true;
     // A call through a function value is taken to write what it is handed (the guard cannot see
-    // its callee), and `fail` is handed immutable globals (`fail(USAGE)`): the hooks get a copy.
+    // its callee), and `fail` is handed immutable globals (`fail(USAGE)`), so the hooks get a copy.
     m: str = msg;
     text: String;
     if (nested) { text = stringOf(msg); } else { text = gSpellHook(m); }
+    shown: str = "";
+    unsafe { shown = text.view(); }
     if (gPos != 0) {
         f: Sym = posFile(gPos);
         where: str = "<input>";
         if (f != NO_SYM) { where = nameOf(f); }
-        eprint("{}:{}:{}: ", where, posLine(gPos), posCol(gPos));
-        eprintln("Error: {}", text);
+        printError(where, posLine(gPos), posCol(gPos), shown);
     } else {
-        eprintln("Error: {}", text);
+        printError("", 0, 0, shown);
     }
     if (!nested) { gNoteHook(m); }
     flushErr();
+    goOnOrStop(nested);
+}
+
+// After an error is printed: count it, and either go on with the next unit of work, by raising
+// to the `recover` the phase runs this one under, or stop the compile: when no `recover` is
+// armed, when the work in hand would be left half done (`gNoResume`), or at the cap. The raise is
+// the phase's own: its `recover` owns every frame down to here, none of them holds a lock, and
+// what they leave half built belongs to the unit the phase discards.
+local goOnOrStop nested:bool -> never {
     gErrorCount = gErrorCount + 1;
-    if (!nested && gResumeArmed && gNoResume == 0 && gErrorCount < MAX_ERRORS) {
+    if (!nested && recoverArmed() && gNoResume == 0 && gErrorCount < MAX_ERRORS) {
         gInFail = false;
-        unsafe { resumeRecovery(); }
+        unsafe { raise(); }
     }
-    if (gErrorCount > 1) {
-        if (gErrorCount >= MAX_ERRORS) { eprintln("{} errors; stopping", gErrorCount); }
-        else { eprintln("{} errors", gErrorCount); }
-    }
+    if (gErrorCount >= MAX_ERRORS) { eprintln("error: too many errors, stopping now"); }
+    if (gErrorCount > 1) { eprintln("{} errors generated.", gErrorCount); }
     flushErr();
     sysExit(COMPILE_FAILED);
 }
 
-// `file:line:col: message`, the form every editor can jump to. A missing file prints `<input>`.
-//
-// No `Error: ` banner. The reference does not put one in front of the location: its parser emits
-// `file:line:col: Expected a statement, but found …` with no banner at all, and its lexer's
-// callers write one into the message they hand over, so it lands after the location. Prefixing
-// here inverted every positioned diagnostic in the port: all eight of the lexer's, and the
-// parser's, which should have none. A caller that wants a banner puts it in `msg`.
+// While the parser skips the rest of a declaration it has reported an error in, a lexer error in
+// that text is neither printed nor counted: it only raises to the `recover` around the skip, which
+// goes on from past it (`Parser.skipToNextDecl`). Only ever set with that `recover` armed.
+pub var gQuiet: long = 0;
+
+// An error at a position the caller names rather than at `gPos`: what the lexer and the parser
+// report, since they know exactly where they are in the text. A missing file name prints
+// `<input>`. The parser reads each declaration under a `recover`, so this goes on to the next
+// one as `fail` goes on to the next function.
 pub failAt file:str line:long col:long msg:str -> never {
+    if (gQuiet > 0 && recoverArmed()) { unsafe { raise(); } }
     where: str = file;
     if (file.len == 0) { where = "<input>"; }
     nested: bool = gInFail;
@@ -348,14 +407,15 @@ pub failAt file:str line:long col:long msg:str -> never {
     m: str = msg;                      // a copy for the hook, as in `fail`
     text: String;
     if (nested) { text = stringOf(msg); } else { text = gSpellHook(m); }
-    eprintln("{}:{}:{}: {}", where, line, col, text);
-    if (gErrorCount > 0) { eprintln("{} errors", gErrorCount + 1); }
+    shown: str = "";
+    unsafe { shown = text.view(); }
+    printError(where, line, col, shown);
     flushErr();
-    sysExit(COMPILE_FAILED);
+    goOnOrStop(nested);
 }
 
-// `fail` for a message that had to be assembled: almost always by `format`. Takes the String
-// rather than a view of it so the call site is one line and cannot outlive its own buffer.
+// `fail` for a message that had to be assembled, almost always by `format`. Takes the String
+// rather than a view of it, so the call site is one line and cannot outlive its own buffer.
 pub failStr s:String -> never { unsafe { fail(s.view()); } }
 
 pub failAtStr file:str line:long col:long s:String -> never {

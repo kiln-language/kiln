@@ -1,11 +1,18 @@
 #!/bin/bash
-# The three suites this compiler is held to. Run from the repository root; pass the compiler to
-# test as $1, or leave it and gen1 is built first.
+# Runs the test suites this compiler is held to. Run it from the repository root and pass the
+# compiler to test as $1; without one, gen1 is built first.
 #
-#   selftests   — this tree's own tests. `expected.tsv` gives each one an exit code, or, for a
-#                 program whose name says it must be REFUSED, a substring of the refusal.
-#   corpus      — every program in ../Kiln/tests that must compile, and does.
-#   rejections  — every program there whose name holds `err` or `error`, which must not.
+#   selftests:   this tree's own tests. `expected.tsv` gives each one an exit code or, for a
+#                program whose name says it must be REFUSED, a substring of the error it prints.
+#                A refused one with a `.expect` file beside it must print exactly that file
+#                (every error, and nothing else): the parser's tests of going on past errors.
+#   rewind:      for each of those, `--verify-regops` holds the registry the parse left to the
+#                one its operation log replays to, so a declaration taken back for an error took
+#                all it had registered with it.
+#   foreign:     a program linked with a foreign object (`scripts/foreign.sh`).
+#   corpus:      every program in ../Kiln/tests that must compile, each of which has to.
+#   rejections:  every program there whose name holds `err` or `error`, each of which must be
+#                refused.
 OUT=${2:-build}
 C=${1:-}
 if [ -z "$C" ]; then scripts/build.sh "$OUT" >/dev/null; C=$OUT/gen1; fi
@@ -21,6 +28,9 @@ while IFS=$(printf '\t') read -r name exp; do
     case "$exp" in
         ""|*[!0-9]*)
             if [ $rc -eq 0 ]; then echo "  $name: expected refusal <$exp>, compiled"; fail=$((fail+1))
+            elif [ -f "selftests/$name.expect" ]; then
+                if [ "$out" = "$(cat "selftests/$name.expect")" ]; then pass=$((pass+1))
+                else echo "  $name: printed other than $name.expect:"; echo "$out" | head -20 | sed 's/^/    /'; fail=$((fail+1)); fi
             elif echo "$out" | grep -qF "$exp"; then pass=$((pass+1))
             else echo "  $name: got: $out"; fail=$((fail+1)); fi ;;
         *)
@@ -32,6 +42,19 @@ while IFS=$(printf '\t') read -r name exp; do
     esac
 done < selftests/expected.tsv
 echo "selftests    pass=$pass fail=$fail"
+# The registry after a parse that took declarations back, against its log. A test that reaches
+# the cap stops in the middle of the parse, before there is anything to compare.
+rw=0; rwbad=0
+for e in selftests/*.expect; do
+    [ -f "$e" ] || continue
+    grep -q "too many errors" "$e" && continue
+    n=$(basename "$e" .expect)
+    if "$C" --verify-regops "selftests/$n.k" 2>&1 | grep -q '; 0 differences$'; then rw=$((rw+1))
+    else rwbad=$((rwbad+1)); echo "  $n: the registry after its errors is not the one its log replays to"; fi
+done
+echo "rewind       pass=$rw fail=$rwbad"
+# A program linked with a foreign object that clobbers every register System V lets it clobber.
+scripts/foreign.sh "$C"
 
 [ -d "$CORPUS/tests" ] || { echo "corpus       (../Kiln/tests not present, skipped)"; exit 0; }
 cd "$CORPUS" || exit 1

@@ -6,13 +6,14 @@
 //     key: Hash128 = h.finish();
 //     println("{}", key.hex());          // 32 hex digits
 //
-// For identifying content -- a build cache key, a file's fingerprint -- not for defending against
-// someone who chooses the input: it is not a cryptographic hash. What it is, is well distributed
-// at the full 128 bits (it passes SMHasher), fast over whole files (two 64-bit lanes, one
-// multiply-rotate-multiply per word, no table), and published with reference output, so this
-// implementation is checked against the original rather than against itself. A one-shot call and
-// any split of the same bytes across `update`s give the same hash: the block loop runs over a
-// carried 16-byte tail, and only `finish` mixes in the length.
+// For identifying content, such as a build cache key or a file fingerprint. It is not a
+// cryptographic hash, so do not rely on it against someone who controls the input. It is well
+// distributed across all 128 bits and passes SMHasher. It is fast over whole files: two 64-bit
+// lanes, one multiply-rotate-multiply per word, and no table. It also has published reference
+// output, so this implementation is tested against the original and not just against itself.
+//
+// One call and any split of the same bytes across `update` calls give the same hash: the block
+// loop carries a 16-byte tail between calls, and only `finish` mixes in the length.
 #include <{core, string, cmp}>
 
 // The two lanes' multipliers and the finalizer's, as the reference spells them in hex. Written
@@ -48,7 +49,7 @@ methods Hash128 for Eq<Hash128> {
 methods Hash128 for Display {
     display &self w:Write -> void { s: String = self.hex(); writeTo(w, "{}", s); }
 }
-// A content hash is already well mixed, so as a table key its first lane IS the bucket hash.
+// A content hash is already well mixed, so as a table key its first lane is the bucket hash.
 methods Hash128 for Hash {
     hash &self -> u64 { return self.lo; }
 }
@@ -74,13 +75,13 @@ methods Hasher128 {
     update &self b:[u8] -> void {
         i: long = 0;
         n: long = b.len;
-        self.total = self.total + n;
+        self.total += n;
         // Top up a carried partial block first.
         if (self.tailLen > 0) {
             while (self.tailLen < 16 && i < n) {
                 self.tail[self.tailLen] = b[i];
-                self.tailLen = self.tailLen + 1;
-                i = i + 1;
+                self.tailLen += 1;
+                i += 1;
             }
             if (self.tailLen < 16) { return; }
             unsafe {
@@ -94,13 +95,13 @@ methods Hasher128 {
             base: long = b.ptr as long;
             while (i + 16 <= n) {
                 self.block(*((base + i) as *u64), *((base + i + 8) as *u64));
-                i = i + 16;
+                i += 16;
             }
         }
         while (i < n) {
             self.tail[self.tailLen] = b[i];
-            self.tailLen = self.tailLen + 1;
-            i = i + 1;
+            self.tailLen += 1;
+            i += 1;
         }
     }
 
@@ -128,25 +129,25 @@ methods Hasher128 {
         // into the second lane's word, 0..7 into the first's, each little-endian.
         j: long = n;
         while (j > 8) {
-            j = j - 1;
-            k2 = k2 ^ ((self.tail[j] as u64) << ((j - 8) * 8));
+            j -= 1;
+            k2 ^= ((self.tail[j] as u64) << ((j - 8) * 8));
         }
         if (n > 8) { h2 = h2 ^ mixK2(k2); }
         j = n;
         if (j > 8) { j = 8; }
         while (j > 0) {
-            j = j - 1;
-            k1 = k1 ^ ((self.tail[j] as u64) << (j * 8));
+            j -= 1;
+            k1 ^= ((self.tail[j] as u64) << (j * 8));
         }
         if (n > 0) { h1 = h1 ^ mixK1(k1); }
-        h1 = h1 ^ (self.total as u64);
-        h2 = h2 ^ (self.total as u64);
-        h1 = h1 + h2;
-        h2 = h2 + h1;
+        h1 ^= (self.total as u64);
+        h2 ^= (self.total as u64);
+        h1 += h2;
+        h2 += h1;
         h1 = fmix64(h1);
         h2 = fmix64(h2);
-        h1 = h1 + h2;
-        h2 = h2 + h1;
+        h1 += h2;
+        h2 += h1;
         return Hash128 { lo: h1, hi: h2 };
     }
 }
@@ -165,11 +166,11 @@ local rotl64 x:u64 r:long -> u64 { return (x << r) | (x >> (64 - r)); }
 // The finalizer: every input bit reaches every output bit.
 local fmix64 k0:u64 -> u64 {
     k: u64 = k0;
-    k = k ^ (k >> 33);
-    k = k * F1;
-    k = k ^ (k >> 33);
-    k = k * F2;
-    k = k ^ (k >> 33);
+    k ^= (k >> 33);
+    k *= F1;
+    k ^= (k >> 33);
+    k *= F2;
+    k ^= (k >> 33);
     return k;
 }
 
@@ -178,6 +179,6 @@ local pushHex64 inout out:String v:u64 -> void {
     while (shift >= 0) {
         d: long = ((v >> shift) & 15) as long;
         if (d < 10) { out.push(('0' + d) as char); } else { out.push(('a' + d - 10) as char); }
-        shift = shift - 4;
+        shift -= 4;
     }
 }

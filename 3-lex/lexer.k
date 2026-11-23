@@ -27,12 +27,19 @@ pub struct Lexer {
     tokLine: long,             // where the token last returned began
     tokCol:  long,
     // The last token returned was a `.`: `t.0.1` is two tuple fields, not `t.` and `0.1`.
-    afterDot: bool
+    afterDot: bool,
+    // Where the source's text last ended: the line and column of the last character of the last
+    // token or comment read. The end of the file is reported just past it, which is where gcc and
+    // clang put an error such as a missing `}`: on the last line that says anything, not on the
+    // empty line after its newline.
+    endLine: long,
+    endCol:  long
 }
 
 pub lexerOf source:str -> Lexer {
     return Lexer { src: source, pos: 0, fileLine: 1, charNumber: 0,
-                   currentFile: NO_SYM, currentPackage: NO_SYM, tokLine: 1, tokCol: 0, afterDot: false };
+                   currentFile: NO_SYM, currentPackage: NO_SYM, tokLine: 1, tokCol: 0, afterDot: false,
+                   endLine: 1, endCol: 0 };
 }
 
 methods Lexer {
@@ -50,37 +57,29 @@ methods Lexer {
         return c;
     }
 
-    // Step over a decimal digit, advancing the cursor but not the column. The C++ lexer read a
-    // number's digits straight off the stream, past the counter its own `getNextChar` kept, so
-    // every diagnostic after a decimal literal on the same line is reported that many columns to
-    // the left. The count is part of the locations this port has to reproduce.
+    // Step over a decimal digit. A digit is never a newline, so this is `advance` without the test.
     takeDigit &self -> long {
         d: long = self.peek() - '0';
         self.pos = self.pos + 1;
+        self.charNumber = self.charNumber + 1;
         return d;
     }
 
-    // Errors point at the real source: the file named by the last `#file` marker, and the line and
-    // column within it. Before the first marker there is no file to name, which happens only when
-    // the lexer is run on raw source rather than through the preprocessor.
+    // An error in the source. It is reported where the token being read began, in the file named
+    // by the last `#file` marker, so an unterminated string points at its opening quote rather than
+    // at the end of the file. Before the first marker there is no file to name, which happens only
+    // when the lexer is run on raw source rather than through the preprocessor.
     //
-    // Written straight to stderr rather than through `failAt`, which puts `Error: ` in front of
-    // the location. The reference builds this diagnostic as `<file>:<line>:<col>: ` followed by a
-    // message its own callers wrote with the banner already inside it, so the banner lands after
-    // the location, `e1.k:5:1: Error: Unclosed string literal`, verified against the reference
-    // binary for all eight of this lexer's error paths. `Preprocessor.failFrom` sits here for the
-    // same reason, one line further along the same argument: the reference's text is the spec,
-    // and `failAt`'s order is not it.
+    // The parser goes on past one (`failAt` raises to the declaration it is reading). Every error
+    // here is met with the cursor already past the text it is about (an unterminated literal or
+    // comment has run to the end of the input), so the next token is read from there.
     err &self msg:str -> void {
-        eprintln("{}:{}:{}: Error: {}", self.fileName(), self.fileLine, self.charNumber, msg);
-        flushErr();
-        sysExit(COMPILE_FAILED);
+        failAt(self.fileName(), self.tokLine, self.tokCol, msg);
     }
     errStr &self msg:String -> void {
         unsafe { self.err(msg.view()); }   // the view dies with this call, which never returns
     }
-    // `<input>` when no `#file` marker has been seen, which is what the reference names a lexer
-    // run on raw source rather than through the preprocessor.
+    // `<input>` when no `#file` marker has been seen yet.
     fileName &self -> str {
         if (self.currentFile == NO_SYM) { return "<input>"; }
         return nameOf(self.currentFile);
@@ -115,8 +114,8 @@ methods Lexer {
         value: u64 = 0 as u64;
         if (first == '0' && (self.peek() == 'x' || self.peek() == 'X')) {
             self.advance();
-            digits = self.pos;          // the C++ message names the digits, not the `0x`
-            if (hexVal(self.peek()) < 0) { self.err("Expected a hexadecimal number, but found nothing after '0x'"); }
+            digits = self.pos;          // the message names the digits, not the `0x`
+            if (hexVal(self.peek()) < 0) { self.err("expected hexadecimal digits after `0x`"); }
             while (hexVal(self.peek()) >= 0 || (self.peek() == '_' && hexVal(charAt(self.src, self.pos + 1)) >= 0)) {
                 if (self.peek() == '_') { self.advance(); continue; }
                 d: long = hexVal(self.advance());
@@ -164,7 +163,7 @@ methods Lexer {
         if (self.peek() == 'e' || self.peek() == 'E') {
             self.advance();
             if (self.peek() == '+' || self.peek() == '-') { self.advance(); }
-            if (!isDigit(self.peek())) { self.err("a float literal's exponent needs digits"); }
+            if (!isDigit(self.peek())) { self.err("expected at least one digit in the exponent of a float literal"); }
             while (isDigit(self.peek())) { self.advance(); }
         }
         if (isAlpha(self.peek()) || self.peek() == '_') { self.err("unexpected character after a float literal"); }
@@ -176,28 +175,29 @@ methods Lexer {
         return tokenText(Tok.FloatLiteral, internString(s));
     }
 
-    // The literal does not fit a `long`. Read the rest of its digits first, so the message names
-    // the whole thing rather than the prefix that happened to overflow, and so the column is the
-    // one the C++ lexer would have reached, which for a decimal literal is its first digit.
+    // The literal does not fit in 64 bits. The rest of its digits are read first, so the message
+    // names the whole literal rather than the prefix that happened to overflow.
     tooLarge &self digits:long base:long -> void {
         if (base == 16) { while (hexVal(self.peek()) >= 0 || self.peek() == '_') { self.advance(); } }
         else            { while (isDigit(self.peek()) || self.peek() == '_') { self.advance(); } }
         s: String;
-        s.pushStr("Integer literal '");
+        s.pushStr("integer literal `");
         s.pushStr(strSlice(self.src, digits, self.pos - digits));
-        s.pushStr("' is out of range");
+        s.pushStr("` is too large
+note: the largest integer literal is 18446744073709551615 (`u64`'s maximum)");
         self.errStr(s);
     }
 
     // Read to the closing quote. Backslash escapes are kept verbatim (they are resolved at
-    // lowering) which is also what stops an escaped quote from ending the string early. The
-    // quotes stay in the token's text, as they did in the C++ lexer.
+    // lowering), which is also what stops an escaped quote from ending the string early. The
+    // quotes stay in the token's text, so the token dump shows them as the earlier compiler's did;
+    // the parser takes them off (`unquoted`).
     lexStringLiteral &self -> Token {
         start: long = self.pos - 1;
         while (self.peek() != '"') {
             c: long = self.advance();
-            if (c == EOF_CHAR) { self.err("Unclosed string literal"); }
-            if (c == '\\' && self.advance() == EOF_CHAR) { self.err("Unclosed string literal"); }
+            if (c == EOF_CHAR) { self.err("unterminated string literal"); }
+            if (c == '\\' && self.advance() == EOF_CHAR) { self.err("unterminated string literal"); }
         }
         self.advance();
         return tokenText(Tok.StringLiteral, intern(strSlice(self.src, start, self.pos - start)));
@@ -207,14 +207,14 @@ methods Lexer {
     // here, so the token carries the one character the parser turns into a literal.
     lexCharLiteral &self -> Token {
         c: long = self.advance();
-        if (c == EOF_CHAR) { self.err("Unclosed char literal"); }
+        if (c == EOF_CHAR) { self.err("unterminated character literal"); }
         if (c == '\\') {
             e: long = self.advance();
-            if (e == EOF_CHAR) { self.err("Unclosed char literal"); }
+            if (e == EOF_CHAR) { self.err("unterminated character literal"); }
             c = escapeByte(e);
         }
         if (self.advance() != '\'') {
-            self.err("a char literal must be a single character closed by '");
+            self.err("a character literal holds exactly one character");
         }
         return tokenNum(Tok.CharLiteral, c);
     }
@@ -236,7 +236,7 @@ methods Lexer {
         hasNum: bool = isDigit(self.peek());
         while (isDigit(self.peek())) {
             d: long = self.advance() - '0';
-            if (line > (LONG_MAX - d) / 10) { self.err("line number in #file is out of range"); }
+            if (line > (LONG_MAX - d) / 10) { self.err("line number in `#file` is out of range"); }
             line = line * 10 + d;
         }
         // The package argument follows the line number across blanks and nothing else: anything
@@ -280,17 +280,25 @@ methods Lexer {
 
     // One token, or `Tok.FileEnd` at the end of the input.
     //
-    // The first thing done with a character is one table read. The C++ lexer instead ran its
-    // predicates in order: `isspace`, `/`, `#`, `isalpha||_`, `isdigit`, `"`, `'`, `.`, so a
-    // semicolon reached the punctuation map having failed about forty comparisons; `charClass`
-    // answers the same question with an index. The classes below are exhaustive and disjoint,
-    // and the two that can decline (a `/` that opens no comment, a `.` that is not `..`) fall
-    // through to the same two-character and single-character tables everything else uses, which
-    // is where `Tok.Slash` and `Tok.Dot` come from.
+    // The first thing done with a character is one table read (`charClass`) rather than a run of
+    // predicate tests, which would make a semicolon fail about forty comparisons before reaching
+    // the punctuation table. The classes are exhaustive and disjoint. The two that can decline (a
+    // `/` that opens no comment, a `.` that is not `..`) fall through to the same two-character
+    // and single-character tables everything else uses, which is where `Tok.Slash` and `Tok.Dot`
+    // come from.
     next &self -> Token {
         t: Token = self.nextRaw();
         self.afterDot = t.kind == Tok.Dot;
+        if (t.kind != Tok.FileEnd) { self.noteEnd(); }
         return t;
+    }
+
+    // The cursor is just past the last character of a token or a comment: that is where the text
+    // ends so far. A comment's line may end in the `\r` of a CRLF file, which is not text.
+    noteEnd &self -> void {
+        self.endLine = self.fileLine;
+        self.endCol = self.charNumber;
+        if (self.endCol > 0 && charAt(self.src, self.pos - 1) == '\r') { self.endCol = self.endCol - 1; }
     }
 
     nextRaw &self -> Token {
@@ -310,6 +318,7 @@ methods Lexer {
                 // Comments. A lone slash is division.
                 if (self.peek() == '/') {
                     while (self.peek() != '\n' && self.peek() != EOF_CHAR) { self.advance(); }
+                    self.noteEnd();
                     continue;
                 }
                 if (self.peek() == '*') {
@@ -319,6 +328,7 @@ methods Lexer {
                         if (x == EOF_CHAR) { self.err("unterminated block comment"); }
                         if (x == '*' && self.peek() == '/') { self.advance(); break; }
                     }
+                    self.noteEnd();
                     continue;
                 }
             }
@@ -342,14 +352,26 @@ methods Lexer {
             }
 
             one: Tok = punctOf(c);
-            // The reference has no diagnostic here at all: its `char_to_lToken.at(character)`
-            // throws `std::out_of_range`, and the driver prints that exception's own text,
-            // `map::at`, with no file, line or column, and worded differently by every C++
-            // standard library. That is a crash rather than a message, so this port says where
-            // the character is instead of reproducing it.
-            if (one == Tok.FileEnd) { self.err("unexpected character"); }
+            // A byte that starts no token. A printable one is named; anything else (a stray byte of
+            // UTF-8, a control character) is given in hex.
+            if (one == Tok.FileEnd) {
+                s: String;
+                if (c > 32 && c < 127) { s.pushStr("unexpected character `"); s.push(c as char); s.pushStr("`"); }
+                else {
+                    hex: str = "0123456789ABCDEF";
+                    s.pushStr("unexpected byte 0x");
+                    s.push(charAt(hex, (c >> 4) & 15) as char);
+                    s.push(charAt(hex, c & 15) as char);
+                    s.pushStr(" in the source");
+                }
+                self.errStr(s);
+            }
             return tokenOf(one);
         }
+        // Just past the end of the last text, rather than the column 0 of the line after the
+        // final newline, which has nothing on it to point at.
+        self.tokLine = self.endLine;
+        self.tokCol = self.endCol + 1;
         return tokenOf(Tok.FileEnd);
     }
 
@@ -371,7 +393,8 @@ methods Lexer {
     }
 }
 
-// ASCII case-insensitive compare, for the `true`/`false` test the C++ lexer did with toupper.
+// ASCII case-insensitive compare, for the `true`/`false` test: `TRUE` and `False` are boolean
+// literals too, as they were in the earlier compiler.
 pub eqNoCase a:str b:str -> bool {
     if (a.len != b.len) { return false; }
     for i in 0..a.len {

@@ -1,6 +1,6 @@
 // Sorting and searching any `Vec<T>`.
 //
-// The ordering comes from the element type — `sort(&xs)` needs nothing else, because `Ord` is a
+// The ordering comes from the element type: `sort(&xs)` needs nothing else, because `Ord` is a
 // bound the body dispatches through:
 //
 //     xs: Vec<long>;
@@ -13,23 +13,22 @@
 //     sortBy(&xs, ByDesc<long> { });            // [3, 2, 1]
 //     sortBy(&xs, ByFn<long> { f: &byLastDigit });  // any function, no type needed
 //
-// A comparator is a value, so it can carry what the comparison reads. The stateless ones also
-// cost LESS than the function pointer they replace: `compare` monomorphizes to a direct call
-// the inliner erases, where a `fn` is an indirect call at every comparison and the inliner
-// never touches one.
+// A comparator is a value, so it can carry data the comparison needs. The stateless ones are
+// also cheaper than a function pointer: `compare` monomorphizes to a direct call that the
+// inliner removes, while a `fn` is an indirect call on every comparison and is never inlined.
 //
-// Two algorithms. `sort`/`sortBy` is introsort — quicksort with a median-of-three pivot,
-// insertion sort under 16 elements, heapsort once recursion passes 2*log2(n) — in place, and NOT
+// Two algorithms. `sort`/`sortBy` is introsort (quicksort with a median-of-three pivot,
+// insertion sort under 16 elements, heapsort once recursion passes 2*log2(n)): in place, and not
 // stable: ties keep no particular order. `sortStable`/`sortStableBy` is a merge sort that keeps
 // equal elements in the order they arrived, at the price of a scratch buffer as large as the
-// vector. Pick it when the order of ties means something — records sorted by one key after
+// vector. Pick it when the order of ties means something, such as records sorted by one key after
 // another.
 //
-// Nothing here copies an element out, so the same code sorts a Vec<String> and a Vec<long>:
-// comparisons borrow, and the moves are bitwise shuffles of slots inside a buffer, which is the
-// one place a permutation of owning values is safe -- every slot ends up holding exactly one of
-// them. The inner loops index the buffer directly: the range is checked once on the way in, and
-// a bounds check per element per comparison was a third of the sort.
+// Nothing here copies an element out, so the same code sorts a Vec<String> and a Vec<long>.
+// Comparisons borrow, and moves are bitwise swaps of slots within one buffer. That is safe for
+// owning values because every slot still holds one of them when the sort is done. The inner
+// loops index the buffer directly after checking the range once on the way in; a bounds check
+// on every comparison costs about a third of the sort time.
 #include <{core, cmp, vec, heap, mem, option}>
 
 // [lo, hi] is within the vector, or nothing below is sound. Checked once per range.
@@ -58,18 +57,18 @@ local insertionRange<T, C: Compare<T>> inout v:Vec<T> lo:long hi:long c:C -> voi
             j: long = i - 1;
             while (j >= lo && c.compare(p[j], key) > 0) {   // slide the greater ones right, one move each
                 p[j + 1] = p[j];
-                j = j - 1;
+                j -= 1;
             }
             p[j + 1] = key;                                 // moved back in: one owner per slot again
         }
     }
 }
 
-// Partition [lo, hi] around a median-of-three pivot and return where the pivot came to rest:
-// everything before it compares <= 0 against it, everything after >= 0. The pivot is moved
-// to v[lo] first and stays there while the two scans run, which is what lets it be compared
-// against IN PLACE rather than copied out; the last swap puts it where it belongs. Ordering
-// the three samples also plants v[hi] >= pivot, the sentinel that stops the upward scan.
+// Partition [lo, hi] around a median-of-three pivot and return the pivot's final index.
+// Everything before it compares <= 0 against it, everything after >= 0. The pivot sits at v[lo]
+// while the two scans run, so it is compared in place instead of copied out, and the last swap
+// moves it into position. Ordering the three samples also leaves v[hi] >= pivot, which is the
+// sentinel that stops the upward scan.
 local partition<T, C: Compare<T>> inout v:Vec<T> lo:long hi:long c:C -> long {
     checkRange(v, lo, hi);
     unsafe {
@@ -86,8 +85,8 @@ local partition<T, C: Compare<T>> inout v:Vec<T> lo:long hi:long c:C -> long {
             while (c.compare(p[j], p[lo]) > 0) { j = j - 1; }   // stops at lo at the latest
             if (i >= j) { break; }
             swapRaw(p, i, j);
-            i = i + 1;
-            j = j - 1;
+            i += 1;
+            j -= 1;
         }
         swapRaw(p, lo, j);
         return j;
@@ -110,7 +109,7 @@ local siftDown<T, C: Compare<T>> inout v:Vec<T> lo:long start:long hi:long c:C -
     }
 }
 
-// Guaranteed O(n log n), in place, no recursion, no bad case — the ceiling that keeps
+// Guaranteed O(n log n), in place, no recursion, no bad case. It is the ceiling that keeps
 // introsort's worst case honest.
 local heapRange<T, C: Compare<T>> inout v:Vec<T> lo:long hi:long c:C -> void {
     n: long = hi - lo + 1;
@@ -119,24 +118,24 @@ local heapRange<T, C: Compare<T>> inout v:Vec<T> lo:long hi:long c:C -> void {
     i: long = lo + n / 2 - 1;
     while (i >= lo) {
         siftDown(v, lo, i, hi, c);
-        i = i - 1;
+        i -= 1;
     }
     e: long = hi;
     while (e > lo) {
         v.swap(lo, e);
-        e = e - 1;
+        e -= 1;
         siftDown(v, lo, lo, e, c);
     }
 }
 
 // Quicksort [lo, hi] with `budget` levels left before bailing out to heapsort. Recursion
-// always descends into the SMALLER partition and loops on the larger, so stack depth stays
+// always descends into the smaller partition and loops on the larger, so stack depth stays
 // O(log n) however lopsided the splits are.
 local introRange<T, C: Compare<T>> inout v:Vec<T> lo:long hi:long c:C budget:long -> void {
     while (lo < hi) {
         if (hi - lo < 16) { insertionRange(v, lo, hi, c); return; }
         if (budget <= 0) { heapRange(v, lo, hi, c); return; }
-        budget = budget - 1;
+        budget -= 1;
         p: long = partition(v, lo, hi, c);
         if (p - lo < hi - p) {
             introRange(v, lo, p - 1, c, budget);
@@ -149,10 +148,11 @@ local introRange<T, C: Compare<T>> inout v:Vec<T> lo:long hi:long c:C budget:lon
 }
 
 // ─── the stable sort ────────────────────────────────────────────────────────
-// Bottom-up merge sort: runs of 16 sorted by insertion (which is stable — it moves an element
-// only past strictly greater ones), then merged in widening passes, back and forth between the
-// vector's buffer and a scratch buffer of the same size. A tie takes the LEFT run's element
-// first, which is the whole of stability. Elements move by bytes, as everywhere here.
+// Bottom-up merge sort. Runs of 16 are sorted by insertion, which is stable because it only
+// moves an element past strictly greater ones. The runs are then merged in widening passes,
+// alternating between the vector's buffer and a scratch buffer of the same size. On a tie the
+// merge takes the left run's element first, which keeps the sort stable. Elements move as raw
+// bytes, as everywhere in this file.
 
 // Merge [lo, mid) and [mid, hi) of `src` into the same positions of `dst`.
 local unsafe mergeRuns<T, C: Compare<T>> src:*T dst:*T lo:long mid:long hi:long c:C -> void {
@@ -162,7 +162,7 @@ local unsafe mergeRuns<T, C: Compare<T>> src:*T dst:*T lo:long mid:long hi:long 
     while (i < mid && j < hi) {
         if (c.compare(src[j], src[i]) < 0) { memcpy(dst + k, src + j, sizeof(T)); j = j + 1; }
         else                               { memcpy(dst + k, src + i, sizeof(T)); i = i + 1; }
-        k = k + 1;
+        k += 1;
     }
     if (i < mid) { memcpy(dst + k, src + i, (mid - i) * sizeof(T)); }
     if (j < hi)  { memcpy(dst + k, src + j, (hi - j) * sizeof(T)); }
@@ -177,7 +177,7 @@ pub sortStableBy<T, C: Compare<T>> inout v:Vec<T> c:C -> void {
         last: long = first + run - 1;
         if (last >= n) { last = n - 1; }
         insertionRange(v, first, last, c);
-        first = first + run;
+        first += run;
     }
     if (n <= run) { return; }
     unsafe {
@@ -198,7 +198,7 @@ pub sortStableBy<T, C: Compare<T>> inout v:Vec<T> c:C -> void {
                 lo = hi;
             }
             inA = !inA;
-            width = width * 2;
+            width *= 2;
         }
         if (!inA) { memcpy(a, b, n * sizeof(T)); }         // the result ended in the scratch
         free(b);                                           // only bytes: every value lives in `a`
@@ -249,7 +249,7 @@ pub lowerBoundBy<T, C: Compare<T>> inout v:Vec<T> key:T c:C -> long {
     }
     return lo;
 }
-// The LAST such index: past every element equal to `key`. [lowerBound, upperBound) is the
+// The last such index: past every element equal to `key`. [lowerBound, upperBound) is the
 // run of elements equal to it.
 pub upperBoundBy<T, C: Compare<T>> inout v:Vec<T> key:T c:C -> long {
     lo: long = 0;
@@ -262,7 +262,7 @@ pub upperBoundBy<T, C: Compare<T>> inout v:Vec<T> key:T c:C -> long {
 }
 
 // ─── ordered by the element type ────────────────────────────────────────────
-// The same, at ByOrd. Stateless, so these cost a monomorphized copy and nothing at runtime —
+// The same, at ByOrd. Stateless, so these cost a monomorphized copy and nothing at runtime:
 // the comparator is not passed, it is compiled in.
 
 pub sort<T: Ord> inout v:Vec<T> -> void { sortBy(v, ByOrd<T> { }); }

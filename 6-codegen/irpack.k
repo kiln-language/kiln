@@ -1,19 +1,21 @@
-// Inlining across packages: the IR of a package's small exported functions, carried in its
-// `.klib` (the IR chunk), and read back by a dependent so that its inliner can copy them.
+// Inlining across packages. A package's `.klib` carries the IR of its small exported functions
+// (the IR chunk), and a dependent reads it back so that its own inliner can copy them.
 //
-// The owner keeps, after its first optimizer pass, every function it exports -- its own source
-// functions, and the generic instance functions it compiled -- that the inliner would copy
-// (`inlinableIR`: small, no frame slot, no array slot, no `asm`) and that holds nothing another
-// object cannot have: no vtable address (a vtable is local to each object). What it calls or takes
-// the address of is written as the link label the owner's own code uses, and only when another
-// object can link to that label too; a body with one it cannot is not shipped. Temps are numbered
-// from 0 with their types, a string literal travels as its text, a scratch slot as its size.
+// After its first optimizer pass, the owner keeps every function it exports that the inliner
+// would copy (`inlinableIR`: small, with no frame slot, no array slot and no `asm`). That covers
+// its own source functions and the generic instance functions it compiled. A body that holds
+// something another object cannot have is left out, which means a vtable address, since every
+// object has vtables of its own. Each function a body calls or takes the address of is written
+// as the link label the owner's own code uses, and only when another object can link to that
+// label too; a body naming one it cannot is not shipped. Temps are renumbered from 0 and carry
+// their types, a string literal travels as its text, and a scratch slot as its size.
 //
 // A dependent, after lowering and its own first optimizer pass, reads in the body of each external
-// function its code calls that has one (`importInlinable`) as a function that is never emitted
-// (`IRFunc.imported`; the inliner drops it once it has copied it), and the inliner, the second
-// optimizer pass and `flow.k` see through the call exactly as in a whole-program build. A call
-// inside such a body names its callee as `=<label>` (`fnLabel` writes the label as it is).
+// function its code calls, when there is one (`importInlinable`). The body becomes a function that
+// is never emitted (`IRFunc.imported`), and the inliner drops it once it has copied it. Until then
+// the inliner, the second optimizer pass and `flow.k` see through the call exactly as they do in a
+// whole-program build. A call inside such a body names its callee as `=<label>`, which `fnLabel`
+// writes out unchanged.
 #include <{ir, asm, relayout}>
 #include <parse::{registry, types, upstream}>
 #include <support::compiler>
@@ -61,7 +63,10 @@ local shipOne inout p:IRProgram fn:IRFunc -> void {
     for k in 0..fn.instrCount {
         in: Instr = p.code.get(fn.firstInstr + k);
         if (in.op == IROp.Nop) { continue; }
-        if (in.op == IROp.VtableAddr || in.op == IROp.Asm) { gShipCallees.truncate(firstCallee); return; }
+        if (in.op == IROp.VtableAddr || in.op == IROp.Asm || in.op == IROp.RecoverPush || in.op == IROp.FaultEdge) {
+            gShipCallees.truncate(firstCallee);
+            return;
+        }
         out.putVarint(in.op as long);
         if (!shipTemp(&out, fn, in.dst) || !shipTemp(&out, fn, in.a)) { gShipCallees.truncate(firstCallee); return; }
         flags: long = 0;
@@ -130,7 +135,7 @@ pub writeShipChunk inout out:Encoder -> void {
         sb: ShipBody = gShipBodies.get(b);
         own: str = "";
         if (inst.has(nameOf(sb.name))) { own = instanceAlias(nameOf(sb.name)); }
-        else if (exported.has(fnLabel(nameOf(sb.name)))) { own = fnLabel(nameOf(sb.name)); }
+        else if (exported.has(fnLabelOf(sb.name))) { own = fnLabelOf(sb.name); }
         else { continue; }
         first: long = labels.len();
         labels.push(intern(own));
@@ -204,7 +209,7 @@ pub importInlinable inout p:IRProgram -> void {
             in: Instr = p.code.get(fn.firstInstr + k);
             if (in.op != IROp.Call || in.name == NO_SYM || done.has(in.name as long)) { continue; }
             done.put(in.name as long, true);
-            l: str = fnLabel(nameOf(in.name));
+            l: str = fnLabelOf(in.name);
             if (!gUseSyms.has(l)) { continue; }                 // not another object's
             r: long = gShipAt.getOr(l, -1);
             if (r >= 0) { importOne(p, in.name, gShipRefs.get(r)); }
@@ -215,7 +220,7 @@ pub importInlinable inout p:IRProgram -> void {
 local importOne inout p:IRProgram name:Sym r:ShipRef -> void {
     gSymInBase = r.symBase;
     gSymInCount = r.symCount;
-    d: Decoder = decoderOf("" as [u8]);
+    d: Decoder;
     unsafe { d = decoderOf((r.at as *u8)[0..r.len]); }
     nc: long = d.getLen();
     callees: Vec<Sym>;
@@ -223,8 +228,8 @@ local importOne inout p:IRProgram name:Sym r:ShipRef -> void {
         l: Sym = Sym.decode(d);
         callees.push(internString(format("={}", nameOf(l))));
     }
-    // The temps, held to names this compile can resolve: a type it has not got means a body it
-    // cannot compile, and that call stays a call.
+    // The temps, whose types must all be ones this compile knows. A type it has not got means a
+    // body it cannot compile, and the call then stays a call.
     nt: long = d.getLen();
     kinds: Vec<Lit>; structs: Vec<Sym>; pointees: Vec<Sym>;
     for t in 0..nt {
@@ -275,11 +280,12 @@ local importOne inout p:IRProgram name:Sym r:ShipRef -> void {
         p.emit(in);
         i = i + 1;
     }
-    if (!d.done()) { failStr(format("internal: the inlinable body of '{}' did not read back ({})", nameOf(name), d.error())); }
+    if (!d.done()) { failStr(format("internal compiler error: cannot decode the inlinable body of `{}` ({})", nameOf(name), d.error())); }
     p.funcs.push(IRFunc { name: name, firstInstr: firstInstr, instrCount: p.code.len() - firstInstr,
                           firstTemp: base, tempCount: p.tempKinds.len(),
                           firstPromo: p.promoName.len(), promoCount: 0,
-                          isPub: false, isMain: false, wantsArgs: false, imported: true });
+                          isPub: false, isMain: false, wantsArgs: false, imported: true,
+                          holdsRecover: false, borrows: 0, isUnsafe: true });
     gShipImported = gShipImported + 1;
 }
 

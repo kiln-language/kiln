@@ -1,6 +1,8 @@
-// The same expression computed twice is computed once: `v.get(i) * v.get(i)` shifts `i` once,
-// adds it to the buffer once and loads the element once.
-// ir-count: cse::sq shl 1
+// The same expression computed twice is computed once: `v.get(i) * v.get(i)` loads the element
+// once (one indexed access, `[buffer + i*8]`, where the shift and the sum fold) in each of the
+// three copies of the body the loop has run two turns at a time (`Opt.unrollLoop`).
+// ir-count: cse::sq ptrload 5
+// ir-count: cse::sq *8] 3
 // A struct built only to be read back leaves no store behind: its fields are forwarded to the
 // reads and the scratch it was built in, and the local it was copied to, are never written.
 // ir-lacks: cse::area ptrstore

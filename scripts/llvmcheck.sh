@@ -1,14 +1,17 @@
 #!/bin/bash
-# Differential check for the LLVM back end: compile each program down BOTH paths and compare
-# The native path is the oracle. Programs are bare scalar ones, so no runtime is dragged in and
-# clang can link the LLVM side as an ordinary C main.
+# A differential check for the LLVM back end: each program is compiled down BOTH paths and the
+# exit codes are compared, with the native path as the oracle. The programs are small ones written
+# inline (scalars, structs, arrays, pointers, fn values, floats, one `asm` syscall, narrow `asm`
+# outputs and ones into globals, the atomics, `memcpy`); none needs the standard library's
+# runtime, so clang links each module on its own with `-nostdlib`.
 cd "$(dirname "$0")/.."
-# Built here: WSL clears /tmp between invocations, so the compiler cannot be handed in.
+# The compiler is built here rather than passed in, because WSL clears /tmp between invocations.
 ./bootstrap/kilnc main.k -o /tmp/lvc.s > /dev/null
 nasm -O1 -felf64 /tmp/lvc.s -o /tmp/lvc.o
 ld /tmp/lvc.o -o /tmp/lvc
 C=/tmp/lvc
-# A short path: a Kiln diagnostic leads with the file name and a long one crowds out the message.
+# A short directory, because a Kiln diagnostic starts with the file's path and a long one crowds
+# out the message.
 D=/tmp/lc; rm -rf "$D"; mkdir -p "$D"
 
 pass=0; fail=0
@@ -104,6 +107,56 @@ main -> int { return (mix(2, 1.5, 3, 0.5, 4.0) * 4.0) as long as int; }'
 # `asm`: a real syscall, which is what every program reaches through the standard library.
 check syscall_exit    '#include <stdlib::sys>
 main -> int { sysExit(42); return 7; }'
+
+
+# The atomic builtins: an acquire load, a release and a sequentially consistent store, a swap, a
+# compare-and-swap that fails and one that takes, and an add, on eight-byte and four-byte words.
+check atomics         'pub unsafe builtin atomicLoad p:*long -> long;
+pub unsafe builtin atomicStore p:*long v:long -> void;
+pub unsafe builtin atomicStoreSeqCst p:*long v:long -> void;
+pub unsafe builtin atomicSwap p:*long v:long -> long;
+pub unsafe builtin atomicCas p:*long expected:long desired:long -> long;
+pub unsafe builtin atomicAdd p:*long delta:long -> long;
+pub unsafe builtin atomicAdd32 p:*int delta:int -> int;
+pub unsafe builtin atomicCas32 p:*int expected:int desired:int -> int;
+main -> int { c: [long; 2] = [5, 0]; k: [int; 2] = [0 - 3, 9]; r: long = 0;
+    unsafe { p: *long = &c[0] as *long; q: *int = &k[0] as *int;
+        atomicStore(p, atomicLoad(p) + 1); atomicStoreSeqCst(p, atomicSwap(p, 7) + 2);
+        r = atomicCas(p, 1, 50) + atomicCas(p, 8, 9) + atomicAdd(p, 3);
+        r = r + atomicAdd32(q, 5) + atomicCas32(q, 2, 4) + k[0] + k[1]; }
+    return (r + c[0] + c[1]) as int; }'
+
+# An `asm` output into locals narrower than a word: each gets the register's low bytes as its
+# type, extended the way the type says, whatever was above them.
+check asm_narrow      'local asI8 x:long -> i8 { r: i8 = 0; unsafe { asm { in rax x; out r rax; } } return r; }
+local asU16 x:long -> u16 { r: u16 = 0; unsafe { asm { in rax x; out r rax; } } return r; }
+local asI32 x:long -> int { r: int = 0; unsafe { asm { in rax x; out r rax; } } return r; }
+main -> int { n: long = 0;
+    if (asI8(0x180) == 0 - 128) { n = n + 1; }
+    if (asU16(0x1234FFFB) == 65531) { n = n + 10; }
+    if (asI32(0x1FFFFFFFF) == 0 - 1) { n = n + 100; }
+    return n as int; }'
+
+# An `asm` output into globals, a word and a narrow one, read back after a call and by a later
+# block's `in`.
+check asm_global      'var gW: long = 0;
+var gH: i16 = 0;
+local setW x:long -> void { unsafe { asm { in rax x; out gW rax; } } }
+local setH x:long -> void { unsafe { asm { in rax x; out gH rax; } } }
+local bump -> void { unsafe { asm { in rax gW; "add rax, 1" out gW rax; } } }
+main -> int { n: long = 0;
+    setW(40); bump(); bump();
+    if (gW == 42) { n = n + 1; }
+    setH(0x1234FFFB);
+    if (gH == 0 - 5) { n = n + 10; }
+    return n as int; }'
+
+# The `memcpy` builtin (`llvm.memcpy` on this path): a copy of nothing, of a word, and of a run.
+check memcpy          'pub unsafe builtin memcpy dst:long src:long n:long -> void;
+main -> int { a: [long; 4] = [1, 2, 3, 4]; b: [long; 4] = [0, 0, 0, 0];
+    unsafe { memcpy(&b[0] as long, &a[0] as long, 0); memcpy(&b[0] as long, &a[1] as long, 8);
+        memcpy(&b[1] as long, &a[0] as long, 24); }
+    return (b[0] * 1000 + b[1] * 100 + b[2] * 10 + b[3]) as int; }'
 
 echo
 echo "  agree: $pass   problems: $fail"

@@ -3,8 +3,8 @@
 // Two clocks matter most, because they answer different questions and are wrong for each
 // other's. The MONOTONIC one counts from an arbitrary point (boot) and never moves backwards, so
 // it is the one to measure durations with. The REALTIME one counts from the Unix epoch and can
-// be set or stepped by NTP — two readings can come back in the wrong order — so it is the one
-// for saying WHEN something happened, not how long it took. `clockNow` reads any of the others
+// be set or stepped by NTP (two readings can come back in the wrong order), so it is the one
+// for saying when something happened, not how long it took. `clockNow` reads any of the others
 // the kernel keeps: CPU time used by the process or by this thread, or a monotonic clock that
 // also counts time spent suspended.
 //
@@ -27,7 +27,7 @@ local NS_PER_SEC: long = 1000000000;
 local NS_PER_MS:  long = 1000000;
 local NS_PER_US:  long = 1000;
 
-// A point in time: whole seconds, plus nanoseconds within that second — the shape the kernel
+// A point in time: whole seconds, plus nanoseconds within that second, the shape the kernel
 // reports. Two fields rather than one nanosecond count because a wall-clock value in
 // nanoseconds overflows a signed long in 2262, and a timestamp that stops working is not a
 // timestamp. Durations, which are differences, are plain nanosecond longs and have no such
@@ -74,19 +74,19 @@ pub clockNow c:Clock -> Instant {
     return Instant { secs: ts.secs, nanos: ts.nanos };
 }
 
-// Never moves backwards. Measure WITH this one.
+// Never moves backwards. Measure with this one.
 pub monotonic -> Instant { return clockNow(Clock.Monotonic); }
 
-// Since the Unix epoch, and settable. Say WHEN with this one.
+// Since the Unix epoch, and settable. Say when with this one.
 pub now -> Instant { return clockNow(Clock.Realtime); }
 
-// Nanoseconds since `start` on the monotonic clock — the whole of most timing code.
+// Nanoseconds since `start` on the monotonic clock, which is all most timing code needs.
 pub elapsedNs start:Instant -> long { return monotonic().since(start); }
 pub elapsedUs start:Instant -> long { return elapsedNs(start) / NS_PER_US; }
 pub elapsedMs start:Instant -> long { return elapsedNs(start) / NS_PER_MS; }
 
-// Suspend for `ns` nanoseconds. Returns 0, or -EINTR if a signal cut it short — in which case
-// it really did return early. `sleepFor` is the form that finishes the sleep regardless.
+// Suspend for `ns` nanoseconds. Returns 0, or -EINTR if a signal cut the sleep short.
+// `sleepFor` always sleeps the full time.
 pub sleepNanos ns:long -> long {
     req: Timespec = timespecOf(ns);
     unsafe { return syscall2(Syscall.Nanosleep, &req as long, 0); }

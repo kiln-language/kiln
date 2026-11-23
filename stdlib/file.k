@@ -1,15 +1,21 @@
-// `File` — an owning handle around a file descriptor. It implements `Write` and `Read`, so the
+// `File`: an owning handle around a file descriptor. It implements `Write` and `Read`, so the
 // formatter and any sink/source machinery target it like any other, and `Drop` closes the fd at
 // scope exit, so an opened file is released even on an early `return`.
 //
 // Opening a file and whole-file operations return `Result<_, long>`, where the error is a
 // positive errno. Result is `MustUse`, so the check cannot be forgotten.
 //
-// The per-call methods on an open handle — write, read, seek, flush — stay on the syscall
+// The per-call methods on an open handle (write, read, seek, flush) stay on the syscall
 // convention, returning a count or a negative errno. That is not a second opinion about error
 // handling: `Write` and `Read` declare `-> long`, so those two are fixed, and having `seek`
 // disagree with the `write` beside it would be worse than one convention per layer.
 #include <{sys, core, mem, path, result}>
+
+// Is `fd` a terminal? Only a terminal answers TCGETS, the call that reads its settings.
+pub isTerminal fd:long -> bool {
+    settings: [u8; 64];                              // the kernel's struct termios is 36 bytes
+    unsafe { return syscall3(Syscall.Ioctl, fd, 0x5401, &settings[0] as long) == 0; }
+}
 
 // ─── settings ───────────────────────────────────────────────────────────────
 // The access mode is the low two bits of open(2)'s flags: pick exactly one and OR the
@@ -19,12 +25,12 @@ pub enum Access: long { Read = 0, Write = 1, ReadWrite = 2 }
 // open(2) behaviour bits, combined with `|`. `None` is the neutral element.
 pub enum OpenFlag: long {
     None      = 0,
-    Create    = 0x40,      // O_CREAT   — create the file if it does not exist
-    Exclusive = 0x80,      // O_EXCL    — with Create, fail if it already exists
-    Truncate  = 0x200,     // O_TRUNC   — truncate to zero length on open
-    Append    = 0x400,     // O_APPEND  — every write seeks to end-of-file first
+    Create    = 0x40,      // O_CREAT: create the file if it does not exist
+    Exclusive = 0x80,      // O_EXCL: with Create, fail if it already exists
+    Truncate  = 0x200,     // O_TRUNC: truncate to zero length on open
+    Append    = 0x400,     // O_APPEND: every write seeks to end-of-file first
     NonBlock  = 0x800,     // O_NONBLOCK
-    Sync      = 0x101000   // O_SYNC    — writes reach stable storage before returning
+    Sync      = 0x101000   // O_SYNC: writes reach stable storage before returning
 }
 
 pub enum Seek: long { Set = 0, Cur = 1, End = 2 }
@@ -33,7 +39,7 @@ pub enum Seek: long { Set = 0, Cur = 1, End = 2 }
 pub enum Perm: long { Default = 0x1A4, Private = 0x180, All = 0x1FF }   // 0644, 0600, 0777
 
 // A path as the kernel wants it, in `buf`; false when it cannot be passed on as written (too
-// long, or holding a NUL) — every caller answers that with ENAMETOOLONG.
+// long, or holding a NUL). Every caller answers that with ENAMETOOLONG.
 local cPath path:str inout buf:[u8] -> bool { return toCPath(path, buf) >= 0; }
 
 // ─── File ───────────────────────────────────────────────────────────────────
@@ -136,7 +142,7 @@ methods File {
             unsafe { n = syscall4(Syscall.Pwrite64, self.fd, b.ptr + done, b.len - done, off + done); }
             if (n == -Errno.Intr) { continue; }
             if (n <= 0) { if (done > 0) { return done; } return n; }
-            done = done + n;
+            done += n;
         }
         return done;
     }

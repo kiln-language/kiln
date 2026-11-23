@@ -1,13 +1,13 @@
 // Locks, and the two things they compose with: a guarded value (`Mutex<T>`) and a guarded sink
-// (`LockWriter<W>`). Every lock is entered through `with`, which drops its guard — and so
-// releases — at the closing `}` on every exit path, including an early `return`.
+// (`LockWriter<W>`). Every lock is entered through `with`, which drops its guard (and so
+// releases the lock) at the closing `}` on every exit path, including an early `return`.
 #include <{atomic, thread, write, option}>
 
 // ─── LockGuard ──────────────────────────────────────────────────────────────
 // The guard `hold()` returns. It has no get/set, so `with lock { … }` is hold-only: the body
 // uses the guarded thing as-is.
 //
-// A plain store is the correct release on x86-64 — it cannot tear, and TSO keeps every write
+// A plain store is the correct release on x86-64: it cannot tear, and TSO keeps every write
 // made under the lock ahead of it.
 local unsafe releaseLock flag:*int -> void { *flag = 0; }
 pub struct LockGuard { flag: *int }
@@ -17,7 +17,7 @@ methods LockGuard for Drop {
 
 // ─── SpinLock ───────────────────────────────────────────────────────────────
 // An atomic flag: 0 free, 1 held. Uncontended acquire is one CAS. Under contention it does not
-// hammer the atomic — that bounces the cache line between cores — but spins on a plain read
+// hammer the atomic, which bounces the cache line between cores, but spins on a plain read
 // (test-and-test-and-set) with PAUSE between reads, and yields the CPU after a bounded spin so
 // the holder can actually run.
 pub struct SpinLock { flag: AtomicInt, }
@@ -28,7 +28,9 @@ methods SpinLock for Default {
     }
 }
 methods SpinLock {
-    hold &self -> LockGuard {
+    // `unsafe`: the guard keeps a pointer to the lock, so the caller vouches that the lock
+    // outlives it. `with` does that, and is the safe way in.
+    unsafe hold &self -> LockGuard {
         self.acquire();
         unsafe { return LockGuard { flag: &self.flag as *int }; }   // the flag is at offset 0
     }
@@ -38,13 +40,13 @@ methods SpinLock {
             spins: int = 0;
             while (self.flag.load() != 0) {              // contended: spin on a cheap read
                 cpuRelax();
-                spins = spins + 1;
+                spins += 1;
                 if (spins >= 128) {
                     yieldNow();
                     spins = 0;
                 }
             }
-            // looked free — loop back and race for it with the CAS again
+            // looked free, so loop back and race for it with the CAS again
         }
     }
     // One attempt, no blocking: true if this call took the lock.
@@ -73,14 +75,15 @@ methods Mutex<T: Default> for Default {
 methods Mutex<T> {
     lock &self -> void { self.sl.acquire(); }
     unlock &self -> void { self.sl.release(); }
-    hold &self -> LockGuard { return self.sl.hold(); }
-    // The lock if it is free right now, without waiting: a guard to keep, or nothing.
-    tryHold &self -> Option<LockGuard> {
+    unsafe hold &self -> LockGuard { return self.sl.hold(); }      // `unsafe`, as SpinLock.hold
+    // The lock if it is free right now, without waiting: a guard to keep, or nothing. `unsafe`
+    // for the same reason as `hold`.
+    unsafe tryHold &self -> Option<LockGuard> {
         if (!self.sl.tryAcquire()) { return Option.None; }
         unsafe { return Option.Some(LockGuard { flag: &self.sl.flag as *int }); }
     }
 }
-// Copying the value out is Copy-only — a Drop value would double-release. Non-Copy contents
+// Copying the value out is Copy-only, since a Drop value would double-release. Non-Copy contents
 // are reached in place: `with m { … m.data … }`.
 methods Mutex<T: Copy> {
     get &self -> T { return self.data; }
@@ -88,8 +91,8 @@ methods Mutex<T: Copy> {
 }
 
 // ─── ReentrantMutex<T> ──────────────────────────────────────────────────────
-// A mutex the same thread may lock again without deadlocking — the cover for SpinLock's one
-// hazard, code that reaches back into a lock it already holds. An owner thread-id and a
+// A mutex the same thread may lock again without deadlocking. It covers SpinLock's one
+// hazard: code that reaches back into a lock it already holds. An owner thread-id and a
 // recursion count over a plain SpinLock:
 //   first lock          take the SpinLock, record owner = my tid, count = 1
 //   re-lock, same thread   owner is already me, so bump the count: no atomic, no spin
@@ -100,7 +103,7 @@ methods Mutex<T: Copy> {
 pub struct ReentrantMutex<T> { sl: SpinLock, owner: AtomicLong, count: long, data: T, }
 
 // Given typed pointers to the three control words, so it works whatever offset T puts the data
-// at. The owner is cleared BEFORE the lock, or a thread that grabs the freed lock could have
+// at. The owner is cleared before the lock, or a thread that grabs the freed lock could have
 // its own owner clobbered.
 local unsafe reentrantRelease flag:*int owner:*long count:*long -> void {
     *count = *count - 1;
@@ -127,7 +130,7 @@ methods ReentrantMutex<T> {
     acquire &self -> void {
         me: long = threadId();
         if (self.owner.load() == me) {         // already ours: just recurse
-            self.count = self.count + 1;
+            self.count += 1;
             return;
         }
         self.sl.acquire();                     // first entry: block, then claim it
@@ -137,7 +140,7 @@ methods ReentrantMutex<T> {
     release &self -> void { unsafe { reentrantRelease(&self.sl.flag as *int, &self.owner as *long, &self.count as *long); } }
     lock &self -> void { self.acquire(); }
     unlock &self -> void { self.release(); }
-    hold &self -> ReentrantGuard {
+    unsafe hold &self -> ReentrantGuard {                         // `unsafe`, as SpinLock.hold
         self.acquire();
         unsafe { return ReentrantGuard { flag: &self.sl.flag as *int, owner: &self.owner as *long, count: &self.count as *long }; }
     }
@@ -148,13 +151,14 @@ methods ReentrantMutex<T: Copy> {
 }
 
 // ─── LockWriter<W> ──────────────────────────────────────────────────────────
-// Serializes each `write` of an inner sink — the opt-in way to make one thread-safe, since
+// Serializes each `write` of an inner sink. It is the opt-in way to make one thread-safe, since
 // io.k's default stdout is unlocked by design. Composes like any decorator:
 // `LockWriter<BufWriter<FileOut>>`.
 pub struct LockWriter<W> { sl: SpinLock, inner: W }
 methods LockWriter<W: Write> for Write {
     write &self ptr:long len:long -> long {
-        held: LockGuard = self.sl.hold();            // released at the closing brace
+        held: LockGuard;                             // released at the closing brace
+        unsafe { held = self.sl.hold(); }            // the lock is ours and outlives `held`
         return self.inner.write(ptr, len);
     }
 }

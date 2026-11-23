@@ -1,0 +1,7 @@
+selftests/parse_brace_err.k:15:18: error: expected `->`, found `=`
+   15 | var gTotal: long = 0;
+      |                  ^
+selftests/parse_brace_err.k:19:37: error: expected `;`, found `}`
+   19 | twice x:long -> long { return x * 2 }
+      |                                     ^
+2 errors generated.

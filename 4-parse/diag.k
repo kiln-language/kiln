@@ -1,18 +1,19 @@
 // What an error says besides its message, and how it names a type.
 //
 // Every diagnostic goes through `fail` (`support::compiler`), which sits below the registry and
-// cannot read it; the two hooks installed here (`installDiagnostics`) are how it reaches what
-// only the registry knows:
+// cannot read it. The two hooks installed here (`installDiagnostics`) are how it reaches what only
+// the registry knows:
 //
-//   - a type is named as it is written: `Option<long>`, `Buf<FileOut, 8>`, `&Res`, and `Expr`
-//     rather than `parse::ast::Expr` where no other declared type has that name. A message is
+//   - A type is named the way it is written: `Option<long>`, `Buf<FileOut, 8>`, `&Res`, and `Expr`
+//     rather than `parse::ast::Expr` when no other declared type has that name. Messages are
 //     assembled from mangled names all over the compiler (`option::Option_long`), so rather than
-//     every message site spelling its types, the message is rewritten on its way out: every
-//     `::`-qualified word that names a type (an instance, a struct, an enum, a trait, a borrow
-//     or pointer of one) is replaced by its spelling, and `T_method` by `T.method`;
-//   - an error inside a generic instance or a derive adds where it was asked for, one note per
-//     link back to code nothing stamped: `note: instantiated from app.k:12:5 (Vec<String>)`;
-//   - the compiler's own error (`internal: ...`) adds what it was doing, and the source line.
+//     have every message site spell its types, the message is rewritten on its way out. Every
+//     `::`-qualified word that names a type (an instance, a struct, an enum, a trait, or a borrow
+//     or pointer of one) is replaced by its spelling, and `T_method` by `T.method`.
+//   - An error inside a generic instance or a derive adds a note for each link of the chain back
+//     to code nothing stamped, in clang's form:
+//     `app.k:12:5: note: in instantiation of `Vec<String>` requested here`.
+//   - An internal compiler error adds a note saying what the compiler was doing.
 //
 // Only an error pays for any of this.
 #include <{registry, types}>
@@ -26,16 +27,26 @@ local MAX_NOTE_DEPTH: long = 8;
 // print the same chain again.
 local var gLastChain: Sym = NO_SYM;
 
+// The registry, as this file reads it: through its address, taken once at startup, and never by
+// name. Everything here runs on an error's way out (`fail` calls the two hooks), and an error can
+// be raised inside a registry method while that method holds `gReg` lent. Naming `gReg` here would
+// read it, and the index `bareIfUnique` brings up to date would write it, in the middle of the
+// lend, which the law of exclusivity refuses. Through the address that is still sound, because
+// `fail` never returns: the method holding the lend never runs again once a hook has, so nothing it
+// keeps of the registry can go stale.
+local var gRegAt: *Registry;
+
 pub installDiagnostics -> void {
+    unsafe { gRegAt = &gReg as *Registry; }
     gSpellHook = &spellMessage;
     gNoteHook = &diagNotes;
 }
 
 // ─── what to include ─────────────────────────────────────────────────────────
 
-// A name nothing declares, which the standard library has a module named after (`Result`,
-// `stdlib::result`): what to include, said after the error, or "". Only an error pays for the
-// file lookup.
+// A name nothing declares that the standard library has a module named after (`Result`,
+// `stdlib::result`): a `help:` line saying what to include, to go at the end of the message, or
+// "". Only an error pays for the file lookup.
 pub stdlibHint bare:str -> str {
     if (bare.len == 0) { return ""; }
     s: String;
@@ -51,7 +62,7 @@ pub stdlibHint bare:str -> str {
     path.pushStr(mod);
     path.pushStr(".k");
     if (!fileExists(keepString(path))) { return ""; }
-    return keepString(format(" -- the standard library has a module of that name: #include <{}::{}>", STDLIB_PKG, mod));
+    return keepString(format("\nhelp: the standard library has a module named `{}`: `#include <{}::{}>`", mod, STDLIB_PKG, mod));
 }
 
 // ─── a type, as written ──────────────────────────────────────────────────────
@@ -61,14 +72,16 @@ pub stdlibHint bare:str -> str {
 local bareIfUnique n:str -> str {
     bare: str = lastComponentOf(n);
     if (bare.len == n.len) { return n; }
-    gReg.indexLastComponents();
-    i: long = gReg.byBare.firstOf(bare);
-    while (i >= 0) {
-        // An instance's mangled name ends in its last argument's (`vec::Vec_string::String`): it
-        // is not another declaration of the name.
-        q: str = nameOf(gReg.byBare.qualAt(i));
-        if (q != n && gReg.findRequest(q) < 0) { return n; }
-        i = gReg.byBare.nextOf(i);
+    unsafe {
+        gRegAt.indexLastComponents();
+        i: long = gRegAt.byBare.firstOf(bare);
+        while (i >= 0) {
+            // An instance's mangled name ends in its last argument's (`vec::Vec_string::String`,
+            // a trait's `Iter_geo::P`): it is not another declaration of the name.
+            q: str = nameOf(gRegAt.byBare.qualAt(i));
+            if (q != n && gRegAt.findRequest(q) < 0 && gRegAt.traitInstOf(gRegAt.byBare.qualAt(i)) < 0) { return n; }
+            i = gRegAt.byBare.nextOf(i);
+        }
     }
     return bare;
 }
@@ -76,12 +89,14 @@ local bareIfUnique n:str -> str {
 // Whether `n` names a type this program declares or stamped. A generic function's template (a
 // method with type parameters of its own, `L_pick`) is recorded beside the types' and is not one.
 local namesDeclaredType n:str -> bool {
-    if (gReg.findStruct(n) >= 0 || gReg.findEnum(n) >= 0 || gReg.findTrait(n) >= 0
-        || gReg.findRequest(n) >= 0) { return true; }
-    at: long = gReg.findTemplate(n);
-    if (at < 0) { return false; }
-    t: GTemplate = gReg.templateDef(at);
-    return t.fieldCount > 0 || t.isEnum;
+    unsafe {
+        if (gRegAt.findStruct(n) >= 0 || gRegAt.findEnum(n) >= 0 || gRegAt.findTrait(n) >= 0
+            || gRegAt.findRequest(n) >= 0) { return true; }
+        at: long = gRegAt.findTemplate(n);
+        if (at < 0) { return false; }
+        t: GTemplate = gRegAt.templateDef(at);
+        return t.fieldCount > 0 || t.isEnum;
+    }
 }
 
 // A type a method may belong to: a declared one, or a scalar (`methods long for Ord`).
@@ -97,7 +112,7 @@ pub spellTypeRef t:TypeRef -> String {
     if (t.base == Lit.Ref)   { out.push('&'); out.pushString(spellTypeName(nameOf(t.name))); return out; }
     if (t.base == Lit.Ptr)   { out.push('*'); out.pushString(spellTypeName(nameOf(t.name))); return out; }
     if (t.base == Lit.Slice) { out.push('['); out.pushString(spellTypeName(nameOf(t.name))); out.push(']'); return out; }
-    if (t.base == Lit.Fn)    { out.pushStr("fn"); out.pushStr(nameOf(t.name)); return out; }
+    if (t.base == Lit.Fn)    { out.pushStr(nameOf(t.name)); return out; }   // the key is spelled `fn(..)->R`
     out.pushString(spellTypeName(nameOf(t.name)));
     return out;
 }
@@ -110,42 +125,57 @@ pub spellTypeName n:str -> String {
 local spellTypeDepth n:str depth:long -> String {
     out: String;
     if (depth > MAX_NOTE_DEPTH || namesScalar(n)) { out.pushStr(n); return out; }
-    // A closure's capture struct is named by the compiler, not the author.
-    if (strStartsWith(lastComponentOf(n), "$closure")) { out.pushStr("closure"); return out; }
-    // A borrow, a pointer or a slice of one, spelled as the mangler wrote them.
-    if (strStartsWith(n, "ref_") && namesDeclaredType(strSlice(n, 4, n.len - 4))) {
-        out.push('&'); out.pushString(spellTypeDepth(strSlice(n, 4, n.len - 4), depth + 1)); return out;
-    }
-    if (strStartsWith(n, "ptr_") && namesDeclaredType(strSlice(n, 4, n.len - 4))) {
-        out.push('*'); out.pushString(spellTypeDepth(strSlice(n, 4, n.len - 4), depth + 1)); return out;
-    }
-    if (strStartsWith(n, "slice_") && namesDeclaredType(strSlice(n, 6, n.len - 6))) {
-        out.push('['); out.pushString(spellTypeDepth(strSlice(n, 6, n.len - 6), depth + 1)); out.push(']'); return out;
-    }
-    // A tuple is its elements.
-    if (isTupleName(intern(n)) && gReg.findStruct(n) >= 0) {
-        d: StructDef = gReg.structDef(gReg.findStruct(n));
-        out.push('(');
-        for k in 0..d.fieldCount {
-            if (k > 0) { out.pushStr(", "); }
-            f: FieldDef = gReg.fieldAt(d, k);
-            out.pushString(spellTypeRef(TypeRef { base: f.kind, name: f.structName }));
+    unsafe {
+        // A closure's capture struct is named by the compiler, not the author.
+        if (gRegAt.isClosureEnv(symIfAny(n))) { out.pushStr("closure"); return out; }
+        // A borrow, a pointer or a slice of one, spelled as the mangler wrote them.
+        if (strStartsWith(n, "ref_") && namesDeclaredType(strSlice(n, 4, n.len - 4))) {
+            out.push('&'); out.pushString(spellTypeDepth(strSlice(n, 4, n.len - 4), depth + 1)); return out;
         }
-        out.push(')');
-        return out;
-    }
-    // An instance: its template, then its arguments.
-    r: long = gReg.findRequest(n);
-    if (r >= 0) {
-        req: GRequest = gReg.requestAt(r);
-        out.pushStr(bareIfUnique(nameOf(req.base)));
-        out.push('<');
-        for k in 0..req.argCount {
-            if (k > 0) { out.pushStr(", "); }
-            out.pushString(spellTypeRef(gReg.gArgAt(req, k)));
+        if (strStartsWith(n, "ptr_") && namesDeclaredType(strSlice(n, 4, n.len - 4))) {
+            out.push('*'); out.pushString(spellTypeDepth(strSlice(n, 4, n.len - 4), depth + 1)); return out;
         }
-        out.push('>');
-        return out;
+        if (strStartsWith(n, "slice_") && namesDeclaredType(strSlice(n, 6, n.len - 6))) {
+            out.push('['); out.pushString(spellTypeDepth(strSlice(n, 6, n.len - 6), depth + 1)); out.push(']'); return out;
+        }
+        // A tuple is its elements.
+        if (isTupleName(intern(n)) && gRegAt.findStruct(n) >= 0) {
+            d: StructDef = gRegAt.structDef(gRegAt.findStruct(n));
+            out.push('(');
+            for k in 0..d.fieldCount {
+                if (k > 0) { out.pushStr(", "); }
+                f: FieldDef = gRegAt.fieldAt(d, k);
+                out.pushString(spellTypeRef(TypeRef { base: f.kind, name: f.structName }));
+            }
+            out.push(')');
+            return out;
+        }
+        // An instance: its template, then its arguments.
+        r: long = gRegAt.findRequest(n);
+        if (r >= 0) {
+            req: GRequest = gRegAt.requestAt(r);
+            out.pushStr(bareIfUnique(nameOf(req.base)));
+            out.push('<');
+            for k in 0..req.argCount {
+                if (k > 0) { out.pushStr(", "); }
+                out.pushString(spellTypeRef(gRegAt.gArgAt(req, k)));
+            }
+            out.push('>');
+            return out;
+        }
+        // A trait instance (`Iter_long`): its trait, then its arguments.
+        ti: long = gRegAt.traitInstOf(symIfAny(n));
+        if (ti >= 0) {
+            tr: TraitRef = gRegAt.traitInstRef(ti);
+            out.pushStr(bareIfUnique(nameOf(tr.name)));
+            out.push('<');
+            for k in 0..tr.argCount {
+                if (k > 0) { out.pushStr(", "); }
+                out.pushString(spellTypeRef(gRegAt.traitArgAt(tr, k)));
+            }
+            out.push('>');
+            return out;
+        }
     }
     if (namesDeclaredType(n)) { out.pushStr(bareIfUnique(n)); return out; }
     out.pushStr(n);
@@ -189,7 +219,7 @@ local spellWord w:str -> String {
             while (k > 0 && charAt(rest, k) != '_') { k = k - 1; }
             if (k > 0) {
                 method: str = strSlice(rest, k + 1, rest.len - k - 1);
-                if (method.len > 0 && strFind(method, "::").isNone() && gReg.findTrait(strSlice(rest, 0, k)) >= 0) {
+                if (method.len > 0 && strFind(method, "::").isNone() && regTrait(strSlice(rest, 0, k)) >= 0) {
                     out: String = spellTypeName(strSlice(w, 0, j));
                     out.push('.');
                     out.pushStr(method);
@@ -200,7 +230,7 @@ local spellWord w:str -> String {
         j = j + 1;
     }
     // A generic function, by its own name (`fixedOf`).
-    if (gReg.findTemplate(w) >= 0) { return stringOf(lastComponentOf(w)); }
+    if (regTemplate(w) >= 0) { return stringOf(lastComponentOf(w)); }
     return stringOf(w);
 }
 
@@ -211,15 +241,17 @@ local spellScalarMethod w:str -> String {
     while (cut < w.len && charAt(w, cut) != '_') { cut = cut + 1; }
     if (cut == 0 || cut + 1 >= w.len || !namesScalar(strSlice(w, 0, cut))) { return stringOf(w); }
     owner: Sym = intern(strSlice(w, 0, cut));
-    for i in 0..gReg.implCount() {
-        im: TraitImplDef = gReg.implAt(i);
-        if (im.structName != owner) { continue; }
-        for k in 0..im.fnCount {
-            if (nameOf(gReg.implFnAt(im, k)) == w) {
-                out: String = stringOf(strSlice(w, 0, cut));
-                out.push('.');
-                out.pushStr(strSlice(w, cut + 1, w.len - cut - 1));
-                return out;
+    unsafe {
+        for i in 0..gRegAt.implCount() {
+            im: TraitImplDef = gRegAt.implAt(i);
+            if (im.structName != owner) { continue; }
+            for k in 0..im.fnCount {
+                if (nameOf(gRegAt.implFnAt(im, k)) == w) {
+                    out: String = stringOf(strSlice(w, 0, cut));
+                    out.push('.');
+                    out.pushStr(strSlice(w, cut + 1, w.len - cut - 1));
+                    return out;
+                }
             }
         }
     }
@@ -291,6 +323,7 @@ pub spellMessage msg:str -> String {
         w: str = strSlice(msg, i, j - i);
         if (qualified) { out.pushString(spellWord(w)); }
         else if (hasDollar(w)) { out.pushStr(spellInternal(w)); }
+        else if (regTraitInst(symIfAny(w)) >= 0) { out.pushString(spellTypeName(w)); }
         else { out.pushString(spellScalarMethod(w)); }
         i = j;
     }
@@ -318,44 +351,21 @@ local instanceText inst:Sym -> String {
     return spellTypeName(nameOf(inst));
 }
 
-// The line of source a position names, or nothing when the file cannot be read again.
-local sourceLine p:long -> String {
-    out: String;
-    f: Sym = posFile(p);
-    if (f == NO_SYM || posLine(p) <= 0) { return out; }
-    hit: Option<str> = tryReadSource(nameOf(f));
-    text: str = "";
-    match hit { Some(t) { text = t; } None { return out; } }
-    line: long = 1;
-    i: long = 0;
-    while (i < text.len && line < posLine(p)) {
-        if (charAt(text, i) == 10) { line = line + 1; }
-        i = i + 1;
-    }
-    j: long = i;
-    while (j < text.len && charAt(text, j) != 10) { j = j + 1; }
-    out.pushStr(strSlice(text, i, j - i));
-    return out;
-}
-
 local diagNotes msg:str -> void {
-    // The compiler's own error: what it was doing, and the statement it was at.
-    if (strStartsWith(msg, "internal")) {
+    // An internal compiler error: say so, and what the compiler was doing. The source line it was
+    // at has already been shown under the error.
+    if (strStartsWith(msg, "internal compiler error")) {
         what: String;
         what.pushStr("this is a bug in the compiler");
-        if (gPhase.len > 0) { what.pushStr(", met while "); what.pushStr(gPhase); }
-        if (gCtxFn != NO_SYM) { what.pushStr(" '"); what.pushString(spellWord(nameOf(gCtxFn))); what.pushStr("'"); }
+        if (gPhase.len > 0) { what.pushStr(", hit while "); what.pushStr(gPhase); }
+        if (gCtxFn != NO_SYM) { what.pushStr(" `"); what.pushString(spellWord(nameOf(gCtxFn))); what.pushStr("`"); }
         eprintln("note: {}", what);
-        if (gPos != 0) {
-            src: String = sourceLine(gPos);
-            if (src.length() > 0) { t: str = ""; unsafe { t = strTrim(src.view()); } eprintln("note: at {}: {}", positionText(gPos), t); }
-        }
     }
     // Inside a generic instance or a derive: where it was asked for, back to code nothing stamped.
     inst: Sym = gCtxInst;
     if (inst == NO_SYM) { inst = fnOwnerOf(gCtxFn); }
     if (inst == NO_SYM) { gLastChain = NO_SYM; return; }
-    if (inst == gLastChain) { eprintln("note: in the same instantiation as the error before"); return; }
+    if (inst == gLastChain) { eprintln("note: in the same instantiation as the previous error"); return; }
     gLastChain = inst;
     seen: Vec<Sym>;
     depth: long = 0;
@@ -373,10 +383,15 @@ local diagNotes msg:str -> void {
             o = originOf(o.parent);
             depth = depth + 1;
         }
-        if (o.pos == 0) { eprintln("note: in {}", what); }
-        else { eprintln("note: instantiated from {} ({})", positionText(o.pos), what); }
+        if (o.pos == 0) { eprintln("note: in instantiation of `{}`", what); }
+        else { eprintln("{}: note: in instantiation of `{}` requested here", positionText(o.pos), what); }
         inst = o.parent;
         depth = depth + 1;
     }
-    if (inst != NO_SYM) { eprintln("note: ...and further"); }
+    if (inst != NO_SYM) { eprintln("note: (further instantiation context omitted)"); }
 }
+
+// One lookup each in the registry, through its address (`gRegAt`).
+local regTrait q:str -> long { unsafe { return gRegAt.findTrait(q); } }
+local regTemplate q:str -> long { unsafe { return gRegAt.findTemplate(q); } }
+local regTraitInst n:Sym -> long { unsafe { return gRegAt.traitInstOf(n); } }

@@ -1,8 +1,9 @@
-// The tree to the IR, one pass per function.
+// Lowering: the checked syntax tree to the IR, one function at a time.
 //
-// Expressions lower to a temp holding the value, statements to instructions that read and write
-// named variable slots. Control flow becomes labels and jumps, numbered per function so that two
-// functions never share one.
+// An expression lowers to a temp holding its value, and a statement to instructions that read
+// and write named variable slots. Control flow becomes labels and jumps, numbered per function so
+// that two functions never share one. A value too big for a register (a struct, a tuple, a `str`
+// or slice pair, a trait object) lives in memory and flows as the address of its bytes.
 #include <ir>
 #include <parse::{ast, registry, types, upstream}>
 #include <transform::{check, eval, facts}>
@@ -19,6 +20,12 @@ pub struct Lowerer {
     labels: long,          // per-function label counter
     breakTo: Vec<Sym>,     // the label a `break` jumps to, innermost last
     continueTo: Vec<Sym>,
+    // The `recover` statements whose bodies are being lowered, innermost last: each one's record
+    // slot, and how many loops were open when it began. A `return` unlinks every record, and a
+    // `break` or `continue` the ones begun inside the loop it leaves.
+    recovers: Vec<long>,
+    recoverLoops: Vec<long>,
+    sawRecover: bool,          // the function being lowered holds one
 
     // Parameters that arrive as a pointer rather than a value. An aggregate is too big for a
     // register, so the caller passes its address and the callee reads through it, which means
@@ -35,6 +42,10 @@ pub struct Lowerer {
 
     // Every `builtin` declaration, by name: the primitive a call to it is (`BI_...`).
     builtinKinds: HashMap<str, long>,
+    // What each function does with the addresses a call hands it (`callConventionsOf`), by name.
+    callConvs: HashMap<long, long>,
+    // Which of each function's parameters take a struct or tuple by value, as a mask (`byValueParams`).
+    byValParams: HashMap<long, long>,
     asmSeq: long,              // hidden slots a builtin's `asm` writes its result to
 
     // What the function being lowered returns. A `return` needs its destination's type, not its
@@ -43,16 +54,25 @@ pub struct Lowerer {
     retStruct: Sym,
     // The declaration being lowered is an array the next statements write in full
     // (`writtenInFull`): no zero fill.
-    skipZero: bool
+    skipZero: bool,
+
+    // The function's `str`, slice and trait-object parameters taken by value (`ownsFatPair`):
+    // each one's name, where the room for a copy of its own was left, and whether the body lends
+    // it (`&s`).
+    fatNames: Vec<Sym>,
+    fatRoom:  Vec<long>,
+    fatLent:  Vec<bool>,
+    fatMark:  Vec<bool>        // per temp of the function: computed from a fat parameter's address
 }
 
 methods Lowerer for Default {
     new -> Lowerer {
         p: IRProgram;
-        return Lowerer { ir: p, labels: 0, breakTo: vec![], continueTo: vec![], byRef: map![], arrayLen: map![],
+        return Lowerer { ir: p, labels: 0, breakTo: vec![], continueTo: vec![], recovers: vec![], recoverLoops: vec![], sawRecover: false, byRef: map![], arrayLen: map![],
                          variadics: map![], varSigs: vec![],
-                         builtinKinds: map![], asmSeq: 0, skipZero: false,
-                         retKind: Lit.Void, retStruct: NO_SYM };
+                         builtinKinds: map![], callConvs: map![], byValParams: map![], asmSeq: 0, skipZero: false,
+                         retKind: Lit.Void, retStruct: NO_SYM,
+                         fatNames: vec![], fatRoom: vec![], fatLent: vec![], fatMark: vec![] };
     }
 }
 
@@ -100,13 +120,16 @@ methods Lowerer {
                 self.noteHook(a.fns.get(st.at));
                 bk: long = builtinOf(a.fns.get(st.at));
                 if (bk != 0) { self.builtinKinds.put(nameOf(a.fns.get(st.at).name), bk); }
+                self.callConvs.put(a.fns.get(st.at).name as long, callConventionsOf(a, st.at));
+                bv: long = byValueParams(a, st.at);
+                if (bv != 0) { self.byValParams.put(a.fns.get(st.at).name as long, bv); }
             }
         }
         for k in 0..n {
             st: Stmt = a.stmtAt(page, k);
             // A generic method's own body is a pattern, not code: its clones carry the concrete
             // types and are what gets emitted. Lowering the pattern would emit calls against
-            // type parameters, which is what left a bare `write` in every program that printed.
+            // type parameters (a bare `write`, in every program that prints).
             if (st.kind == StmtKind.FunctionDef && !a.fns.get(st.at).isTemplate) {
                 // Where an error lowering it (or emitting it, later) is reported.
                 gPos = a.stmtPos.get(a.stmtIdAt(page, k));
@@ -141,9 +164,9 @@ methods Lowerer {
 
     // A global's initializer may be any expression, so it is not folded into `.data`: it runs at
     // program start, in declaration order, from a synthetic function `_start` calls before `main`.
-    // Except a scalar whose initializer is a constant -- written as one, or folded to one by the
-    // evaluator -- which is emitted with its value and needs no code at all. When every global is
-    // one of those, there is no `$globalInit`.
+    // The exception is a scalar whose initializer is a constant (written as one, or folded to one
+    // by the evaluator): it is emitted with its value and needs no code at all. When every global
+    // is one of those, there is no `$globalInit`.
     lowerGlobalInit &self inout a:Ast page:long -> void {
         self.labels = 0;
         self.retKind = Lit.Void;
@@ -167,6 +190,8 @@ methods Lowerer {
                     // the first field, which for a `Mutex` is the lock flag it is guarded by.
                     if (d.isArray && a.expr(d.init).op == Op.ArrayLit) {
                         self.lowerArrayInto(a, self.addressOfVar(d.name, d.structName), d.init);
+                    } else if (d.isArray) {
+                        self.copyInto(self.addressOfVar(d.name, d.structName), self.lowerAddress(a, d.init), declaredBytes(d));
                     } else if (storedInline(d.kind, d.structName)) {
                         src: Temp = self.placeOf(a, d.init);
                         dst: Temp = self.addressOfVar(d.name, d.structName);
@@ -187,7 +212,8 @@ methods Lowerer {
                                     instrCount: self.ir.code.len() - first,
                                     firstTemp: firstT, tempCount: self.ir.tempKinds.len(),
                                     firstPromo: fp, promoCount: self.ir.promoName.len() - fp,
-                                    isPub: gKlibMode, isMain: false, wantsArgs: false, imported: false });
+                                    isPub: gKlibMode, isMain: false, wantsArgs: false, imported: false,
+                                    holdsRecover: false, borrows: 0, isUnsafe: false });
     }
 
     // `[a, b, c]` into the array at `dst`, element by element: what a `var` global's literal does
@@ -207,8 +233,8 @@ methods Lowerer {
         }
     }
 
-    // A global initialized by a constant -- a scalar literal, or an image the evaluator computed
-    // -- is recorded on the program and emitted as data. An image's pointer words name string
+    // A global initialized by a constant (a scalar literal, or an image the evaluator computed)
+    // is recorded on the program and emitted as data. An image's pointer words name string
     // literals, which are interned here exactly as a mention in code would intern them.
     constantInit &self inout a:Ast d:VarDeclNode -> bool {
         e: Expr = a.expr(d.init);
@@ -251,6 +277,11 @@ methods Lowerer {
         exported: bool = f.visibility == Vis.Pub;
         if (gKlibMode) { exported = isOwnSourceFn(a, at); }
         self.labels = 0;
+        self.ir.slotFn = f.name;
+        self.ir.faultTo = NO_SYM;
+        self.recovers.clear();
+        self.recoverLoops.clear();
+        self.sawRecover = false;
         self.retKind = f.returnKind;
         self.retStruct = f.returnStruct;
         self.byRef.clear();
@@ -272,8 +303,9 @@ methods Lowerer {
             self.ir.emit(sd);
         }
 
-        // Each parameter arrives in a register and is stored to its slot, so the body reads it by
-        // name like any other local. `mem2reg` is what later takes the store back out.
+        // Each parameter arrives in a register and the prologue stores it to its slot, so the body
+        // reads it by name like any other local. The seed load made here marks where it enters
+        // (`paramSeed`), and `Opt.promoteLocals` may later keep it in a register instead.
         for k in 0..f.argCount {
             p: VarDeclNode = a.paramAt(f, k);
             if (p.isArray) { self.arrayLen.put(nameOf(p.name), p.count); }
@@ -308,12 +340,31 @@ methods Lowerer {
             if (namedScalar(p.kind, p.structName)) { ld.kind = namedScalarBacking(p.structName); }
             ld.structName = p.structName;
             // How many bytes that copy moves, from the declaration. Not from `slotBytesOf`: the
-            // slot table is program-wide and keyed by name, taking the largest claim any function
-            // made for that name, fine for reserving frame space, and wildly wrong as the length
-            // of a copy.
+            // slot table is program-wide and keyed by name, holding the largest claim any function
+            // made for that name. That is fine for reserving frame space, and wildly wrong as the
+            // length of a copy.
             if (byValue && !p.isArray) { ld.imm = declaredBytes(p); }
             ld.paramSeed = true;
             self.ir.emit(ld);
+        }
+
+        // A `str`, a slice or a trait object taken by value arrives as the address of the
+        // caller's pair, and the body reaches the pair through that address. A body that writes
+        // the parameter (`s = s[1..]`, `s.len = n`) or lets the address go where it cannot be
+        // followed (`&s`, a store of it) would be changing the caller's own value, so such a
+        // parameter is first copied into storage of its own (`ownCopy`). Room for the copy is
+        // left here, between the seeds and the body, and filled once the body has been lowered
+        // and shows the copy is needed; otherwise it stays four `Nop`s.
+        self.fatNames.clear();
+        self.fatRoom.clear();
+        self.fatLent.clear();
+        for k in 0..f.argCount {
+            p: VarDeclNode = a.paramAt(f, k);
+            if (!ownsFatPair(p)) { continue; }
+            self.fatNames.push(p.name);
+            self.fatRoom.push(self.ir.code.len());
+            self.fatLent.push(false);
+            for j in 0..FAT_ROOM { self.ir.emit(instr(IROp.Nop)); }
         }
 
         isMain: bool = nameEndsWith(nameOf(f.name), "::main") || nameOf(f.name) == "main";
@@ -322,6 +373,12 @@ methods Lowerer {
 
         // A body that falls off its end returns nothing. Harmless when it cannot be reached.
         if (f.returnKind == Lit.Void) { self.ir.emit(instr(IROp.RetVoid)); }
+
+        for j in 0..self.fatNames.len() {
+            if (self.fatLent.get(j) || self.pairEscapes(self.fatRoom.get(j) + FAT_ROOM, self.fatNames.get(j), firstT)) {
+                self.ownCopy(j);
+            }
+        }
 
         takesArgs: bool = false;
 
@@ -335,7 +392,9 @@ methods Lowerer {
                                     firstTemp: firstT, tempCount: self.ir.tempKinds.len(),
                                     firstPromo: fp, promoCount: self.ir.promoName.len() - fp,
                                     isPub: exported,
-                                    isMain: isMain, wantsArgs: takesArgs, imported: false });
+                                    isMain: isMain, wantsArgs: takesArgs, imported: false,
+                                    holdsRecover: self.sawRecover, borrows: borrowMask(a, at),
+                                    isUnsafe: f.isUnsafe });
     }
 
     // ─── statements ──────────────────────────────────────────────────────────
@@ -363,8 +422,8 @@ methods Lowerer {
             // a call. Saying so here is what makes reading the name a load of the pointer rather
             // than an `lea` of the eight bytes holding it. Per declaration, not per name: a value
             // a sibling scope declares under the same name (`for p in v { }` and then
-            // `{ p: P = ...; }`) is a value again, and reading it through the old borrow wrote
-            // the collection.
+            // `{ p: P = ...; }`) is a value again, and reading it through the old borrow would
+            // write the collection.
             if (d.kind == Lit.Ref && !d.isArray) { self.noteByRef(d.name); }
             else { self.byRef.remove(nameOf(d.name)); }
             if (d.isArray) { self.arrayLen.put(nameOf(d.name), d.count); }
@@ -379,11 +438,20 @@ methods Lowerer {
                 z.imm = declaredBytes(d);
                 self.ir.emit(z);
             }
+            // So does a struct of plain data declared without a value. The checker takes a store
+            // to one field as the start of the value (`b.data[0] = 0`, `p.a = 1`), and a field no
+            // store reached would read whatever the stack held. A type with a `Default` was given
+            // one by the checker, and a type that owns something is refused a partial store.
+            if (d.init == NO_NODE && !d.isArray && !self.skipZero && plainAggregateDecl(d)) {
+                self.zeroFill(self.addressOfVar(d.name, d.structName), aggregateBytes(d.kind, d.structName));
+            }
             if (d.init != NO_NODE) {
                 // An aggregate initializer is a block copy into the variable's storage. Storing
                 // the value would store the address of someone else's copy, and both names would
-                // then be the same object.
-                if (storedInline(d.kind, d.structName)) {
+                // then be the same object. A whole array is one too, of all its elements.
+                if (d.isArray) {
+                    self.copyInto(self.addressOfVar(d.name, d.structName), self.lowerAddress(a, d.init), declaredBytes(d));
+                } else if (storedInline(d.kind, d.structName)) {
                     src: Temp = self.lowerAggValue(a, d.init, d.kind, d.structName);
                     self.copyInto(self.addressOfVar(d.name, d.structName), src,
                                   aggregateBytes(d.kind, d.structName));
@@ -397,7 +465,7 @@ methods Lowerer {
         if (st.kind == StmtKind.Expr) { self.lowerExpr(a, a.exprStmts.get(st.at).value); return; }
         if (st.kind == StmtKind.Return) {
             r: ReturnNode = a.returns.get(st.at);
-            if (r.value == NO_NODE) { self.ir.emit(instr(IROp.RetVoid)); return; }
+            if (r.value == NO_NODE) { self.unlinkRecords(0); self.ir.emit(instr(IROp.RetVoid)); return; }
             if (returnedByPointer(self.retKind, self.retStruct)) {
                 src: Temp = self.lowerAggValue(a, r.value, self.retKind, self.retStruct);
                 dst: Temp = self.ir.newTemp(Lit.Ptr, NO_SYM);
@@ -411,6 +479,7 @@ methods Lowerer {
                 cp.b = src;
                 cp.imm = aggregateBytes(self.retKind, self.retStruct);
                 self.ir.emit(cp);
+                self.unlinkRecords(0);
                 rv: Instr = instr(IROp.Ret);
                 rv.a = dst;
                 rv.kind = Lit.Ptr;
@@ -422,6 +491,7 @@ methods Lowerer {
             v: Temp = NO_TEMP;
             if (self.retKind == Lit.Ref) { v = self.baseAddress(a, r.value); }
             if (v == NO_TEMP) { v = self.lowerExpr(a, r.value); }
+            self.unlinkRecords(0);
             in: Instr = instr(IROp.Ret);
             in.a = v;
             in.kind = self.ir.kindOf(v);
@@ -432,6 +502,7 @@ methods Lowerer {
         if (st.kind == StmtKind.Match) { self.lowerMatch(a, st.at); return; }
         if (st.kind == StmtKind.While) { self.lowerWhile(a, st.at); return; }
         if (st.kind == StmtKind.Loop)  { self.lowerLoop(a, a.blockStmts.get(st.at).body); return; }
+        if (st.kind == StmtKind.Recover) { self.lowerRecover(a, st.at); return; }
         if (st.kind == StmtKind.Unsafe || st.kind == StmtKind.Block) {
             self.lowerBlock(a, a.blockStmts.get(st.at).body);
             return;
@@ -443,11 +514,17 @@ methods Lowerer {
         // A struct declaration is a fact about types, not code: the registry already holds it.
         if (st.kind == StmtKind.StructDecl) { return; }
         if (st.kind == StmtKind.Break) {
-            if (self.breakTo.len() > 0) { self.emitJump(IROp.Jmp, self.breakTo.last(), NO_TEMP); }
+            if (self.breakTo.len() > 0) {
+                self.unlinkRecords(self.loopRecovers());
+                self.emitJump(IROp.Jmp, self.breakTo.last(), NO_TEMP);
+            }
             return;
         }
         if (st.kind == StmtKind.Continue) {
-            if (self.continueTo.len() > 0) { self.emitJump(IROp.Jmp, self.continueTo.last(), NO_TEMP); }
+            if (self.continueTo.len() > 0) {
+                self.unlinkRecords(self.loopRecovers());
+                self.emitJump(IROp.Jmp, self.continueTo.last(), NO_TEMP);
+            }
             return;
         }
     }
@@ -509,7 +586,7 @@ methods Lowerer {
         self.emitJump(IROp.Jz, trueL, nz);
     }
 
-    // One comparison, straight to a conditional jump. The operation's type is the operands common
+    // One comparison, straight to a conditional jump. The operation's type is the operands' common
     // type, exactly as the value form takes it: that is what decides signed against unsigned, and
     // taking the left one would order `long` against `u64` by the wrong rule.
     compareJump &self inout a:Ast e:Expr to:Sym negate:bool -> void {
@@ -608,6 +685,107 @@ methods Lowerer {
         self.emitLabel(endL);
     }
 
+    // `recover { body } else { handler }`:
+    //
+    //         recoverpush #rec, Lh           where to resume, rsp, rbp, the registers to put back
+    //         t = call <@recover>(&rec)      link it; the record it replaced goes in its first word
+    //         [&rec] = t
+    //         <body>                         every call ends its block with `faultedge Lh`
+    //         call <@recover>([&rec])        unlink it
+    //         jmp Lend
+    //     Lh: <handler>                      `raise` has unlinked it already
+    //     Lend:
+    //
+    // The record lives in this frame for the whole statement, so the handler finds it at the
+    // same place once `raise` has put rsp and rbp back.
+    lowerRecover &self inout a:Ast at:long -> void {
+        w: WhileNode = a.whiles.get(at);
+        self.sawRecover = true;
+        handlerL: Sym = self.freshLabel();
+        endL: Sym = self.freshLabel();
+        slot: long = self.ir.addAggSlot(RECORD_BYTES);
+        push: Instr = instr(IROp.RecoverPush);
+        push.imm = slot;
+        push.name = handlerL;
+        self.ir.emit(push);
+        rec: Temp = self.recordAddr(slot);
+        prev: Temp = self.callRecoverFn(rec);
+        st: Instr = instr(IROp.PtrStore);
+        st.a = rec;
+        st.b = prev;
+        st.kind = Lit.Long;
+        self.ir.emit(st);
+
+        self.recovers.push(slot);
+        self.recoverLoops.push(self.breakTo.len());
+        outer: Sym = self.ir.faultTo;
+        self.ir.faultTo = handlerL;
+        self.lowerBlock(a, w.body);
+        self.ir.faultTo = outer;
+        self.recovers.pop();
+        self.recoverLoops.pop();
+        self.unlinkRecord(slot);
+        self.emitJump(IROp.Jmp, endL, NO_TEMP);
+        self.emitLabel(handlerL);
+        self.lowerBlock(a, w.step);
+        self.emitLabel(endL);
+    }
+
+    recordAddr &self slot:long -> Temp {
+        t: Temp = self.ir.newTemp(Lit.Ptr, NO_SYM);
+        sl: Instr = instr(IROp.AggSlot);
+        sl.dst = t;
+        sl.imm = slot;
+        sl.kind = Lit.Ptr;
+        self.ir.emit(sl);
+        return t;
+    }
+
+    // A call to the program's `@recover` function (`Checker.recoverTarget`, which the checker
+    // refused the statement without), handing it `arg`.
+    callRecoverFn &self arg:Temp -> Temp {
+        first: long = self.ir.args.len();
+        self.ir.args.push(arg);
+        t: Temp = self.ir.newTemp(Lit.Long, NO_SYM);
+        in: Instr = instr(IROp.Call);
+        in.dst = t;
+        in.name = gRecoverFn;
+        in.firstArg = first;
+        in.argCount = 1;
+        in.kind = Lit.Long;
+        self.ir.emit(in);
+        return t;
+    }
+
+    // Unlink the record in `slot`: the one it replaced becomes the innermost again.
+    unlinkRecord &self slot:long -> void {
+        rec: Temp = self.recordAddr(slot);
+        prev: Temp = self.ir.newTemp(Lit.Long, NO_SYM);
+        ld: Instr = instr(IROp.PtrLoad);
+        ld.dst = prev;
+        ld.a = rec;
+        ld.kind = Lit.Long;
+        self.ir.emit(ld);
+        self.callRecoverFn(prev);
+    }
+
+    // Leaving the bodies of the `recover` statements from the `from`-th open one inward: each
+    // record is unlinked, innermost first.
+    unlinkRecords &self from:long -> void {
+        k: long = self.recovers.len();
+        while (k > from) {
+            k = k - 1;
+            self.unlinkRecord(self.recovers.get(k));
+        }
+    }
+
+    // The first open `recover` begun inside the innermost loop: what a `break` or `continue` leaves.
+    loopRecovers &self -> long {
+        k: long = self.recovers.len();
+        while (k > 0 && self.recoverLoops.get(k - 1) >= self.breakTo.len()) { k = k - 1; }
+        return k;
+    }
+
     storeVar &self name:Sym v:Temp k:Lit -> void {
         in: Instr = instr(IROp.Store);
         in.name = name;
@@ -637,8 +815,8 @@ methods Lowerer {
         if (e.op == Op.AddressOf) {
             inner: NodeId = self.subNode(a, id);
             // `&isOdd` is the address of a function: a label, not a slot. Taken as a variable's
-            // address it handed out a pointer into this frame, and the call through it jumped
-            // into the stack.
+            // address it would hand out a pointer into this frame, and a call through it would
+            // jump into the stack.
             if (inner != NO_NODE && e.kind == Lit.Fn) {
                 fname: Sym = NO_SYM;
                 q: Payload = a.expr(inner).payload;
@@ -652,6 +830,7 @@ methods Lowerer {
                 }
             }
             if (inner != NO_NODE) {
+                if (self.fatNames.len() > 0) { self.noteFatLend(a, inner); }
                 // `&__cl.x` on a ref forwards the borrow rather than taking a second one: the
                 // address to hand on is the one already held, not where it is held. That covers
                 // a captured `&S` field and a parameter inference retyped to a borrow alike.
@@ -751,9 +930,9 @@ methods Lowerer {
             r: Temp = self.lowerExpr(a, e.right);
             // `p + n` on a `*T` steps whole elements and `q - p` counts them, both scaled by the
             // pointee the temp carries. Without it a pointer walks by bytes: `boxes + a` over
-            // 24-byte boxes landed eight bytes in, and read a value's address as its tag. Asked
-            // after both operands are lowered, because whether this is pointer arithmetic is a
-            // fact about the values, and a raw address that happens to be spelled `*T` is not one.
+            // 24-byte boxes would land eight bytes in, and read a value's address as its tag.
+            // Asked after both operands are lowered, because whether this is pointer arithmetic is
+            // a fact about the values, and a raw address that happens to be spelled `*T` is not.
             scaled: Temp = self.lowerPtrArith(a, id, l, r);
             if (scaled != NO_TEMP) { return scaled; }
             // The operation's type is the common type of the two operands, not the left one's:
@@ -761,6 +940,10 @@ methods Lowerer {
             // result wraps. `long / int` taking the left operand's type would divide correctly and
             // then truncate the answer to thirty-two bits.
             common: Lit = commonKind(self.ir.kindOf(l), self.ir.kindOf(r));
+            // A shift is the left operand's type, whatever the count's (the checker's rule).
+            if ((e.op == Op.ShiftLeft || e.op == Op.ShiftRight) && isInteger(self.ir.kindOf(l))) {
+                common = self.ir.kindOf(l);
+            }
             t: Temp = self.ir.newTemp(e.kind, e.structName);
             in: Instr = instr(opFor(e.op));
             in.dst = t;
@@ -836,6 +1019,16 @@ methods Lowerer {
     lowerAssign &self inout a:Ast id:NodeId -> Temp {
         e: Expr = a.expr(id);
         lhs0: Expr = a.expr(e.left);
+        // A whole fixed array is copied, every element. Its `kind` is its element's, so neither
+        // path below is right for it: the word store would write the source's address into the
+        // first element, and an aggregate element's copy would move one element's bytes.
+        whole: long = self.wholeArrayBytes(a, e.left);
+        if (whole > 0) {
+            src: Temp = self.lowerAddress(a, e.right);
+            dst: Temp = self.lowerAddress(a, e.left);
+            if (dst != NO_TEMP) { self.copyInto(dst, src, whole); }
+            return src;
+        }
         // Assigning an aggregate copies its bytes into the destination's storage. A ref holds a
         // pointer, so assigning one is an ordinary word store.
         if (storedInline(lhs0.kind, lhs0.structName)) {
@@ -1007,13 +1200,16 @@ methods Lowerer {
     }
 
     // Where an aggregate expression's bytes are. `lowerAddress` declines some expressions by
-    // answering NO_TEMP, and the value path handles those instead, but for a call and for a
-    // literal it does not decline, it lowers, and a call yielding no temp comes back NO_TEMP
-    // having already been emitted. Retrying that as a value ran it a second time: `q: Pair =
-    // p.clone()` cloned twice and copied neither answer into `q`. An expression is lowered once,
-    // so whether a retry is allowed has to be decided from the shape of the node, before it.
+    // answering NO_TEMP, and the value path handles those instead. For a call or a literal it does
+    // not decline but lowers, and a call yielding no temp comes back NO_TEMP having already been
+    // emitted. Retrying that as a value would run it a second time: `q: Pair = p.clone()` would
+    // clone twice and copy neither answer into `q`. An expression is lowered once, so whether a
+    // retry is allowed has to be decided from the shape of the node, before lowering it.
     placeOf &self inout a:Ast id:NodeId -> Temp {
         if (id == NO_NODE) { return NO_TEMP; }
+        // A borrow held in a field (a closure's captured `&S`): its bytes are where it points, as
+        // a borrowed variable's are (`addressOfVar`), not the field's own eight.
+        if (a.expr(id).kind == Lit.Ref && a.expr(id).op == Op.FieldAccess) { return self.lowerExpr(a, id); }
         p: Payload = a.expr(id).payload;
         alreadyLowered: bool = false;
         match p {
@@ -1065,7 +1261,7 @@ methods Lowerer {
         if (concrete == NO_SYM || trait == NO_SYM) { return; }
         tr: TraitRef = TraitRef { name: trait, firstArg: 0, argCount: 0 };
         if (gReg.implementsTrait(concrete, tr)) { return; }
-        at: long = gReg.findTrait(nameOf(trait));
+        at: long = gReg.findTraitSym(trait);
         if (at < 0) { return; }
         t: TraitDef = gReg.traitDef(at);
         fns: Vec<Sym>;
@@ -1115,6 +1311,7 @@ methods Lowerer {
         in.firstArg = first;
         in.argCount = self.ir.args.len() - first;
         in.kind = e.kind;
+        in.imm = fnValueConventions(cn.sigKey, ret != NO_TEMP);
         self.ir.emit(in);
         return t;
     }
@@ -1145,11 +1342,47 @@ methods Lowerer {
     //   atCompileTime()         false: the program is running, and the branch it guards is dead
     //   exit(status)            the `@fini` hooks (`__kiln_fini`), then exit_group
     //   parseExpr(src)          a trap: the parser exists only while the compiler runs
+    //   memcpy(dst, src, n)     one `MemCopy` instruction (`rep movsb`), which ends only what is known
+    //                           of the destination range
     lowerBuiltin &self inout a:Ast id:NodeId cn:CallNode bk:long -> Temp {
         e: Expr = a.expr(id);
         if (bk == BI_AT_COMPILE_TIME) { return self.constTemp(0, Lit.Bool); }
+        // An atomic: one `Atomic` instruction, its operands in argument order (the address, then
+        // the value, then a compare-and-swap's desired value as its one argument).
+        if (isAtomicBuiltin(bk)) {
+            op: long = atomicOpOf(bk);
+            k: Lit = Lit.Long;
+            if (bk != op) { k = Lit.Int; }
+            vals: Vec<Temp>;
+            for j in 0..cn.argCount { vals.push(self.lowerExpr(a, a.argAt(cn, j))); }
+            at: Instr = instr(IROp.Atomic);
+            at.imm = op;
+            at.kind = k;
+            at.a = vals.get(0);
+            if (vals.len() > 1) { at.b = vals.get(1); }
+            if (vals.len() > 2) {
+                at.firstArg = self.ir.args.len();
+                at.argCount = 1;
+                self.ir.args.push(vals.get(2));
+            }
+            if (op != BI_ATOMIC_STORE && op != BI_ATOMIC_STORE_SC) { at.dst = self.ir.newTemp(k, NO_SYM); }
+            self.ir.emit(at);
+            return at.dst;
+        }
+        if (bk == BI_MEMCPY) {
+            mc: Instr = instr(IROp.MemCopy);
+            mc.a = self.lowerExpr(a, a.argAt(cn, 0));
+            mc.b = self.lowerExpr(a, a.argAt(cn, 1));
+            n: Temp = self.lowerExpr(a, a.argAt(cn, 2));
+            mc.firstArg = self.ir.args.len();
+            mc.argCount = 1;
+            self.ir.args.push(n);
+            mc.kind = Lit.Long;
+            self.ir.emit(mc);
+            return NO_TEMP;
+        }
         if (bk == BI_SYSCALL) {
-            if (cn.argCount > 7) { failStr(stringOf("a syscall takes a number and at most six arguments")); }
+            if (cn.argCount > 7) { failStr(format("too many arguments to `syscall`: expected at most 7, found {}\nnote: a system call takes its number and at most six arguments", cn.argCount)); }
             first: long = self.ir.asmKinds.len();
             regs: [str; 7] = ["rax", "rdi", "rsi", "rdx", "r10", "r8", "r9"];
             vals: Vec<Temp>;
@@ -1246,9 +1479,9 @@ methods Lowerer {
     buildVariadicSlice &self inout a:Ast nodes:Vec<NodeId> sig:VarSig -> Temp {
         count: long = nodes.len() - sig.fixed;
         if (count < 0) { count = 0; }
-        // `...Tok` is a tail of integers, however the type is spelled: a backed enum reaches here
-        // as `Lit.Struct` with a name the struct registry has never heard of, and `structBytes`
-        // answered 0 for it: a zero stride writes every argument over the first one.
+        // `...Tok` is a tail of integers, however the type is spelled. A backed enum reaches here
+        // as `Lit.Struct` with a name the struct registry has never heard of, `structBytes` would
+        // answer 0 for it, and a zero stride writes every argument over the first one.
         ek: Lit = storedKind(sig.elemKind, sig.elemStruct);
         elem: long = typeInfo(ek).size;
         if (ek == Lit.Struct) { elem = structBytes(sig.elemStruct); }
@@ -1276,8 +1509,8 @@ methods Lowerer {
     }
 
     // One `any`: 24 bytes of {tag, x, y}, matching `stdlib/fmt.k`'s `AnyBox` and `BoxTag`. The
-    // tag says how to read the other two words, and is chosen by width and signedness rather
-    // than by naming a type -- an 8-byte value tagged as an int has its top half read as absent.
+    // tag says how to read the other two words. It is chosen by width and signedness rather than
+    // by naming a type, because an 8-byte value tagged as an int would have its top half ignored.
     boxAny &self inout a:Ast base:Temp off:long arg:NodeId -> void {
         e: Expr = a.expr(arg);
         isObj: bool = e.kind == Lit.TraitObj && lastComponentOf(nameOf(e.structName)) == "Display";
@@ -1332,8 +1565,9 @@ methods Lowerer {
         else if (isTruthValue(e.kind, e.op)) { tag = boxTagOf("Bool", 0); }
         self.storeAt(base, off, self.constTemp(tag, Lit.Long), Lit.Long);
         self.storeAt(base, off + 8, self.lowerExpr(a, arg), Lit.Long);
-        // A float's box carries the formatter's address, which is what makes a program that
-        // formats a float -- and only one -- reach it (`gFloatBoxFormat`).
+        // A float's box carries the formatter's address. That reference is what makes the float
+        // formatter reachable in a program that formats a float, and only in such a program
+        // (`gFloatBoxFormat`).
         if ((tag == 6 || tag == 7) && gFloatBoxFormat != NO_SYM) {
             fp: Temp = self.ir.newTemp(Lit.Ptr, NO_SYM);
             fa: Instr = instr(IROp.FnAddr);
@@ -1358,9 +1592,9 @@ methods Lowerer {
     //
     // The pointee comes from `ir.pointeeOf`, the tracked fact, never from the static type of the
     // node. The two disagree exactly where it matters: `s.ptr` on a `str` is a `Lit.Ptr`
-    // expression whose companion name is empty (a `str` names no element type), and reading a
-    // width off that name answered 8, so `strSlice(s, 7, n)` and `strCmp`'s `s.ptr + i` walked
-    // eight bytes an index and landed in some other string entirely. An untracked pointer is a
+    // expression whose companion name is empty (a `str` names no element type). Reading a width
+    // off that name would answer 8, so `strSlice(s, 7, n)` and `strCmp`'s `s.ptr + i` would walk
+    // eight bytes per index and land in some other string entirely. An untracked pointer is a
     // raw address, exactly as a `&x` long is, and a raw address is not scaled.
     lowerPtrArith &self inout a:Ast id:NodeId l:Temp r:Temp -> Temp {
         e: Expr = a.expr(id);
@@ -1390,6 +1624,13 @@ methods Lowerer {
         return out;
     }
 
+    // `Instr.imm` of a direct call to `name` (`CALL_KNOWN` and its bits): the callee's conventions,
+    // which do not depend on whether this call passes a `$sret`, since the callee's own `$sret` is
+    // counted where it has one. 0, knowing nothing, for a callee not found.
+    callConventions &self inout a:Ast name:Sym sret:bool -> long {
+        return self.callConvs.getOr(name as long, 0);
+    }
+
     lowerCall &self inout a:Ast id:NodeId c:long -> Temp {
         e: Expr = a.expr(id);
         cn: CallNode = a.calls.get(c);
@@ -1405,18 +1646,41 @@ methods Lowerer {
         k: long = 0;
         while (k < cn.argCount) { nodes.push(a.argAt(cn, k)); k = k + 1; }
 
+        // Which arguments hand the callee bytes nothing reads again (`freshArg`): a mask over
+        // `nodes`, and the owning locals among them, which no other argument may name.
+        argsFrom: long = self.ir.code.len();
+        byVal: long = self.byValParams.getOr(cn.name as long, 0);
+        fresh: long = 0;
+        moved: long = 0;
         vs: long = self.variadicOf(cn.name);
-        if (vs == NOT_FOUND) {
-            k = 0;
-            while (k < nodes.len()) { argTemps.push(self.lowerArg(a, nodes.get(k))); k = k + 1; }
-        } else {
-            sig: VarSig = self.varSigs.get(vs);
-            k = 0;
-            while (k < sig.fixed && k < nodes.len()) {
-                argTemps.push(self.lowerArg(a, nodes.get(k)));
-                k = k + 1;
+        fixed: long = nodes.len();
+        if (vs != NOT_FOUND) { fixed = self.varSigs.get(vs).fixed; }
+        k = 0;
+        while (k < fixed && k < nodes.len()) {
+            c0: long = self.ir.code.len();
+            s0: long = self.ir.aggSlots.len();
+            t: Temp = self.lowerArg(a, nodes.get(k));
+            argTemps.push(t);
+            if (k < 62 && (byVal & (1 << k)) != 0) {
+                how: long = self.freshArg(a, nodes.get(k), t, c0, s0);
+                if (how != 0) { fresh = fresh | (1 << k); }
+                if (how == 2) { moved = moved | (1 << k); }
             }
-            argTemps.push(self.buildVariadicSlice(a, nodes, sig));
+            k = k + 1;
+        }
+        if (vs != NOT_FOUND) { argTemps.push(self.buildVariadicSlice(a, nodes, self.varSigs.get(vs))); }
+        // A move does not keep the call's other arguments from lending the same local (`take(x,
+        // x)` with the first parameter a borrow), so a local named anywhere else in the call keeps
+        // the callee's copy: its own `&` is the one instruction that may name it.
+        if (moved != 0) {
+            for j in 0..62 {
+                if ((moved & (1 << j)) == 0) { continue; }
+                n: Sym = NO_SYM;
+                match a.expr(nodes.get(j)).payload { Name(x) { n = x; } _ { } }
+                uses: long = 0;
+                for q in argsFrom..self.ir.code.len() { if (self.namesSlot(q, n)) { uses = uses + 1; } }
+                if (uses != 1) { fresh = fresh & ~(1 << j); }
+            }
         }
 
         // An aggregate result needs somewhere to live: a scratch slot in this frame, whose
@@ -1446,11 +1710,55 @@ methods Lowerer {
         in.argCount = self.ir.args.len() - first;
         in.kind = e.kind;
         in.noReturn = gNoReturnFns.has(nameOf(cn.name));
+        in.imm = self.callConventions(a, cn.name, ret != NO_TEMP);
         // The result already sits in the slot the hidden pointer named, so the call writes no
         // destination temp of its own.
         if (returnedByPointer(e.kind, e.structName)) { in.dst = NO_TEMP; }
+        // Which arguments are fresh, by their position in the IR (`CALL_FRESH_ALL`).
+        if (ret != NO_TEMP) { fresh = fresh << 1; }
+        in.scale = fresh & (CALL_FRESH_ALL);
         self.ir.emit(in);
         return t;
+    }
+
+    // Whether the argument just lowered into `t` (by the instructions from `from` on, any scratch
+    // slot it made numbered `slots` or more) hands the callee bytes nothing reads again, which a
+    // parameter taken by value may then own where they lie (`ownMovedArgs`): 0 when not, 1 for a
+    // value the argument built in a scratch slot of its own (a literal, a call's result: nothing
+    // else knows the slot), 2 for a local, or a parameter taken by value, that owns something and
+    // is named whole. Passing that by value moves it: the checker refuses any later read until it
+    // is assigned again, and what it held is released by the callee, never by this scope. The
+    // call then checks no other argument names it (`lowerCall`).
+    freshArg &self inout a:Ast id:NodeId t:Temp from:long slots:long -> long {
+        if (t == NO_TEMP) { return 0; }
+        i: long = self.ir.code.len() - 1;
+        while (i >= from) {
+            if (self.ir.code[i].dst == t) { break; }
+            i = i - 1;
+        }
+        if (i < from) { return 0; }
+        o: IROp = self.ir.code[i].op;
+        if (o != IROp.AggSlot && (o != IROp.AddrOf || self.ir.code[i].isGlobal)) { return 0; }
+        e: Expr = a.expr(id);
+        if (!byValueAggregate(e.kind)) { return 0; }
+        if (o == IROp.AggSlot) {
+            if (self.ir.code[i].imm >= slots) { return 1; }
+            return 0;
+        }
+        if (e.op != Op.Lvalue || e.kind != Lit.Struct || !gReg.needsDrop(e.structName)) { return 0; }
+        match e.payload { Name(x) { if (x == self.ir.code[i].name) { return 2; } } _ { } }
+        return 0;
+    }
+    // Whether instruction `k` reads or writes the frame slot `n` by name.
+    namesSlot &self k:long n:Sym -> bool {
+        o: IROp = self.ir.code[k].op;
+        if (o == IROp.Asm) {
+            fp: long = self.ir.code[k].firstPiece;
+            for q in 0..self.ir.code[k].pieceCount { if (self.ir.asmNames.get(fp + q) == n) { return true; } }
+            return false;
+        }
+        if (o != IROp.Load && o != IROp.Store && o != IROp.AddrOf && o != IROp.ArrLoad && o != IROp.ArrStore) { return false; }
+        return !self.ir.code[k].isGlobal && self.ir.code[k].name == n;
     }
 }
 
@@ -1459,7 +1767,7 @@ pub sretSym -> Sym { return intern("$sret"); }
 // How many bytes a named aggregate occupies.
 pub structBytes n:Sym -> long {
     if (n == NO_SYM) { return 8; }
-    at: long = gReg.findStruct(nameOf(n));
+    at: long = gReg.findStructSym(n);
     if (at < 0) { return 8; }
     b: long = gReg.structDef(at).size;
     if (b < 8) { b = 8; }
@@ -1474,8 +1782,35 @@ pub structBytes n:Sym -> long {
 //
 // It takes the companion name as well as the kind, because a kind alone cannot answer: the parser
 // gives every named type it does not otherwise recognise `Lit.Struct`, and a backed enum is one of
-// those. `config: BufWriterConfig` is an integer, and copying sixteen bytes from the integer 1 as
-// though it were an address is what it did before this asked.
+// those. `config: BufWriterConfig` is an integer, and asked by kind alone this would copy sixteen
+// bytes from the integer 1 as though it were an address.
+// A local of a struct or tuple type that owns nothing, stored in its slot: what starts as zero
+// bytes when it is declared without a value.
+local plainAggregateDecl d:VarDeclNode -> bool {
+    if (d.kind != Lit.Struct && d.kind != Lit.Tuple) { return false; }
+    if (namedScalar(d.kind, d.structName) || !storedInline(d.kind, d.structName)) { return false; }
+    return !gReg.needsDrop(d.structName);
+}
+
+// A `str`, a slice or a trait object taken by value: it arrives as the address of the caller's
+// pair (`passedByPointer`), and the callee must not write through that address (`ownCopy`).
+// An `inout` slice is the caller's lent pair and is written in place; an array parameter is its
+// own storage already.
+pub ownsFatPair p:VarDeclNode -> bool {
+    return (p.kind == Lit.Str || p.kind == Lit.Slice || p.kind == Lit.TraitObj) && !p.isArray && p.conv != Conv.Inout;
+}
+
+// How many instructions the room for a parameter's own pair takes: its copy (a load of the
+// caller's address, the copy's address, the block copy) and, when the slot must be pointed at
+// the copy, a store.
+local FAT_ROOM: long = 4;
+local FAT_PAIR_BYTES: long = 16;
+
+// A temp holding an address of the kinds a fat pointer's address is moved through.
+local addressKind k:Lit -> bool {
+    return k == Lit.Ptr || k == Lit.Str || k == Lit.Slice || k == Lit.TraitObj || k == Lit.Ref;
+}
+
 pub passedByPointer k:Lit n:Sym -> bool {
     if (namedScalar(k, n)) { return false; }
     return isAggregate(k) || k == Lit.Ref;
@@ -1487,11 +1822,11 @@ pub passedByPointer k:Lit n:Sym -> bool {
 // block copy, and reading it is a load rather than the field's own address.
 //
 // `passedByPointer` cannot answer this. It says how a value travels to a callee, and a borrow
-// travels the way an aggregate does precisely because both arrive as an address, which is why
-// the two questions read alike, and why conflating them was silent: a closure's captured `&S`
-// field was filled by copying the first eight bytes of the borrowed struct over the pointer, so
-// `a.bump(5)` inside the closure wrote to the closure and `a.n` read the struct's first word
-// whichever field was asked for.
+// travels the way an aggregate does precisely because both arrive as an address. That is why the
+// two questions read alike, and why mixing them up fails silently: a closure's captured `&S`
+// field would be filled by copying the first eight bytes of the borrowed struct over the pointer,
+// so `a.bump(5)` inside the closure would write to the closure, and `a.n` would read the struct's
+// first word whichever field was asked for.
 pub storedInline k:Lit n:Sym -> bool {
     if (k == Lit.Ref) { return false; }
     return passedByPointer(k, n);
@@ -1500,7 +1835,7 @@ pub storedInline k:Lit n:Sym -> bool {
 // What a return, and so a call's result, travels as. A `-> &T` hands back an address, which is one
 // register, so it comes back like a scalar even though `&T` borrows an aggregate, and only a
 // value with no register to fit in needs the hidden result pointer. Routing a borrow through that
-// pointer copied the first eight bytes of the borrowed object where its address should have gone.
+// pointer would copy the first eight bytes of the borrowed object where its address should go.
 pub returnedByPointer k:Lit n:Sym -> bool {
     if (k == Lit.Ref) { return false; }
     return passedByPointer(k, n);
@@ -1508,8 +1843,8 @@ pub returnedByPointer k:Lit n:Sym -> bool {
 
 // The bytes a value of this type occupies where it lives. A `str` or a slice is its two words, a
 // trait object its {data, vtable}, an `any` its tagged three; only a named aggregate has to ask
-// the registry. Reading this off `structBytes` alone answered 8 for every one of them, which is
-// how a slice local came to hold half a fat pointer.
+// the registry. `structBytes` alone answers 8 for every one of them, and a slice local sized by it
+// holds half a fat pointer.
 pub aggregateBytes k:Lit n:Sym -> long {
     if (namedScalar(k, n)) { return 8; }    // one register, like any other integer
     if (k == Lit.Struct || k == Lit.Tuple) { return structBytes(n); }
@@ -1523,10 +1858,10 @@ pub aggregateBytes k:Lit n:Sym -> long {
 pub declaredBytes d:VarDeclNode -> long {
     unit: long = typeInfo(d.kind).size;
     // A backed enum first, so `xs: [Tok; 128]` strides by the backing integer the way an indexing
-    // expression's `typeBytes` does, the two are the same array and must agree on its shape.
+    // expression's `typeBytes` does: the two are the same array and must agree on its shape.
     if (namedScalar(d.kind, d.structName)) { unit = typeInfo(namedScalarBacking(d.structName)).size; }
     else if (d.kind == Lit.Struct && d.structName != NO_SYM) {
-        at: long = gReg.findStruct(nameOf(d.structName));
+        at: long = gReg.findStructSym(d.structName);
         if (at >= 0) { unit = gReg.structDef(at).size; }
     }
     if (unit < 1) { unit = 8; }
@@ -1535,16 +1870,14 @@ pub declaredBytes d:VarDeclNode -> long {
     return unit;
 }
 
-// The type both operands of an operation widen to: the higher-ranked of the two, and never
-// narrower than `int`, which is where the numeric ladder starts. A type off the ladder (an
-// aggregate, an address) does not widen at all and keeps the left operand's type, which is what
-// the back end then sizes by.
+// The type both operands of an operation widen to, and the one it is computed and wraps at: the
+// checker's (`higherPrecedence`), so a `u8 + u8` is a `u8` here as it is there. C's promotion to
+// at least `int` would be wrong: the checker types that result a `u8`, and a temp computed as an
+// `int` could then hold 400. A type off the ladder (an aggregate, an address) does not widen at
+// all and keeps the left operand's type, which is what the back end then sizes by.
 pub commonKind x:Lit y:Lit -> Lit {
     if (typeInfo(x).precedence == 0 || typeInfo(y).precedence == 0) { return x; }
-    c: Lit = x;
-    if (typeInfo(y).precedence > typeInfo(x).precedence) { c = y; }
-    if (typeInfo(c).size < typeInfo(Lit.Int).size) { return Lit.Int; }
-    return c;
+    return higherPrecedence(x, y);
 }
 
 // The IR operation a syntax operator lowers to, as a table built once and indexed by the
@@ -1584,14 +1917,27 @@ pub nameEndsWith s:str suffix:str -> bool { return strEndsWith(s, suffix); }
 // ─── an array written in full before it is read ───────────────────────────────
 //
 // Statement `k` of block `b` declares a local array without a value, and what follows plainly
-// writes every element before anything reads the array: one store per element by constant index
-// (what `xs: [T; N] = [a, b, ...]` is written out as), or a range loop over exactly `0..N` whose
-// body begins with `xs[i] = v` and holds no `break` and no write to `i`, where no stored value
-// reads `xs`. Plainly: anything else keeps the fill.
+// writes every element before anything reads the array. Two shapes count: one store per element
+// by constant index (what `xs: [T; N] = [a, b, ...]` is written out as), or a range loop over
+// exactly `0..N` whose body begins with `xs[i] = v` and holds no `break` and no write to `i`. In
+// both, no stored value may read `xs`. Anything less plain keeps the zero fill.
 local writtenInFull inout a:Ast b:long k:long -> bool {
     d: VarDeclNode = a.decls.get(a.stmtAt(b, k).at);
-    if (!d.isArray || d.init != NO_NODE || d.count <= 0) { return false; }
     n: long = a.blockLen(b);
+    // A struct the next statement assigns whole (the value assigned cannot read it: nothing has
+    // been stored in it, and definite initialization refuses the read).
+    if (!d.isArray && d.init == NO_NODE && plainAggregateDecl(d)) {
+        if (k + 1 >= n) { return false; }
+        nx: Stmt = a.stmtAt(b, k + 1);
+        if (nx.kind != StmtKind.Expr) { return false; }
+        e: Expr = a.expr(a.exprStmts.get(nx.at).value);
+        if (e.op != Op.Assignment || e.left == NO_NODE) { return false; }
+        l: Expr = a.expr(e.left);
+        if (l.op != Op.Lvalue) { return false; }
+        match l.payload { Name(x) { return x == d.name; } _ { } }
+        return false;
+    }
+    if (!d.isArray || d.init != NO_NODE || d.count <= 0) { return false; }
     // One store per element.
     if (k + d.count < n) {
         seen: Vec<bool>;
@@ -1704,8 +2050,8 @@ local mentions inout a:Ast id:NodeId n:Sym -> bool {
     return false;
 }
 
-// Whether a loop body may leave early (`break`, or anything but a plain statement we can read) or
-// write its counter `i`.
+// Whether a loop body may leave early (`break`, or anything but a plain statement this can read)
+// or write its counter `i`.
 local breaksOrWrites inout a:Ast b:long i:Sym -> bool {
     if (b < 0) { return false; }
     for k in 0..a.blockLen(b) {
@@ -1727,6 +2073,8 @@ local breaksOrWrites inout a:Ast b:long i:Sym -> bool {
         if (st.kind == StmtKind.Block || st.kind == StmtKind.Unsafe) {
             if (breaksOrWrites(a, a.blockStmts.get(st.at).body, i)) { return true; }
         }
+        // A `raise` can leave the body at any call, so a loop holding one is not counted on.
+        if (st.kind == StmtKind.Recover) { return true; }
         if (st.kind == StmtKind.Match) {
             m: MatchNode = a.matches.get(st.at);
             for j in 0..m.armCount { if (breaksOrWrites(a, a.arms.get(m.firstArm + j).body, i)) { return true; } }
@@ -1786,13 +2134,173 @@ methods Lowerer {
     isByRef &self name:Sym -> bool { return self.byRef.has(nameOf(name)); }
     noteByRef &self name:Sym -> void { self.byRef.put(nameOf(name), 1); }
 
+    // ─── a `str`, slice or trait object parameter that needs a pair of its own ──
+
+    // `&p` or `&p.len`, where `p` is one of the function's by-value fat parameters: the body
+    // lends the pair, and whatever it is lent to may write it.
+    noteFatLend &self inout a:Ast id:NodeId -> void {
+        at: NodeId = id;
+        while (at != NO_NODE) {
+            e: Expr = a.expr(at);
+            p: Payload = e.payload;
+            match p {
+                Name(n) {
+                    if (e.op != Op.Lvalue) { return; }
+                    for j in 0..self.fatNames.len() { if (self.fatNames.get(j) == n) { self.fatLent.set(j, true); } }
+                    return;
+                }
+                Field(f) { at = a.fields.get(f).base; }
+                _ { return; }
+            }
+        }
+    }
+
+    // Whether the body lowered from `from` on does anything with parameter `n`'s pair address
+    // other than read through it. The address is what a non-seed load of the slot gives
+    // (`addressOfVar`), followed through copies, constant offsets and the `str`/slice view
+    // conversion. A read is a load through it, a copy out of it, a comparison, or handing it to a
+    // call: a callee takes a `str`, a slice or a trait object by value the same way, and copies
+    // its own before writing. A lend (`&p`, to an `inout` parameter or a raw pointer) is caught
+    // as it is lowered (`noteFatLend`); a `&self` method of `str` or of a slice may not assign
+    // `self` (the checker refuses it), so a receiver is a read. Anything else (a store through
+    // it, a copy into it, the address stored, returned, converted to a number or handed to
+    // `asm`) counts as a write.
+    pairEscapes &self from:long n:Sym firstT:Temp -> bool {
+        end: long = self.ir.code.len();
+        nt: long = self.ir.tempKinds.len() - firstT;
+        self.fatMark.clear();
+        for i in 0..nt { self.fatMark.push(false); }
+        for i in from..end {
+            if (self.ir.code[i].op != IROp.Load) { continue; }
+            in: Instr = self.ir.code.get(i);
+            if (!in.paramSeed && !in.isGlobal && in.name == n) { self.markFat(in.dst, firstT); }
+        }
+        // What is computed from the address, to a fixpoint: a later definition can feed an
+        // earlier use only round a loop, so this settles in a pass or two.
+        going: bool = true;
+        while (going) {
+            going = false;
+            for i in from..end {
+                o: IROp = self.ir.code[i].op;
+                if (o != IROp.Mov && o != IROp.Convert && o != IROp.Add && o != IROp.Sub) { continue; }
+                in: Instr = self.ir.code.get(i);
+                if (self.fatMarked(in.dst, firstT) || !self.fatMarked(in.a, firstT)) { continue; }
+                if (!in.bIsImm && self.fatMarked(in.b, firstT)) { continue; }
+                if (in.dst == NO_TEMP || !addressKind(self.ir.tempKinds.get(in.dst))) { continue; }
+                self.markFat(in.dst, firstT);
+                going = true;
+            }
+        }
+        for i in from..end {
+            u: Instr = self.ir.code.get(i);
+            o: IROp = u.op;
+            if (o == IROp.Nop || o == IROp.Label) { continue; }
+            for j in 0..u.pieceCount { if (self.fatMarked(self.ir.asmVals.get(u.firstPiece + j), firstT)) { return true; } }
+            if (o != IROp.Call && o != IROp.CallIndirect) {
+                for j in 0..u.argCount { if (self.fatMarked(self.ir.args.get(u.firstArg + j), firstT)) { return true; } }
+            }
+            inA: bool = self.fatMarked(u.a, firstT);
+            inB: bool = !u.bIsImm && self.fatMarked(u.b, firstT);
+            if (!inA && !inB) { continue; }
+            if (o == IROp.PtrLoad && !inB) { continue; }
+            if (o == IROp.AggCopy && !inA) { continue; }
+            if (isCompare(o) || o == IROp.Jcc || o == IROp.Jz) { continue; }
+            if ((o == IROp.Mov || o == IROp.Convert || o == IROp.Add || o == IROp.Sub) && !inB && self.fatMarked(u.dst, firstT)) { continue; }
+            return true;
+        }
+        return false;
+    }
+    markFat &self t:Temp firstT:Temp -> void {
+        if (t == NO_TEMP || t < firstT || t - firstT >= self.fatMark.len()) { return; }
+        self.fatMark.set(t - firstT, true);
+    }
+    fatMarked &self t:Temp firstT:Temp -> bool {
+        if (t == NO_TEMP || t < firstT || t - firstT >= self.fatMark.len()) { return false; }
+        return self.fatMark.get(t - firstT);
+    }
+
+    // Fill parameter `j`'s room with a copy of the caller's pair into a slot of this frame
+    // (`<name>$own`), and point the body at the copy: every read of the parameter's slot after
+    // the room becomes the copy's address. The slot itself is then read once, by the copy.
+    // Should anything but a read name the slot, the slot is pointed at the copy instead, which
+    // costs a store and keeps every access to it right.
+    ownCopy &self j:long -> void {
+        n: Sym = self.fatNames.get(j);
+        room: long = self.fatRoom.get(j);
+        ownName: String;
+        ownName.pushStr(nameOf(n));
+        ownName.pushStr("$own");
+        own: Sym = internString(ownName);
+        self.ir.noteSlot(own, FAT_PAIR_BYTES);
+        src: Temp = self.ir.newTemp(Lit.Ptr, NO_SYM);
+        dst: Temp = self.ir.newTemp(Lit.Ptr, NO_SYM);
+        ld: Instr = instr(IROp.Load);
+        ld.dst = src; ld.name = n; ld.kind = Lit.Ptr;
+        ad: Instr = instr(IROp.AddrOf);
+        ad.dst = dst; ad.name = own; ad.kind = Lit.Ptr;
+        cp: Instr = instr(IROp.AggCopy);
+        cp.a = dst; cp.b = src; cp.imm = FAT_PAIR_BYTES;
+        self.ir.code.set(room, ld);
+        self.ir.code.set(room + 1, ad);
+        self.ir.code.set(room + 2, cp);
+        body: long = room + FAT_ROOM;
+        end: long = self.ir.code.len();
+        readsOnly: bool = true;
+        for i in body..end {
+            in: Instr = self.ir.code.get(i);
+            if (in.op == IROp.Asm) {
+                for k in 0..in.pieceCount { if (self.ir.asmNames.get(in.firstPiece + k) == n) { readsOnly = false; } }
+            } else if (in.name == n && !in.isGlobal && in.op != IROp.Load
+                       && (in.op == IROp.Store || in.op == IROp.AddrOf || in.op == IROp.ArrLoad || in.op == IROp.ArrStore)) {
+                readsOnly = false;
+            }
+        }
+        if (!readsOnly) {
+            st: Instr = instr(IROp.Store);
+            st.name = n; st.a = dst; st.kind = Lit.Ptr;
+            self.ir.code.set(room + 3, st);
+            return;
+        }
+        for i in body..end {
+            in: Instr = self.ir.code.get(i);
+            if (in.op == IROp.Load && !in.paramSeed && !in.isGlobal && in.name == n) {
+                rd: Instr = instr(IROp.AddrOf);
+                rd.dst = in.dst; rd.name = own; rd.kind = Lit.Ptr;
+                self.ir.code.set(i, rd);
+            }
+        }
+    }
+
+    // The bytes of the whole fixed array place `id` names (a local, a parameter's, a global, a
+    // field of one, through any number of fields), or -1 when it names no whole array.
+    wholeArrayBytes &self inout a:Ast id:NodeId -> long {
+        if (id == NO_NODE) { return -1; }
+        e: Expr = a.expr(id);
+        p: Payload = e.payload;
+        match p {
+            Name(n) {
+                if (e.op != Op.Lvalue) { return -1; }
+                c: long = self.arrayCount(n);
+                if (c < 0) { return -1; }
+                return c * typeBytes(e.kind, e.structName);
+            }
+            Field(_) {
+                fd: FieldDef = self.fieldArrayDef(a, id);
+                if (fd.name == NO_SYM) { return -1; }
+                return fd.count * typeBytes(fd.kind, fd.structName);
+            }
+            _ { }
+        }
+        return -1;
+    }
+
     // How long the fixed array `name` is, or NOT_FOUND when it is not one.
     arrayCount &self name:Sym -> long {
         hit: Option<long> = self.arrayLen.find(nameOf(name));
         match hit { Some(n) { return n; } None { } }
-        // A global array: its count is the declaration's. Without it `G[..]` was a slice of
-        // length zero, so `for x in G` walked nothing, and `G[i]` was not bounds-checked.
-        gi: long = gReg.findGlobal(nameOf(name));
+        // A global array: its count is the declaration's. Without it `G[..]` would be a slice of
+        // length zero, so `for x in G` would walk nothing, and `G[i]` would not be bounds-checked.
+        gi: long = gReg.findGlobalSym(name);
         if (gi >= 0 && gReg.globalDef(gi).isArray) { return gReg.globalDef(gi).count; }
         return NOT_FOUND;
     }
@@ -1822,8 +2330,6 @@ methods Lowerer {
         return t;
     }
 
-    // The address of the aggregate an expression denotes, rather than its value. A field chain
-    // walks down through offsets without ever materialising the intermediate structs.
     // The operand of a prefix node: `&x`, `*p`, `!b`, a cast. It rides in the payload as a
     // sub-expression, which is the one shape all of them share.
     subNode &self inout a:Ast id:NodeId -> NodeId {
@@ -1832,11 +2338,13 @@ methods Lowerer {
         return NO_NODE;
     }
 
+    // The address of the aggregate an expression denotes, rather than its value. A field chain
+    // walks down through offsets without ever materialising the intermediate structs.
     lowerAddress &self inout a:Ast id:NodeId -> Temp {
         if (id == NO_NODE) { return NO_TEMP; }
         e: Expr = a.expr(id);
-        // The place `*p` names is `p`. Without this a `-> &T` returning one fell through to the
-        // value path and handed back what `p` pointed at instead of `p`.
+        // The place `*p` names is `p`. Without this a `-> &T` returning one would fall through
+        // to the value path and hand back what `p` points at instead of `p`.
         if (e.op == Op.Deref) { return self.lowerExpr(a, self.subNode(a, id)); }
         p: Payload = e.payload;
         match p {
@@ -1878,11 +2386,11 @@ methods Lowerer {
     }
 
     // The address of the aggregate a field is read out of. A `*T` holds that address, so the base
-    // is the pointer's value; taking the address of the pointer's own slot instead read the
-    // pointer where the struct should be, and `e.tag` answered with `e`. A ref is the same
-    // arrangement under a different name (a borrow is the address) and for one held in a field
-    // (a closure's captured `&S`) the difference is exactly the load that makes `__cl.a.n` reach
-    // the borrowed struct instead of the closure.
+    // is the pointer's value. Taking the address of the pointer's own slot instead would read the
+    // pointer where the struct should be, and `e.tag` would answer with `e`. A ref is the same
+    // arrangement under a different name (a borrow is the address). For one held in a field (a
+    // closure's captured `&S`), the difference is exactly the load that makes `__cl.a.n` reach the
+    // borrowed struct instead of the closure.
     baseAddress &self inout a:Ast id:NodeId -> Temp {
         if (id == NO_NODE) { return NO_TEMP; }
         k: Lit = a.expr(id).kind;
@@ -1890,40 +2398,41 @@ methods Lowerer {
         return self.lowerAddress(a, id);
     }
 
-    // The byte offset of `field` within whatever `base` is a struct of.
-    // Where a field sits inside its struct. Every failure here used to answer 0, which is a
-    // valid offset (the first field) so a base whose type was never resolved silently read and
-    // wrote the wrong member. That is how `gStderr.data.flush()` came to write over the mutex's
-    // own lock flag. There is no answer to give when the type is unknown, so it says so.
+    // The byte offset of `field` within whatever struct `base` is. When the type is unknown there
+    // is no answer to give, so this stops the compile rather than answering 0. Zero is a valid
+    // offset (the first field's), so a base whose type was never resolved would silently read and
+    // write the wrong member: that is how `gStderr.data.flush()` once wrote over the mutex's own
+    // lock flag.
     fieldOffset &self inout a:Ast base:NodeId field:Sym -> long {
         b: Expr = a.expr(base);
+        // The checker refuses every case below that has no answer (`Checker.checkField`), so
+        // reaching one here is a bug in this compiler rather than in the program. Answering 0
+        // would be wrong either way, since it is the first field's own offset and reads back as
+        // some other member's value, so each one stops the compile.
+        //
         // A `str` or a slice is a fat pointer, not a struct: `.ptr` and `.len` are its two words,
         // and its companion name is the element's, which no struct registry will ever hold.
         if (b.kind == Lit.Str || b.kind == Lit.Slice) {
             if (nameOf(field) == "ptr") { return 0; }
             if (nameOf(field) == "len") { return 8; }
-            failStr(format("a {} has only '.ptr' and '.len', not '.{}'",
-                           typeName(b.kind), nameOf(field)));
+            failStr(format("internal compiler error: no field `{}` on type `{}` reached lowering",
+                           nameOf(field), typeName(b.kind)));
         }
-        // Each of the three below used to print and answer 0. The checker refuses all three now
-        // (`Checker::checkField`), so reaching one here is this compiler's own bug rather than
-        // the program's -- and 0 is the wrong answer to give either way, since it is the first
-        // field's own offset and reads back as some other member's value. They stop the compile.
         owner: Sym = b.structName;     // a `*T` names T here, which is whose field this is
         if (owner == NO_SYM) {
-            failStr(format("internal: '.{}' on a value with no struct type reached lowering",
+            failStr(format("internal compiler error: field access `.{}` on a value with no struct type reached lowering",
                            nameOf(field)));
         }
-        at: long = gReg.findStruct(nameOf(owner));
+        at: long = gReg.findStructSym(owner);
         if (at < 0) {
-            failStr(format("internal: '{}.{}' — {} was never laid out (kind {})",
+            failStr(format("internal compiler error: `{}.{}` reached lowering, but `{}` was never laid out (kind `{}`)",
                            nameOf(owner), nameOf(field), nameOf(owner), typeName(b.kind)));
         }
         d: StructDef = gReg.structDef(at);
         k: long = gReg.findFieldSym(d, field);
         if (k < 0) {
-            failStr(format("internal: {} has no field '{}', and it reached lowering",
-                           nameOf(owner), nameOf(field)));
+            failStr(format("internal compiler error: no field `{}` on type `{}` reached lowering",
+                           nameOf(field), nameOf(owner)));
         }
         return gReg.fieldAt(d, k).offset;
     }
@@ -1959,8 +2468,8 @@ methods Lowerer {
                     ld.kind = e.kind;
                     self.ir.emit(ld);
                     // `.ptr` hands out the raw base address, and a raw address is not a typed
-                    // pointer: `s.ptr + i` counts bytes, which is what every caller of it writes:
-                    //  `strCmp`'s `loadByte(s.ptr + i)`, `strSlice`'s `(s.ptr + from)`. Left
+                    // pointer: `s.ptr + i` counts bytes, which is what every caller of it means
+                    // (`strCmp`'s `loadByte(s.ptr + i)`, `strSlice`'s `(s.ptr + from)`). Left
                     // tracked, the companion name a slice carries (its element's) would scale
                     // those by the element width, and on a `str`, whose companion is empty, by
                     // the eight bytes an unnamed pointee defaults to. The one way to get a typed
@@ -2022,16 +2531,16 @@ methods Lowerer {
         return false;
     }
 
-    // The address of `xs[i]`.
-    // The bytes an index runs over. A fixed array is its storage, so its address is the base; a
+    // The bytes an index runs over. A fixed array is its storage, so its address is the base. A
     // `str` or a slice is a fat pointer to storage somewhere else, so the base is the word that
-    // pointer holds -- indexing off the pair itself reads the pair.
+    // pointer holds; indexing off the pair itself would read the pair.
     // `raw` is the checker's own answer to "is this base a raw pointer", written onto the index
-    // node however the pointer was spelled. Asked instead of re-deriving it from the base's type,
-    // because a base that is an expression need not carry one this pass can recognise: `(q + 1)`
-    // arrives typed by its literal operand, and reading the type sent it down the take-the-
-    // address path, where a binary operator is no place at all and the whole slice lowered to
-    // nothing, a `convert` with no operand, and a segfault reading the header it never built.
+    // node however the pointer was spelled. It is asked instead of re-deriving the answer from the
+    // base's type, because a base that is an expression need not carry a type this pass can
+    // recognise: `(q + 1)` arrives typed by its literal operand. Reading the type would send it
+    // down the take-the-address path, where a binary operator is no place at all, and the whole
+    // slice would lower to a `convert` with no operand and a segfault reading a header it never
+    // built.
     indexBase &self inout a:Ast base:NodeId raw:bool -> Temp {
         bk: Lit = a.expr(base).kind;
         if (bk == Lit.Ptr || raw) { return self.lowerExpr(a, base); }
@@ -2046,11 +2555,11 @@ methods Lowerer {
         }
         at: Temp = self.placeOf(a, base);
         if (at != NO_TEMP) { return at; }
-        // Nothing with an address, and no fat pointer either: the base is an expression. Lower it
-        // as a value: `(q + 1)[..3]` is a run of bytes reached through the pointer that
-        // expression yields, and taking its address instead answered nothing at all, so the whole
-        // slice lowered to a `convert` with no operand. `placeOf` declines without emitting for
-        // exactly the shapes that reach here, so this lowers the base once.
+        // Nothing with an address, and no fat pointer either: the base is an expression, so lower
+        // it as a value. `(q + 1)[..3]` is a run of bytes reached through the pointer that
+        // expression yields. Taking its address instead would answer nothing at all, and the whole
+        // slice would lower to a `convert` with no operand. `placeOf` declines without emitting
+        // for exactly the shapes that reach here, so this lowers the base once.
         return self.lowerExpr(a, base);
     }
 
@@ -2060,11 +2569,11 @@ methods Lowerer {
     lengthOf &self inout a:Ast base:NodeId -> Temp {
         e: Expr = a.expr(base);
         // A written-down count is asked for first. An array carries its element's kind on the
-        // node, so `[str; 47]` and `[[T]; N]` look exactly like one `str` or one slice here, and
-        // reading the first sixteen bytes of the array as a {ptr, len} pair answers with element
-        // zero's length, which for a zero-filled table is 0 and puts every index out of range.
-        // `arrayCount` and `fieldArrayDef` both answer only for something declared as an array,
-        // so a real `str` or slice falls through to the pair below exactly as it did.
+        // node, so `[str; 47]` and `[[T]; N]` look exactly like one `str` or one slice here.
+        // Reading the first sixteen bytes of the array as a {ptr, len} pair would answer with
+        // element zero's length, which for a zero-filled table is 0 and puts every index out of
+        // range. `arrayCount` and `fieldArrayDef` both answer only for something declared as an
+        // array, so a real `str` or slice falls through to the pair below.
         pl: Payload = e.payload;
         match pl {
             Name(n) {
@@ -2085,20 +2594,21 @@ methods Lowerer {
         return NO_TEMP;
     }
 
-    // Trap unless (unsigned) `idx` < `len`. Unsigned, so a negative index is an enormous one and
-    // fails the same compare. One test rather than two. A range bound is inclusive (`hi <= len`,
-    // `lo <= hi`) and says so, because it is a different mistake with a different wording.
-    // `at` is where the `[` was written: the one thing a failed check cannot work out for
-    // itself, and the only part of the message that says which index of the program went wrong.
-    // A synthesized index (one no source line produced) carries NO_SYM, and the report leaves the
-    // location off rather than naming somewhere arbitrary.
-    boundsCheck &self idx:Temp len:Temp range:bool at:Sym -> void {
+    // Trap unless (unsigned) `idx` < `len`. The compare is unsigned, so a negative index looks
+    // enormous and fails the same single test. `kind` says which check this is, and so what the
+    // report says when it fails (`BOUNDS_INDEX` and the three slice checks in `ir.k`); every slice
+    // check is inclusive (`end <= len`, `start <= end`), since a slice may end at the length.
+    // `at` is where the `[` was written. A failed check cannot work that out for itself, and it is
+    // the only part of the report that says which index in the program went wrong. An index no
+    // source line produced carries NO_SYM, and the report then leaves the location off rather than
+    // naming somewhere arbitrary.
+    boundsCheck &self idx:Temp len:Temp kind:long at:Sym -> void {
         if (idx == NO_TEMP || len == NO_TEMP) { return; }
         in: Instr = instr(IROp.Bounds);
         in.a = idx;
         in.b = len;
         in.name = at;
-        if (range) { in.imm = 1; }
+        in.imm = kind;
         self.ir.emit(in);
     }
 
@@ -2147,11 +2657,15 @@ methods Lowerer {
         upto: Temp = total;
         if (ix.sliceEnd != NO_NODE) { upto = self.lowerExpr(a, ix.sliceEnd); }
 
-        // The two ways a range can be wrong, each inclusive: the far bound past the end, and the
-        // bounds the wrong way round. `hi <= len` first, so `xs[5..2]` on a length of 3 reports
-        // the bound it exceeded rather than the order it was written in.
-        if (ix.sliceEnd != NO_NODE) { self.boundsCheck(upto, total, true, ix.at); }
-        if (from != NO_TEMP && upto != NO_TEMP) { self.boundsCheck(from, upto, true, ix.at); }
+        // The two ways a range can be wrong: its end past the length, and its bounds the wrong way
+        // round. The end is checked first, so `xs[5..2]` on a length of 3 reports the end it went
+        // past rather than the order it was written in. With no end written, the start is held
+        // to the length itself.
+        if (ix.sliceEnd != NO_NODE) { self.boundsCheck(upto, total, BOUNDS_SLICE_END, ix.at); }
+        if (from != NO_TEMP && upto != NO_TEMP) {
+            if (ix.sliceEnd != NO_NODE) { self.boundsCheck(from, upto, BOUNDS_SLICE_ORDER, ix.at); }
+            else { self.boundsCheck(from, upto, BOUNDS_SLICE_START, ix.at); }
+        }
 
         start: Temp = data;
         len: Temp = upto;
@@ -2191,6 +2705,7 @@ methods Lowerer {
         return (bk == Lit.Str || bk == Lit.Slice) && !self.isFixedArray(a, base);
     }
 
+    // The address of `xs[i]`, bounds-checked where the length is known.
     lowerElemAddress &self inout a:Ast ix:IndexNode elemSize:long -> Temp {
         base: Temp = NO_TEMP;
         len: Temp = NO_TEMP;
@@ -2209,7 +2724,7 @@ methods Lowerer {
         // Checked before the address is formed, and only where a length is known: a raw `*T` has
         // none, which is exactly why walking one is `unsafe`.
         if (!fat) { len = self.checkableLength(a, ix.base); }
-        self.boundsCheck(idx, len, false, ix.at);
+        self.boundsCheck(idx, len, BOUNDS_INDEX, ix.at);
         // Over a raw pointer the stride is the pointee the base temp records, not the type the
         // base expression carries: an index whose base is itself an index or a piece of pointer
         // arithmetic need not be typed as one.
@@ -2255,7 +2770,7 @@ methods Lowerer {
         sl.kind = Lit.Ptr;
         self.ir.emit(sl);
 
-        at: long = gReg.findStruct(nameOf(e.structName));
+        at: long = gReg.findStructSym(e.structName);
         if (at < 0) { return base; }
         d: StructDef = gReg.structDef(at);
         k: long = 0;
@@ -2265,10 +2780,10 @@ methods Lowerer {
             src: Temp = self.placeOf(a, ln.rest);
             self.copyInto(base, src, bytes);
         }
-        // A literal naming fewer fields than the struct has leaves the rest, so `T { tag: 1 }`
-        // over a `[str; 4]` is the ordinary case.
-        // The slot is scratch frame storage holding whatever the last call left in it, so the
-        // whole of it is zeroed before the named fields are written over the top.
+        // A literal that names fewer fields than the struct has leaves the rest zero
+        // (`T { tag: 1 }` over a `[str; 4]` is the ordinary case). The slot is scratch frame
+        // storage holding whatever the last call left in it, so all of it is zeroed before the
+        // named fields are written over the top.
         else if (ln.initCount < d.fieldCount) { self.zeroFill(base, bytes); }
         for k in 0..ln.initCount {
             ini: InitNode = a.inits.get(ln.firstInit + k);
@@ -2289,6 +2804,10 @@ methods Lowerer {
                 // `xs: [a, b, c]`: every element, in place (the checker held it to the length).
                 if (f.isArray && a.expr(ini.value).op == Op.ArrayLit) {
                     self.lowerArrayInto(a, where, ini.value);
+                } else if (f.isArray) {
+                    // `S { xs: a }` with `a` a whole array (the checker held it to the length):
+                    // its elements, copied in.
+                    self.copyInto(where, self.lowerAddress(a, ini.value), f.count * typeBytes(f.kind, f.structName));
                 } else if (storedInline(f.kind, f.structName)) {
                     src: Temp = self.placeOf(a, ini.value);
                     self.copyInto(where, src, aggregateBytes(f.kind, f.structName));
@@ -2307,8 +2826,8 @@ methods Lowerer {
 
     // Zero `size` bytes at `base[0..size)`, in word-sized chunks: the widest that still fits,
     // so a struct (whose size is always rounded to eight) costs one store per eight bytes. Past
-    // `UNROLL_COPY_BYTES` one block zero instead (`rep stosq`): a `BufWriter` literal's 4 KiB buffer was
-    // 512 stores, in every program that prints.
+    // `UNROLL_COPY_BYTES` it is one block zero instead (`rep stosq`), since a `BufWriter`
+    // literal's 4 KiB buffer would otherwise be 512 stores, in every program that prints.
     zeroFill &self base:Temp size:long -> void {
         if (base == NO_TEMP) { return; }
         if (size > UNROLL_COPY_BYTES) {
@@ -2347,7 +2866,7 @@ methods Lowerer {
     // The declaration of the array field an index is over, or a row named NO_SYM when the base is
     // not one. An inline array field is the one place the index expression's own type does not
     // answer: `self.data[i]` on a `[int; 4]` arrives typed `long`, and reading eight bytes of a
-    // four-byte element returns two of them at once: `at0` came back as 10 << 32.
+    // four-byte element returns two of them at once (`at0` came back as 10 << 32).
     fieldArrayDef &self inout a:Ast base:NodeId -> FieldDef {
         none: FieldDef = FieldDef { name: NO_SYM, kind: Lit.Void, structName: NO_SYM,
                                     offset: 0, isArray: false, count: 0 };
@@ -2359,7 +2878,7 @@ methods Lowerer {
         fn: FieldNode = a.fields.get(fi);
         owner: Sym = self.ownerStructOf(a, fn.base);
         if (owner == NO_SYM) { return none; }
-        at: long = gReg.findStruct(nameOf(owner));
+        at: long = gReg.findStructSym(owner);
         if (at < 0) { return none; }
         d: StructDef = gReg.structDef(at);
         k: long = gReg.findFieldSym(d, fn.name);
@@ -2373,8 +2892,8 @@ methods Lowerer {
 
     // The struct an expression is of. Usually the node says so; an index over an array field may
     // not, and then the field's element type does: `g.rows[0]` is a `Row` because `rows` was
-    // declared `[Row; 2]`. Without this the chain `g.rows[0].cells` found no field, so
-    // `cells[..]` built a header of length zero.
+    // declared `[Row; 2]`. Without this the chain `g.rows[0].cells` would find no field, and
+    // `cells[..]` would build a header of length zero.
     ownerStructOf &self inout a:Ast id:NodeId -> Sym {
         if (id == NO_NODE) { return NO_SYM; }
         e: Expr = a.expr(id);
@@ -2394,7 +2913,7 @@ methods Lowerer {
     elemWidth &self inout a:Ast id:NodeId -> long {
         e: Expr = a.expr(id);
         if (e.kind == Lit.Struct && e.structName != NO_SYM) {
-            at: long = gReg.findStruct(nameOf(e.structName));
+            at: long = gReg.findStructSym(e.structName);
             if (at >= 0) { return gReg.structDef(at).size; }
         }
         n: long = typeInfo(e.kind).size;
@@ -2403,9 +2922,9 @@ methods Lowerer {
     }
 
     // One element of whatever `base` is a sequence of. A slice expression's own type is `slice`,
-    // so its width has to come from the base rather than from the node being built.
-    // A fixed array is asked first: its node carries the element's kind, so a `[str; 3]` looks
-    // like one `str`, and `ss[1..]` stepped one byte into the array instead of one element.
+    // so its width has to come from the base rather than from the node being built. A fixed
+    // array is asked first: its node carries the element's kind, so a `[str; 3]` looks like one
+    // `str`, and `ss[1..]` would step one byte into the array instead of one element.
     baseElemWidth &self inout a:Ast base:NodeId -> long {
         e: Expr = a.expr(base);
         fd: FieldDef = self.fieldArrayDef(a, base);
@@ -2472,9 +2991,17 @@ methods Lowerer {
     // The pieces keep their source order, because the literal lines are emitted verbatim between
     // the register moves. Inputs are evaluated before the block, outputs stored after it, which
     // is what lets an `asm` block read and write ordinary variables.
+    // An `out` into a global (the checker has given the piece the global's own name) writes a
+    // hidden local of the block's own, which is then stored into the global at the global's
+    // kind: the emitters write an output into a frame slot, and given the global's name they
+    // wrote one that only shared its spelling, leaving the global as it was. Through the local,
+    // a narrow global's output is extended from its width as any narrow local's is, and both
+    // back ends see an ordinary store.
     lowerAsm &self inout a:Ast at:long -> void {
         n: AsmNode = a.asms.get(at);
         first: long = self.ir.asmKinds.len();
+        globals: Vec<Sym>;
+        hidden: Vec<Sym>;
         for k in 0..n.pieceCount {
             piece: AsmPiece = a.asmPieces.get(n.firstPiece + k);
             v: Temp = NO_TEMP;
@@ -2483,19 +3010,38 @@ methods Lowerer {
                 v = self.lowerExpr(a, piece.value);
                 size = typeInfo(self.ir.kindOf(v)).size;
             }
-            self.ir.addAsmPiece(piece.kind, piece.reg, piece.name, v, piece.text, size);
+            name: Sym = piece.name;
+            if (piece.kind == AsmKind.Out && name != NO_SYM && self.ir.isGlobalName(name)) {
+                globals.push(name);
+                name = internString(format("$asmout{}", self.asmSeq));
+                self.asmSeq = self.asmSeq + 1;
+                hidden.push(name);
+            }
+            self.ir.addAsmPiece(piece.kind, piece.reg, name, v, piece.text, size);
         }
         in: Instr = instr(IROp.Asm);
         in.firstPiece = first;
         in.pieceCount = n.pieceCount;
         self.ir.emit(in);
+        for j in 0..globals.len() {
+            g: Sym = globals.get(j);
+            k: Lit = Lit.Long;
+            gi: long = gReg.findGlobalSym(g);
+            if (gi >= 0 && !gReg.globalDef(gi).isArray && !isAggregate(gReg.globalDef(gi).kind)) { k = gReg.globalDef(gi).kind; }
+            ld: Instr = instr(IROp.Load);
+            ld.dst = self.ir.newTemp(k, NO_SYM);
+            ld.name = hidden.get(j);
+            ld.kind = k;
+            self.ir.emit(ld);
+            self.storeVar(g, ld.dst, k);
+        }
     }
 }
 
 // The `@init` and `@fini` functions, in the order the program's modules were read (dependencies
-// first): `_start` calls the first before any startup initializer, and `__kiln_fini` (which the
-// entry object defines, and `_start` and the `exit` builtin call) the second in reverse. And
-// whether this object calls `__kiln_fini` from outside.
+// first). `_start` calls the `@init` ones before any startup initializer. `__kiln_fini`, which the
+// entry object defines and which `_start` and the `exit` builtin call, runs the `@fini` ones in
+// reverse. `gUsesFini` says whether this object calls `__kiln_fini` from outside.
 pub var gInitHooks: Vec<Sym> = vec![];
 pub var gFiniHooks: Vec<Sym> = vec![];
 pub var gUsesFini: bool = false;
@@ -2513,4 +3059,84 @@ pub initFunctionName -> Sym {
         if (isIdentPart(c)) { s.push(c as char); } else { s.push('_'); }
     }
     return internString(s);
+}
+
+// A function's borrows (`IRFunc.borrows`), by position in the IR (a hidden `$sret` first), as a
+// mask: each `Ref`, which is what a read or `inout` struct, a `&self` and an `inout` scalar become.
+local borrowMask inout a:Ast fi:long -> long {
+    f: FnNode = a.fns.get(fi);
+    m: long = 0;
+    at: long = 0;
+    if (returnedByPointer(f.returnKind, f.returnStruct)) { at = 1; }
+    for k in 0..f.argCount {
+        if (at + k >= 62) { break; }
+        p: VarDeclNode = a.paramAt(f, k);
+        if (p.kind != Lit.Ref || p.isVariadic) { continue; }
+        m = m | (1 << (at + k));
+    }
+    return m;
+}
+
+// What a direct call to `f` does with the addresses it hands over, as `Instr.imm` (`CALL_KNOWN`
+// and its bits; 0 for a function declared `unsafe`, which may keep what it is lent). Each
+// parameter passed by address is lent for the call and never kept: a borrow, a struct or tuple
+// the callee copies, a `str`, slice or trait object's pair, the variadic slice, the `$sret`. It may
+// be written where the guard found the callee writes through it (`gFnWrites`), and the `$sret`.
+local callConventionsOf inout a:Ast fi:long -> long {
+    f: FnNode = a.fns.get(fi);
+    if (f.isUnsafe) { return 0; }
+    m: long = CALL_KNOWN;
+    at: long = 0;
+    if (returnedByPointer(f.returnKind, f.returnStruct)) { m = m | 1 | (1 << CALL_ARGS); at = 1; }
+    for k in 0..f.argCount {
+        j: long = at + k;
+        if (j >= CALL_ARGS) { break; }
+        p: VarDeclNode = a.paramAt(f, k);
+        if (!p.isVariadic && !p.isArray && !passedByPointer(p.kind, p.structName)) { continue; }
+        m = m | (1 << j);
+        if (writesParam(fi, k) || p.conv == Conv.Inout || p.isArray) { m = m | (1 << (CALL_ARGS + j)); }
+    }
+    return m;
+}
+
+// The same for a call through a fn value of type `sig`, from the type alone: a fn value holds
+// only a function that fits it (`fnSigsFit`), and taking an `unsafe` function's address needs
+// `unsafe`, so what the type says each parameter does is what the callee does. A borrow (`&T`) may
+// be written through; a struct, a pair and a copy are not. 0 when the type is not known.
+local fnValueConventions sig:Sym sret:bool -> long {
+    si: long = gFnSigs.find(sig);
+    if (si < 0) { return 0; }
+    s: FnSig = gFnSigs.sigAt(si);
+    m: long = CALL_KNOWN;
+    at: long = 0;
+    if (sret) { m = m | 1 | (1 << CALL_ARGS); at = 1; }
+    for k in 0..s.paramCount {
+        j: long = at + k;
+        if (j >= CALL_ARGS) { break; }
+        fp: FnParam = gFnSigs.paramAt(s, k);
+        if (passedByPointer(fp.kind, fp.name)) { m = m | (1 << j); }
+        if (fp.kind == Lit.Ref) { m = m | (1 << (CALL_ARGS + j)); }
+    }
+    return m;
+}
+
+// Whether function `fi` may write through its parameter `k`, itself or through what it calls, as
+// the guard found (`gFnWrites`); yes when it did not say.
+local writesParam fi:long k:long -> bool {
+    if (fi < 0 || fi >= gFnWrites.len() || k >= 62) { return true; }
+    w: long = gFnWrites.get(fi);
+    return (w & 4611686018427387904) != 0 || (w & (1 << k)) != 0;
+}
+
+// Which of function `fi`'s parameters take a struct or tuple by value, as a mask by declared
+// position (a receiver first): the ones whose argument `Lowerer.freshArg` asks about.
+local byValueParams inout a:Ast fi:long -> long {
+    f: FnNode = a.fns.get(fi);
+    m: long = 0;
+    for k in 0..f.argCount {
+        if (k >= 62) { break; }
+        p: VarDeclNode = a.paramAt(f, k);
+        if (!p.isArray && !p.isVariadic && passedByPointer(p.kind, p.structName) && byValueAggregate(p.kind)) { m = m | (1 << k); }
+    }
+    return m;
 }

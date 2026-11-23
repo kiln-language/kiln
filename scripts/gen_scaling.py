@@ -18,15 +18,15 @@ and only a per-axis curve tells them apart:
   instances   N distinct struct types through one generic. Grows monomorphization, which is a
               fixpoint that re-walks the page each round.
 
-Usage: gen_scaling.py <family> <n> <outdir>   -- prints the line count it generated.
+Usage: gen_scaling.py <family> <n> <outdir>   (prints the line count it generated)
 """
 import sys
 from pathlib import Path
 
 
 def functions(n, d):
-    # A chain: main calls f0, f0 calls f1, and so on, so every one is reachable and no two are
-    # identical -- the arithmetic differs per function so nothing folds them together.
+    # A chain: main calls f0, f0 calls f1, and so on, so every function is reachable. The arithmetic
+    # differs per function, so no two are identical and nothing can fold them together.
     out = ["#include <stdlib::io>", ""]
     for i in range(n):
         nxt = "f{}(x + {})".format(i + 1, i % 7) if i + 1 < n else "x"

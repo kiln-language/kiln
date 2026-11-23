@@ -1,6 +1,6 @@
 // Reading a byte out of a `str`, and asking what kind of character it is.
 //
-// A `str` is a {ptr, len} pair with no indexing of its own — `s as [u8]` gives you a bounds-
+// A `str` is a {ptr, len} pair with no indexing of its own. `s as [u8]` gives you a bounds-
 // checked slice, but a scanner wants "the byte at i, or nothing" rather than a trap at the end,
 // because running off the end is the normal way a scan finishes. `charAt` answers -1 there,
 // which is why it returns a `long` and why every predicate here takes one.
@@ -12,10 +12,10 @@
 // the lexer-shaped code that wants it does not compile the containers to get it.
 //
 // All ASCII. A byte above 127 is part of a UTF-8 sequence, and none of these claim to know what
-// that sequence means — they answer false, which is right for every one of them.
+// that sequence means, so they answer false, which is right for every one of them.
 
-// The byte at `i`, or -1 past either end. Bounds-checked, which is what makes it safe: running
-// off the end answers -1 rather than reading whatever follows the buffer.
+// The byte at `i`, or -1 past either end. The bounds check keeps it safe: running off the end
+// returns -1 instead of reading whatever follows the buffer.
 pub charAt s:str i:long -> long {
     if (i < 0 || i >= s.len) { return -1; }
     unsafe { p: *u8 = s.ptr as *u8; return p[i]; }
@@ -33,7 +33,7 @@ pub isOctDigit c:long -> bool { return c >= '0' && c <= '7'; }
 pub isPrint c:long -> bool { return c >= ' ' && c <= '~'; }
 pub isPunct c:long -> bool { return isPrint(c) && c != ' ' && !isAlnum(c); }
 
-// Space, tab, newline, carriage return, vertical tab and form feed — C's `isspace` set.
+// Space, tab, newline, carriage return, vertical tab and form feed: C's `isspace` set.
 pub isSpace c:long -> bool {
     return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f';
 }
@@ -51,10 +51,9 @@ pub hexVal c:long -> long {
     return -1;
 }
 
-// The byte a backslash escape stands for: `escapeByte('n')` is 10. The C family's set, which
-// this language shares -- \n \t \r \0 \v \f, and a quote or backslash that stands for itself.
-// An UNRECOGNIZED escape is the character itself, which is what makes that last case need no
-// entry: `\\` and `\"` fall out of the default.
+// The byte a backslash escape stands for: `escapeByte('n')` is 10. The C set: \n \t \r \0 \v \f,
+// plus a quote or backslash standing for itself. Any other character maps to itself, so `\\`
+// and `\"` need no entries of their own.
 pub escapeByte e:long -> long {
     if (e == 'n') { return '\n'; }
     if (e == 't') { return '\t'; }
@@ -70,8 +69,10 @@ pub escapeByte e:long -> long {
 pub digitVal c:long base:long -> long {
     v: long = -1;
     if (isDigit(c)) { v = c - '0'; }
-    else if (isLower(c)) { v = c - 'a' + 10; }
-    else if (isUpper(c)) { v = c - 'A' + 10; }
+    else {
+        l: long = c | 32;                       // folds A-Z onto a-z, and moves no other value there
+        if (isLower(l)) { v = l - 'a' + 10; }
+    }
     if (v >= base) { return -1; }
     return v;
 }

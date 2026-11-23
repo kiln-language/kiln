@@ -1,18 +1,19 @@
-// Every write the parser makes to the declaration tables, as an operation: done here, and logged.
+// Every write the parser makes to the declaration tables, as an operation that is both done here
+// and logged.
 //
 // A package's `.klib` carries its modules' declarations as these operations rather than as the
-// tables themselves (`1-cumulation/Klib.k`). Each one carries its content -- a struct's fields
-// with their offsets, a trait's signatures with their parameter declarations, a template's
-// parameters, fields, variants and bounds -- never an index into a table, so a dependent replays
-// them into a registry that already holds other packages' declarations and gets the same
-// answers its own parse would have: `replayOps` calls exactly the registry functions the parser
-// calls through the wrappers below. Nothing in the registry is renumbered; what the tree points
-// at in it (a function's bounds) is mapped by `replayOps` as it goes.
+// tables themselves (`1-cumulation/Klib.k`). Each operation carries its content (a struct's
+// fields with their offsets, a trait's signatures with their parameter declarations, a template's
+// parameters, fields, variants and bounds) and never an index into a table. That way a dependent
+// can replay them into a registry that already holds other packages' declarations and get the
+// same answers its own parse would have: `Replay.run` calls exactly the registry functions the
+// parser calls through the wrappers below. Nothing in the registry is renumbered; what the tree
+// points at in it (a function's bounds) is mapped by `Replay.run` as it goes.
 //
-// The log is one byte stream in segments, each segment a module's: what a dependent replays when
-// it loads that module. A `macro` is parsed after the whole page, so its operations land in a
-// later segment of the same module. Logging is on only while a package build parses its own
-// modules (and under `--verify-regops`); the evaluator's parser (`parseExpr`) logs nothing.
+// The log is one byte stream in segments, one per module, and a segment is what a dependent
+// replays when it loads that module. A `macro` is parsed after the whole page, so its operations
+// land in a later segment of the same module. Logging is on only while a package build parses its
+// own modules (and under `--verify-regops`); the evaluator's parser (`parseExpr`) logs nothing.
 #include <{ast, registry, types}>
 #include <support::compiler>
 #include <stdlib::{encode, map, option, string, vec}>
@@ -42,13 +43,14 @@ pub struct TemplateRec { name: Sym, params: Vec<Sym>, infos: Vec<GParamInfo>, fi
 // `first` is where the producer's registry put the run: the key a function's `firstBound` is
 // mapped by.
 pub struct BoundsRec   { first: long, bounds: Vec<BoundRec> }
-// `inBody`: asked for while reading a non-generic body, which a dependent does not check unless
-// it has to, so the request is held back there (`Registry.request`).
+// `inBody` marks a request made while reading a non-generic body. A dependent does not check such
+// a body unless it has to, so there the request is held back (`Registry.request`).
 pub struct RequestRec  { base: Sym, instance: Sym, args: Vec<TypeRef>, inBody: bool }
 pub struct TupleRec    { elems: Vec<TypeRef> }
 pub struct FnSigRec    { params: Vec<FnParam>, ret: TypeRef }
 pub struct StampRec    { base: Sym, args: Vec<TypeRef> }
 pub struct MacroRec    { name: Sym }
+pub struct ClosureRec  { name: Sym }
 pub struct FnReturnRec { name: Sym, kind: Lit, pkg: Sym }
 
 local OP_STRUCT: long = 1;
@@ -70,6 +72,7 @@ local OP_STAMP: long = 16;
 local OP_MACRO: long = 17;
 local OP_FNRETURN: long = 18;
 local OP_DISTINCT: long = 19;
+local OP_CLOSURE: long = 20;
 
 // ─── the log ─────────────────────────────────────────────────────────────────
 
@@ -85,9 +88,29 @@ local var gOpCurMod: long = -1;
 // Requests already logged in the open segment, so a type named a hundred times in one module is
 // one record (a repeat changes nothing a replay would see).
 local var gOpSeen: HashMap<str, bool> = map![];
-// Who declared each type, global and function name: the package, for the error that two
-// packages each declare one (two packages may both have a module `util`).
+// The package that declared each type, global and function name, so that the error for two
+// packages declaring the same name can name both (two packages may each have a module `util`).
 local var gDeclPkg: HashMap<str, Sym> = map![];
+// The keys those two gained, in order: neither ever gains a key twice, so the keys past a mark are
+// what a declaration the parser takes back added (`opsRewind`).
+local var gOpSeenAdded: Vec<str> = vec![];
+local var gDeclAdded: Vec<Sym> = vec![];
+
+// Where the log stood when a declaration began, for taking it back.
+pub struct OpsMark { log: long, count: long, seen: long, decl: long }
+
+pub opsMark -> OpsMark {
+    return OpsMark { log: gOpLog.len(), count: gOpCount, seen: gOpSeenAdded.len(), decl: gDeclAdded.len() };
+}
+// A declaration taken back: its operations off the log, and the keys it added.
+pub opsRewind m:OpsMark -> void {
+    gOpLog.out.truncate(m.log);
+    gOpCount = m.count;
+    for k in m.seen..gOpSeenAdded.len() { gOpSeen.remove(gOpSeenAdded.get(k)); }
+    gOpSeenAdded.truncate(m.seen);
+    for k in m.decl..gDeclAdded.len() { gDeclPkg.remove(nameOf(gDeclAdded.get(k))); }
+    gDeclAdded.truncate(m.decl);
+}
 
 // The operations that follow are module `m`'s.
 pub opsModule m:long -> void {
@@ -100,6 +123,7 @@ pub opsModule m:long -> void {
     gOpSegEnd.push(gOpLog.len());
     gOpCurMod = m;
     gOpSeen.clear();
+    gOpSeenAdded.clear();
 }
 // Parsing is over: close the last segment and stop logging.
 pub opsEnd -> void {
@@ -151,7 +175,7 @@ local boundsOf rs:Vec<BoundRec> -> Vec<MethodBound> {
 }
 
 local noteDecl q:Sym pkg:Sym -> void {
-    if (pkg != NO_SYM && !gDeclPkg.has(nameOf(q))) { gDeclPkg.put(nameOf(q), pkg); }
+    if (pkg != NO_SYM && !gDeclPkg.has(nameOf(q))) { gDeclPkg.put(nameOf(q), pkg); gDeclAdded.push(q); }
 }
 local declPkgOf q:Sym -> Sym {
     hit: Option<Sym> = gDeclPkg.find(nameOf(q));
@@ -211,7 +235,7 @@ local declareTrait name:Sym sigs:Vec<TraitMethodSig> params:Vec<TypeRef> -> void
     firstParam: long = gReg.addTraitArgs(params);
     gReg.traits.push(TraitDef { name: name, firstMethod: firstMethod, methodCount: sigs.len(),
                                 firstParam: firstParam, paramCount: params.len() });
-    gReg.traitAt.put(nameOf(name), gReg.traits.len() - 1);
+    gReg.traitAt.put(name as long, gReg.traits.len() - 1);
     if (isModuleTrait(name)) { gReg.ownedTraits.push(name); }
 }
 
@@ -289,7 +313,9 @@ pub regRequest base:Sym instance:Sym args:Vec<TypeRef> inBody:bool -> void {
         seen: str = "";
         unsafe { seen = key.view(); }
         if (!gOpSeen.has(seen)) {
-            gOpSeen.put(keepString(key), true);
+            kept: str = keepString(key);
+            gOpSeen.put(kept, true);
+            gOpSeenAdded.push(kept);
             logTag(OP_REQUEST);
             base.encode(gOpLog); instance.encode(gOpLog); args.encode(gOpLog); inBody.encode(gOpLog);
         }
@@ -319,6 +345,11 @@ pub regNoteMacro q:Sym -> void {
     if (gOpLogOn) { logTag(OP_MACRO); q.encode(gOpLog); }
     gReg.noteMacro(q);
 }
+// A closure's capture struct (or its template), marked before anything requests an instance.
+pub regMarkClosure q:Sym -> void {
+    if (gOpLogOn) { logTag(OP_CLOSURE); q.encode(gOpLog); }
+    gReg.markClosure(q);
+}
 // What a function returns, for the type of a call to it the parser builds (`Parser.fnReturns`).
 pub regFnReturn inout fr:HashMap<str, Lit> q:Sym kind:Lit pkg:Sym -> void {
     noteDecl(q, pkg);
@@ -329,11 +360,12 @@ pub regFnReturn inout fr:HashMap<str, Lit> q:Sym kind:Lit pkg:Sym -> void {
 
 // ─── replay ──────────────────────────────────────────────────────────────────
 
-// Where a module's operations are replayed into: its file and package (whose bodies a request
-// made `inBody` is held back for, when the package is a dependency), the parser's table of what
-// functions return, and the tree a trait's parameter declarations go into. `run` also fills
-// `bounds`: where the producer's registry put each run of bounds, to where this one did, which
-// is what a function's `firstBound` is read through.
+// What a module's operations are replayed with: its file and package (when the package is a
+// dependency, a request made `inBody` is held back for that file's bodies) and the structs begun
+// but not yet finished. `run` is also handed the parser's table of what functions return, the
+// tree a trait's parameter declarations go into, and `bounds`, which it fills with where the
+// producer's registry put each run of bounds, mapped to where this one did. A function's
+// `firstBound` is read through that map.
 pub struct Replay { file: Sym, pkg: Sym, upstream: bool, ops: long, structAt: Vec<long> }
 
 pub replayOf file:Sym pkg:Sym upstream:bool -> Replay {
@@ -347,9 +379,9 @@ methods Replay {
     clash &self q:Sym what:str -> void {
         other: Sym = declPkgOf(q);
         if (other == NO_SYM || other == self.pkg) {
-            failStr(format("'{}' is declared twice ({}, from package '{}')", nameOf(q), what, nameOf(self.pkg)));
+            failStr(format("redefinition of `{}`\nnote: it is already declared as {}, and package `{}` declares it again", nameOf(q), what, nameOf(self.pkg)));
         }
-        failStr(format("'{}' is declared by package '{}' and by package '{}' -- each has a module named '{}'; rename one",
+        failStr(format("`{}` is declared by package `{}` and by package `{}`\nnote: each package has a module named `{}`, and a module's name is its namespace\nhelp: rename one of the two modules",
                        nameOf(q), nameOf(other), nameOf(self.pkg), nameOf(moduleOfName(nameOf(q)))));
     }
     typeFree &self q:Sym -> void {
@@ -391,10 +423,10 @@ methods Replay {
                 gReg.abandonStruct(self.structAt.pop());
             } else if (t == OP_STRUCT) {
                 r: StructRec = StructRec.decode(d);
-                if (!gReg.hasStruct(nameOf(r.name))) { gReg.addStruct(r.name, r.fields, r.size, r.isEnum); }
+                if (!gReg.hasStructSym(r.name)) { gReg.addStruct(r.name, r.fields, r.size, r.isEnum); }
             } else if (t == OP_ENUM) {
                 r: EnumRec = EnumRec.decode(d);
-                if (gReg.findEnum(nameOf(r.name)) >= 0) { self.clash(r.name, "an enum"); }
+                if (gReg.findEnumSym(r.name) >= 0) { self.clash(r.name, "an enum"); }
                 gReg.addEnum(r.name, r.backing, r.variants, r.hasPayload);
             } else if (t == OP_TRAIT) {
                 r: TraitRec = TraitRec.decode(d);
@@ -403,8 +435,8 @@ methods Replay {
                 r: DeriveRec = DeriveRec.decode(d);
                 had: Sym = gReg.deriveMacroOf(r.trait);
                 if (had != NO_SYM && had != r.by) {
-                    failStr(format("trait '{}' derives with '{}' in one package and with '{}' in package '{}'",
-                                   nameOf(r.trait), nameOf(had), nameOf(r.by), nameOf(self.pkg)));
+                    failStr(format("conflicting derive macros for trait `{}`\nnote: one package derives it with `{}`, and package `{}` with `{}`",
+                                   nameOf(r.trait), nameOf(had), nameOf(self.pkg), nameOf(r.by)));
                 }
                 if (had == NO_SYM) { gReg.noteDerive(r.trait, r.by, r.file); }
             } else if (t == OP_IMPL) {
@@ -412,7 +444,7 @@ methods Replay {
                 gReg.addImplAs(r.owner, traitRefOf(r.trait), r.fns, r.carried);
             } else if (t == OP_GLOBAL) {
                 r: GlobalRec = GlobalRec.decode(d);
-                if (gReg.findGlobal(nameOf(r.def.name)) >= 0) { self.clash(r.def.name, "a global"); }
+                if (gReg.findGlobalSym(r.def.name) >= 0) { self.clash(r.def.name, "a global"); }
                 noteDecl(r.def.name, r.def.pkg);
                 gReg.addGlobal(r.def);
             } else if (t == OP_ALIAS) {
@@ -421,7 +453,7 @@ methods Replay {
                 if (r.def.visibility == Vis.Pub) {
                     other: Sym = gReg.otherPubAlias(lastComponentOf(nameOf(r.def.name)), r.def.name);
                     if (other != NO_SYM) {
-                        failStr(format("type name '{}' is a type alias published by '{}' and by '{}' (package '{}')",
+                        failStr(format("type alias `{}` is published by both `{}` and `{}`\nnote: the second one comes from package `{}`",
                                        lastComponentOf(nameOf(r.def.name)), nameOf(other), nameOf(r.def.name), nameOf(self.pkg)));
                     }
                 }
@@ -431,7 +463,7 @@ methods Replay {
                 r: TemplateRec = TemplateRec.decode(d);
                 // A generic function's template carries its name, which no type table holds.
                 if (r.fields.len() > 0 || r.variants.len() > 0 || r.isEnum) { self.typeFree(r.name); }
-                else if (gReg.findTemplate(nameOf(r.name)) >= 0) { self.clash(r.name, "a generic"); }
+                else if (gReg.findTemplateSym(r.name) >= 0) { self.clash(r.name, "a generic"); }
                 noteDecl(r.name, r.pkg);
                 addTemplate(r.name, r.params, r.infos, r.fields, r.variants, boundsOf(r.bounds),
                             r.isEnum, r.visibility, r.file, r.pkg);
@@ -453,6 +485,9 @@ methods Replay {
             } else if (t == OP_DISTINCT) {
                 r: DistinctRec = DistinctRec.decode(d);
                 gReg.addDistinct(r.name, r.base);
+            } else if (t == OP_CLOSURE) {
+                r: ClosureRec = ClosureRec.decode(d);
+                gReg.markClosure(r.name);
             } else {
                 d.fail("an operation this compiler does not know");
             }
@@ -474,10 +509,10 @@ methods Replay {
                                        firstParam: a.addParams(ps), paramCount: ps.len(),
                                        isStatic: r.sigs.at(k).isStatic, lentSelf: r.sigs.at(k).lentSelf });
         }
-        at: long = gReg.findTrait(nameOf(r.name));
+        at: long = gReg.findTraitSym(r.name);
         if (at >= 0) {
             if (!gReg.sameTrait(gReg.traitDef(at), sigs, r.params.len())) {
-                failStr(format("trait '{}' is declared with different methods in package '{}' and elsewhere",
+                failStr(format("conflicting declarations of trait `{}`\nnote: package `{}` declares it with different methods than an earlier declaration",
                                nameOf(r.name), nameOf(self.pkg)));
             }
             return;
@@ -514,19 +549,19 @@ local sameBound ra:Registry rb:Registry a:MethodBound b:MethodBound -> bool {
     return a.param == b.param && sameArgs(ra, rb, a.trait, b.trait);
 }
 
-// Replay the log and compare. Answers the number of differences (0 is the pass).
 // One stretch of operations to replay: where its bytes are, the string table its names are in,
 // and the module it is (`Replay`).
 pub struct OpPart { at: long, len: long, symBase: long, symCount: long, file: Sym, pkg: Sym, upstream: bool }
 
-// In a package build, the order operations reached the registry in: a segment of this compile's
-// own log (its index), or `-1 - k` for module `k` of a loaded `.klib`, replayed when the scan
-// reached it. What `--klib-verify` replays them in again.
+// In a package build, the order in which operations reached the registry. Each entry is a segment
+// of this compile's own log (its index), or `-1 - k` for module `k` of a loaded `.klib`, replayed
+// when the scan reached it. `--klib-verify` replays them again in this order.
 pub var gOpOrder: Vec<long> = vec![];
 // Where this compile's own string table sits among the read ones, once it has been made readable.
 pub var gOwnSymBase: long = -1;
 
-// This compile's own names, readable through `Sym`'s decoder: what reads its log back.
+// Makes this compile's own names readable through `Sym`'s decoder, which reading its own log
+// back needs.
 pub ownSymsReadable -> void {
     if (gOwnSymBase >= 0) { return; }
     gOwnSymBase = gSymIn.len();
@@ -543,7 +578,7 @@ pub logPart s:long -> OpPart {
                     symBase: gOwnSymBase, symCount: gSymTable.len(), file: NO_SYM, pkg: NO_SYM, upstream: false };
 }
 
-// The whole log replayed and compared.
+// The whole log replayed and compared. Returns the number of differences (0 is a pass).
 pub verifyRegops inout a:Ast fr:HashMap<str, Lit> -> long {
     opsEnd();
     ownSymsReadable();
@@ -569,7 +604,8 @@ pub verifyRegopsParts inout a:Ast fr:HashMap<str, Lit> parts:Vec<OpPart> -> long
         gSymInCount = pt.symCount;
         view: [u8] = "";
         unsafe { view = (pt.at as *u8)[..pt.len]; }
-        d: Decoder = decoderOf(view);
+        d: Decoder;
+        unsafe { d = decoderOf(view); }
         rp: Replay = replayOf(pt.file, pt.pkg, pt.upstream);
         bmap: HashMap<long, long>;
         rp.run(&d, &fr2, &scratch, &bmap);
@@ -611,7 +647,7 @@ pub verifyRegopsParts inout a:Ast fr:HashMap<str, Lit> parts:Vec<OpPart> -> long
         }
         i = fr.nextSlot(i);
     }
-    eprintln("regops: {} operations, {} bytes, {} names; {} difference(s)", gOpCount, gOpLog.len(), gSymTable.len(), gVerifyBad);
+    eprintln("regops: {} operations, {} bytes, {} names; {}", gOpCount, gOpLog.len(), gSymTable.len(), plural(gVerifyBad, "difference"));
     flushErr();
     return gVerifyBad;
 }
@@ -622,7 +658,7 @@ local compareRegistries x:Registry y:Registry ax:Ast ay:Ast -> void {
         s: StructDef = x.structs.get(i);
         t: StructDef = y.structs.get(i);
         same: bool = s.name == t.name && s.fieldCount == t.fieldCount && s.size == t.size && s.isEnum == t.isEnum
-                     && x.findStruct(nameOf(s.name)) == y.findStruct(nameOf(t.name));
+                     && x.findStructSym(s.name) == y.findStructSym(t.name);
         k: long = 0;
         while (same && k < s.fieldCount) { same = x.fields.get(s.firstField + k) == y.fields.get(t.firstField + k); k = k + 1; }
         if (!same) { differs(format("struct {} ({})", i, nameOf(s.name))); }
@@ -643,7 +679,7 @@ local compareRegistries x:Registry y:Registry ax:Ast ay:Ast -> void {
         u: TraitDef = y.traits.get(i);
         same: bool = t.name == u.name && t.methodCount == u.methodCount && t.paramCount == u.paramCount
                      && sameRun(x, y, t.firstParam, u.firstParam, t.paramCount)
-                     && x.findTrait(nameOf(t.name)) == y.findTrait(nameOf(u.name));
+                     && x.findTraitSym(t.name) == y.findTraitSym(u.name);
         k: long = 0;
         while (same && k < t.methodCount) {
             m: TraitMethodSig = x.traitMethodAt(t, k);
@@ -723,6 +759,12 @@ local compareRegistries x:Registry y:Registry ax:Ast ay:Ast -> void {
         k: long = 0;
         while (same && k < p.argCount) { same = x.gArgAt(p, k) == y.gArgAt(q, k); k = k + 1; }
         if (!same) { differs(format("request {}", nameOf(p.instance))); }
+    }
+    if (x.closureEnvs.len() != y.closureEnvs.len()) { differs(stringOf("the closure count")); }
+    i = x.closureEnvs.nextSlot(-1);
+    while (i >= 0) {
+        if (!y.closureEnvs.has(x.closureEnvs.keyAt(i))) { differs(format("closure {}", nameOf(x.closureEnvs.keyAt(i) as Sym))); }
+        i = x.closureEnvs.nextSlot(i);
     }
     if (x.macroAt.len() != y.macroAt.len()) { differs(stringOf("the macro count")); }
     i = x.macroAt.nextSlot(-1);

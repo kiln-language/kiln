@@ -1,6 +1,6 @@
 // `vec![ ... ]`: the raw form of a macro call. The compiler hands `vec` the text between the
 // brackets as a `str`; the macro splits it on its top-level commas and reads each piece back as
-// code with `parseExpr`, in the module it was called from -- so a struct literal of a type
+// code with `parseExpr`, in the module it was called from, so a struct literal of a type
 // declared here resolves. The element type comes from where the result is stored (`v`, `e`,
 // the field, the return), or is named up front. Exit code: 15 + 4 = 19.
 #include <stdlib::io>

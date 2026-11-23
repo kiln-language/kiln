@@ -9,10 +9,21 @@
 // ir-lacks: try_thread::stepTry jz
 // ir-lacks: try_thread::stepTry trap
 // ir-lacks: try_thread::stepTry call try_thread::Outcome
+// In `find*` the operand is built in two blocks, each storing its tag, and copied into the
+// matched value at the join: the edge that stored the tag the test wants goes straight to its arm
+// (`threadPastSlots`), and the dataflow decides the other. One compare, `?` and `match` alike.
 // ir-count: try_thread::findTry jcc 1
 // ir-count: try_thread::findMatch jcc 1
 // ir-lacks: try_thread::findTry jz
 // ir-lacks: try_thread::findTry trap
+// And no block copies: the residual `fromResidual` builds, and the value the other path returns,
+// is built in the caller's memory where it is returned (`buildInPlaceEach`), not in a slot of its
+// own and copied there; the call in `step*` writes the matched value where it lies
+// (`forwardResults`).
+// ir-count: try_thread::findTry aggcopy 0
+// ir-count: try_thread::findMatch aggcopy 0
+// ir-count: try_thread::stepTry aggcopy 0
+// ir-count: try_thread::stepMatch aggcopy 0
 trait Try<T, R> { isBreak &self -> bool; output self -> T; residual self -> R; fromResidual r:R -> Self; }
 trap -> never { unsafe { asm -> never { "ud2" } } }
 

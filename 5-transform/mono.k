@@ -17,8 +17,8 @@ pub struct Mono {
     // Type parameter name -> what it stands for in the instance being stamped. One map, saved
     // and restored around a nested stamp, because laying out `Wrap<Vec<T>>` re-enters this.
     subst: HashMap<str, TypeRef>,
-    // Every instance method already stamped, so a second request for the same instance -- or two
-    // templates that happen to share a method name -- does not emit the function twice.
+    // Every instance method already stamped, so that a second request for the same instance, or
+    // two templates that happen to share a method name, does not emit the function twice.
     stamped: HashMap<str, long>,
     // The template being stamped and what it is becoming, for the two things a body can name
     // that the checker cannot re-derive: `Vec { }` and `T.new()`.
@@ -114,11 +114,11 @@ methods Mono {
         return a.addBlock(ids);
     }
 
-    // Every struct, laid out again now that the instances its fields name exist. A struct is
-    // laid out when it is parsed, and a field whose type is a generic instance had no size then:
-    // `SpinLock` holds an `AtomicInt`, which is `Atomic<int>`, which nothing had stamped yet, so
-    // it took zero bytes and every field after it landed on top of it. That is how a mutex's
-    // guarded value came to share an address with the lock flag protecting it.
+    // Lays every struct out again, now that the instances its fields name exist. A struct is laid
+    // out when it is parsed, and a field whose type is a generic instance has no size yet then.
+    // `SpinLock` holds an `AtomicInt`, which is `Atomic<int>`, which nothing has stamped at that
+    // point. Left alone, it would take zero bytes and every field after it would land on top of
+    // it, putting a mutex's guarded value at the same address as the lock flag protecting it.
     //
     // Repeated to a fixpoint: a struct that gains a size gives every struct holding it a
     // different answer too.
@@ -134,9 +134,10 @@ methods Mono {
         }
     }
 
-    // Every type instance asked for that has not been stamped. The table grows as it is walked (
-    // laying out `Vec<Option<T>>` asks for `Option<T>`) so the index, not a snapshot length, is
-    // what says when it is drained. Resumable: a generic function's body can ask for more.
+    // Stamps every type instance asked for that has not been stamped yet. The table grows as it
+    // is walked (laying out `Vec<Option<T>>` asks for `Option<T>`), so the index, not a snapshot
+    // of the length, says when it is drained. It can be resumed, since a generic function's body
+    // can ask for more.
     drainRequests &self inout a:Ast -> void {
         loop {
             while (self.nextRequest < gReg.requestCount()) {
@@ -205,7 +206,7 @@ methods Mono {
     deriveClone &self inout a:Ast owner:Sym -> void {
         name: Sym = methodName(owner, intern("clone"));
         if (self.stamped.find(nameOf(name)).isSome()) { return; }
-        at: long = gReg.findStruct(nameOf(owner));
+        at: long = gReg.findStructSym(owner);
         if (at < 0) { return; }
         self.stamped.put(nameOf(name), 1);
         d: StructDef = gReg.structDef(at);
@@ -220,7 +221,7 @@ methods Mono {
 
         body: Vec<long>;
         ei: long = NOT_FOUND;
-        if (d.isEnum && gReg.needsDrop(owner)) { ei = gReg.findEnum(nameOf(owner)); }
+        if (d.isEnum && gReg.needsDrop(owner)) { ei = gReg.findEnumSym(owner); }
         if (ei >= 0) {
             // A sum type's payloads overlap, so field by field would clone every variant's
             // payload out of whichever one is live. One arm per variant instead, each building
@@ -283,6 +284,26 @@ methods Mono {
         recv: NodeId = a.leafOf(Op.Lvalue, Payload.Name(selfName), Lit.Ref, owner);
         a.fields.push(FieldNode { base: recv, name: f.name });
         v: NodeId = a.leafOf(Op.FieldAccess, Payload.Field(a.fields.len() - 1), f.kind, f.structName);
+        // An array of owning elements: an array literal of each element's clone.
+        if (f.kind == Lit.Struct && f.isArray && gReg.needsDrop(f.structName)) {
+            inits: Vec<InitNode>;
+            for j in 0..f.count {
+                r2: NodeId = a.leafOf(Op.Lvalue, Payload.Name(selfName), Lit.Ref, owner);
+                a.fields.push(FieldNode { base: r2, name: f.name });
+                fv: NodeId = a.leafOf(Op.FieldAccess, Payload.Field(a.fields.len() - 1), f.kind, f.structName);
+                a.indexes.push(IndexNode { name: f.name, base: fv, index: a.leaf(Op.Literal, Payload.Num(j), Lit.Long),
+                                           whole: false, rawPointerBase: false,
+                                           sliceStart: NO_NODE, sliceEnd: NO_NODE, at: NO_SYM });
+                el: NodeId = a.leafOf(Op.ArrayIndex, Payload.Index(a.indexes.len() - 1), Lit.Struct, f.structName);
+                a.calls.push(CallNode { name: intern("clone"), receiver: el, firstArg: 0, argCount: 0,
+                                        slot: NO_SLOT, callee: NO_NODE, sigKey: NO_SYM });
+                inits.push(InitNode { name: NO_SYM,
+                                      value: a.leafOf(Op.MethodCall, Payload.Call(a.calls.len() - 1), Lit.Struct, f.structName) });
+            }
+            at: long = a.addInits(inits);
+            a.lits.push(LitNode { typeName: NO_SYM, firstInit: at, initCount: inits.len(), rest: NO_NODE });
+            return a.leaf(Op.ArrayLit, Payload.Lit(a.lits.len() - 1), Lit.Void);
+        }
         if (f.kind == Lit.Struct && !f.isArray
             && (gReg.needsDrop(f.structName) || gReg.structImplements(nameOf(f.structName), intern("Clone")))) {
             a.calls.push(CallNode { name: intern("clone"), receiver: v,
@@ -311,7 +332,7 @@ methods Mono {
             if (self.stamped.find(nameOf(r.instance)).isSome()) { i = i + 1; continue; }
             at: long = self.fnDefOf(a, r.base);
             if (at < 0) { i = i + 1; continue; }
-            tat: long = gReg.findTemplate(nameOf(r.base));
+            tat: long = gReg.findTemplateSym(r.base);
             if (tat < 0) { i = i + 1; continue; }
             t: GTemplate = gReg.templateDef(tat);
 
@@ -332,13 +353,13 @@ methods Mono {
             i = i + 1;
         }
         // A stamped body names types the program had not asked for until now (`sort<long>`'s
-        // `Vec<long>`) and those instances have to exist before it is checked. And be laid out:
-        // an instance stamped here has fields whose own instances were stamped after it, at
-        // zero bytes -- `Vec<long>` first, the `RawVec<long>` in its `buf` next -- exactly as
-        // at the first pass, which is why that one relays out to a fixpoint. Without this a
-        // `Vec<long>` reached only through inference -- `vecOf(1 as long)`, no `Vec<long>`
-        // written anywhere -- was eight bytes wide, and a temporary holding one copied a third
-        // of it.
+        // `Vec<long>`), and those instances have to exist before it is checked. They also have to
+        // be laid out: an instance stamped here has fields whose own instances were stamped after
+        // it, at zero bytes (`Vec<long>` first, then the `RawVec<long>` in its `buf`), exactly as
+        // in the first pass, which is why that pass relays out to a fixpoint too. Without this, a
+        // `Vec<long>` reached only through inference (`vecOf(1 as long)`, with no `Vec<long>`
+        // written anywhere) would be eight bytes wide, and a temporary holding one would copy a
+        // third of it.
         self.selfBase = NO_SYM;
         self.selfInstance = NO_SYM;
         self.subst.clear();
@@ -385,9 +406,9 @@ methods Mono {
         // parameter's type, the result, and the convention, which is the half of a fn type that
         // decides who releases the argument and so cannot be dropped in the rebuild.
         //
-        // Left unsubstituted, `mapOption<long, long>`'s `f: fn(T)->U` kept the pattern's key, so
-        // `g(v)` was typed as a struct called `U`, a call given a hidden destination pointer
-        // whose address was then stored as the payload.
+        // Left unsubstituted, `mapOption<long, long>`'s `f: fn(T)->U` would keep the pattern's
+        // key, so `g(v)` would be typed as returning a struct called `U`: a call given a hidden
+        // destination pointer, whose address would then be stored as the payload.
         if (t.base == Lit.Fn) {
             at: long = gFnSigs.find(t.name);
             if (at < 0) { return t; }
@@ -404,8 +425,9 @@ methods Mono {
         if (t.base == Lit.Ref) {
             inner: TypeRef = self.concreteNamed(t.name);
             // A backed enum spells like a struct but is its integer, and a borrow of a scalar is
-            // the scalar: `&T` at T = a backed enum made a ref of it, so `Vec<Sym>.at(i)` handed
-            // back the element's address where the element was asked for.
+            // the scalar. Otherwise `&T` at T = a backed enum would make a ref of it, and
+            // `Vec<Sym>.at(i)` would hand back the element's address where the element was asked
+            // for.
             if (inner.base == Lit.Struct && !namedScalar(inner.base, inner.name)) { return TypeRef { base: Lit.Ref, name: inner.name }; }
             return inner;                        // a borrow of a scalar is the scalar
         }
@@ -438,8 +460,8 @@ methods Mono {
         match hit {
             Some(b) {
                 if (b.base == Lit.Len) { return lengthValue(b); }
-                failStr(format("'{}' is an array's length here, and it was given the type {}",
-                               nameOf(p), self.spellArg(b)));
+                failStr(format("expected a length for `{}`, found the type `{}`\nnote: `{}` is used as an array's length here",
+                               nameOf(p), self.spellArg(b), nameOf(p)));
             }
             None { }
         }
@@ -454,12 +476,12 @@ methods Mono {
         while (k < t.paramCount && k < args.len()) {
             isLen: bool = args.get(k).base == Lit.Len;
             if (gReg.gParamIsLen(t, k) && !isLen) {
-                failStr(format("'{}' is a length parameter of {}, and it was given the type {}",
-                               nameOf(gReg.gParamAt(t, k)), nameOf(base), self.spellArg(args.get(k))));
+                failStr(format("expected a length for `{}`, found the type `{}`\nnote: `{}` is a length parameter of `{}`",
+                               nameOf(gReg.gParamAt(t, k)), self.spellArg(args.get(k)), nameOf(gReg.gParamAt(t, k)), nameOf(base)));
             }
             if (!gReg.gParamIsLen(t, k) && isLen) {
-                failStr(format("'{}' is a type parameter of {}, and it was given the length {}",
-                               nameOf(gReg.gParamAt(t, k)), nameOf(base), nameOf(args.get(k).name)));
+                failStr(format("expected a type for `{}`, found the length `{}`\nnote: `{}` is a type parameter of `{}`",
+                               nameOf(gReg.gParamAt(t, k)), nameOf(args.get(k).name), nameOf(gReg.gParamAt(t, k)), nameOf(base)));
             }
             k = k + 1;
         }
@@ -468,8 +490,8 @@ methods Mono {
     // ─── stamping ────────────────────────────────────────────────────────────
 
     stamp &self inout a:Ast base:Sym instance:Sym args:Vec<TypeRef> -> void {
-        if (gReg.hasStruct(nameOf(instance))) { return; }        // already stamped
-        at: long = gReg.findTemplate(nameOf(base));
+        if (gReg.hasStructSym(instance)) { return; }        // already stamped
+        at: long = gReg.findTemplateSym(base);
         if (at < 0) { return; }                                  // not generic: already itself
         t: GTemplate = gReg.templateDef(at);
         // An error about this instance (its bounds, its arguments) stands at the request; its
@@ -477,12 +499,12 @@ methods Mono {
         outer: Sym = gCtxInst;
         gCtxInst = originOf(instance).parent;
         if (args.len() != t.paramCount) {
-            failStr(format("{} takes {} type argument(s) but was given {}",
+            failStr(format("wrong number of type arguments to `{}`: expected {}, found {}",
                            nameOf(base), t.paramCount, args.len()));
         }
         self.depth = self.depth + 1;
         if (self.depth > MAX_DEPTH) {
-            failStr(format("{} instantiates itself without end — a generic type may hold a POINTER to itself, never a value of itself",
+            failStr(format("`{}` instantiates itself without end\nnote: a generic type may hold a pointer to itself, but never a value of itself",
                            nameOf(base)));
         }
 
@@ -497,14 +519,14 @@ methods Mono {
 
         // A bound the type declared holds for every instance of it, unlike a methods block's,
         // which is conditional. `struct Wrap<W: Default>` stamped with a W that is not `Default`
-        // has fields it cannot initialize, and used to be stamped anyway.
+        // would have fields it cannot initialize, so it is refused here rather than stamped.
         for b in 0..t.boundCount {
             mb: MethodBound = gReg.boundAt(t.firstBound + b);
             if (mb.param >= args.len()) { continue; }
             if (self.satisfies(args.get(mb.param), mb.trait.name)) { continue; }
-            failStr(format("{} does not implement '{}', required by {}<{}>",
+            failStr(format("`{}` does not implement `{}`\nnote: required by the bound `{}: {}` on `{}`",
                            self.spellArg(args.get(mb.param)), lastComponentOf(nameOf(mb.trait.name)),
-                           nameOf(base), nameOf(gReg.gParamAt(t, mb.param))));
+                           nameOf(gReg.gParamAt(t, mb.param)), lastComponentOf(nameOf(mb.trait.name)), nameOf(base)));
         }
 
         gCtxInst = instance;          // what its fields ask for, it asks for
@@ -698,7 +720,7 @@ methods Mono {
     // the program had not asked for, which has to be stamped before the body is checked.
     stampBody &self inout a:Ast at:long -> bool {
         r: long = gLaterAt.getOr(at, -1);
-        if (r < 0) { failStr(format("internal: '{}' has no body to stamp", nameOf(a.fns.get(at).name))); }
+        if (r < 0) { failStr(format("internal compiler error: `{}` has no body to stamp", nameOf(a.fns.get(at).name))); }
         lb: LaterBody = gLater.get(r);
         self.subst.clear();
         for k in 0..lb.substCount { self.subst.put(gLaterKeys.get(lb.firstSubst + k), gLaterVals.get(lb.firstSubst + k)); }
@@ -723,13 +745,13 @@ methods Mono {
         return gReg.requestCount() > asked;
     }
 
-    // What the instance `base<args>` is compiled against: every type it is made of -- the
+    // What the instance `base<args>` is compiled against: every type it is made of (the
     // template, the arguments, and through them an instance's own template and arguments and a
-    // struct's fields -- each with the traits the source declares for it. A sum, so the order the
-    // types are met in does not matter: the owner and a dependent meet them differently. Two
-    // compiles that agree on this compile the instance's functions to the same code (Kiln has no
-    // coherence rule: any package may implement `Drop` for a type it did not write, and the
-    // fingerprint is how a dependent notices one its dependency could not see).
+    // struct's fields), each with the traits the source declares for it. It is a sum, so the
+    // order the types are met in does not matter; the owner and a dependent meet them
+    // differently. Two compiles that agree on this compile the instance's functions to the same
+    // code. Kiln has no coherence rule: any package may implement `Drop` for a type it did not
+    // write, and the fingerprint is how a dependent notices one its dependency could not see.
     fingerprint &self base:Sym args:Vec<TypeRef> -> long {
         if (!gKlibMode) { return 0; }
         seen: HashMap<long, bool>;
@@ -747,13 +769,13 @@ methods Mono {
         if (n == NO_SYM || seen.has(n as long)) { return 0; }
         seen.put(n as long, true);
         acc: long = fpMix(strHash(nameOf(n)) + 31 * self.declaredImpls(n));
-        r: long = gReg.findRequest(nameOf(n));
+        r: long = gReg.findRequestSym(n);
         if (r >= 0) {
             rq: GRequest = gReg.requestAt(r);
             acc = acc + self.fpVisit(rq.base, seen);
             for k in 0..rq.argCount { acc = acc + self.fpType(gReg.gArgAt(rq, k), seen); }
         }
-        si: long = gReg.findStruct(nameOf(n));
+        si: long = gReg.findStructSym(n);
         if (si < 0) { return acc; }
         d: StructDef = gReg.structDef(si);
         for k in 0..d.fieldCount {
@@ -787,15 +809,16 @@ methods Mono {
         }
     }
 
-    // The template's impls, restated for this instance. Without them `Vec<long>` implements
-    // nothing: no vtable, and no way for another template's `T: Write` bound to be met by it.
-    // A block whose bounds this instance failed left its methods uncloned, and that is exactly
-    // what makes the impl conditional: it is not registered either.
-    // The template's impls, restated for this instance: the methods and the registration, from
-    // one place. Both have to agree on the trait's spelling, and only the concrete trait gives it:
-    // `VecIter<T> for Iter<&T>` at T = long is `Iter<long>`, because a borrow of a scalar is the
-    // scalar. Naming the clone by substituting text into the template's own name instead produced
-    // `Iter_ref_long`, which no call site would ever ask for.
+    // Restates the template's impls for this instance, the methods and the registration together.
+    // Without them `Vec<long>` implements nothing: no vtable, and no way for another template's
+    // `T: Write` bound to be met by it. A block whose bounds this instance failed leaves its
+    // methods uncloned, and that is exactly what makes the impl conditional: it is not registered
+    // either.
+    //
+    // The methods and the registration have to agree on the trait's spelling, and only the
+    // concrete trait gives it: `VecIter<T> for Iter<&T>` at T = long is `Iter<long>`, because a
+    // borrow of a scalar is the scalar. Substituting text into the template's own name would give
+    // `Iter_ref_long` instead, which no call site ever asks for.
     cloneImpls &self inout a:Ast base:Sym instance:Sym -> void {
         // The template's own implementations, in the order they were registered. What this adds
         // is the instance's, which is not `base`.
@@ -806,15 +829,15 @@ methods Mono {
             next = self.implNext.get(i);
             im: TraitImplDef = gReg.implAt(i);
             // A marker trait (`MustUse`, and any other with no methods) has nothing to clone,
-            // but the instance still carries the mark. Skipping it outright is what left
-            // `Result<long, long>` not `MustUse` while `Result<T, E>` was, so discarding one went
-            // unnoticed for every instance anybody actually wrote.
+            // but the instance still carries the mark. Skipping it outright would leave
+            // `Result<long, long>` without `MustUse` while `Result<T, E>` has it, and discarding
+            // one would go unnoticed for every instance anybody actually writes.
             if (im.fnCount == 0) {
                 none: Vec<Sym>;
                 gReg.addImpl(instance, self.concreteTrait(im.trait), none);
                 continue;
             }
-            at: long = gReg.findTrait(nameOf(im.trait.name));
+            at: long = gReg.findTraitSym(im.trait.name);
             if (at < 0) { continue; }
             t: TraitDef = gReg.traitDef(at);
             inst: TraitImplDef = TraitImplDef { structName: instance,
@@ -845,8 +868,8 @@ methods Mono {
     // exists for the instance. The new definitions come back as their statements.
     stampImpl &self inout a:Ast base:Sym instance:Sym args:Vec<TypeRef> im:TraitImplDef have:Vec<bool> -> Vec<long> {
         out: Vec<long>;
-        tat: long = gReg.findTemplate(nameOf(base));
-        ti: long = gReg.findTrait(nameOf(im.trait.name));
+        tat: long = gReg.findTemplateSym(base);
+        ti: long = gReg.findTraitSym(im.trait.name);
         if (tat < 0 || ti < 0) { return out; }
         t: GTemplate = gReg.templateDef(tat);
         self.extra.clear();
@@ -891,10 +914,10 @@ methods Mono {
         // scalar is; `Clone` is its opposite: only a value that owns something has a clone to
         // make, so `Vec<str>` gets the plain reads and not `cloneAt`.
         bare: str = lastComponentOf(nameOf(trait));
-        // ...and a value that owns something is never one of them: a bitwise copy would hand two
-        // owners the same resource, which is exactly what a `T: Copy` block exists to keep out.
-        // Answering `true` for every type stamped `Mutex<BufWriter<Write>>.get`, whose whole body
-        // is a copy of a value it would then have to release twice.
+        // A value that owns something is never `Copy`: a bitwise copy would hand two owners the
+        // same resource, which is exactly what a `T: Copy` block exists to keep out. Answering
+        // `true` for every type would stamp `Mutex<BufWriter<Write>>.get`, whose whole body is a
+        // copy of a value it would then have to release twice.
         if (bare == "Copy")  { return gReg.isCopy(t.base, t.name); }
         // `Copy` implies `Clone` (the clone of a plain value is the copy), so `Vec<long>` gets
         // `methods Vec<T: Clone> for Clone`, the deep one, rather than a clone derived field by
@@ -1034,8 +1057,8 @@ methods Mono {
     // or its methods block's, whose parameters are the type's), each as a run of trait names.
     noteHintVars &self fn:FnNode -> void {
         if (fn.boundCount == 0) { return; }
-        tat: long = gReg.findTemplate(nameOf(fn.name));
-        if (tat < 0 && self.selfBase != NO_SYM) { tat = gReg.findTemplate(nameOf(self.selfBase)); }
+        tat: long = gReg.findTemplateSym(fn.name);
+        if (tat < 0 && self.selfBase != NO_SYM) { tat = gReg.findTemplateSym(self.selfBase); }
         if (tat < 0) { return; }
         t: GTemplate = gReg.templateDef(tat);
         for p in 0..t.paramCount {
@@ -1057,8 +1080,8 @@ methods Mono {
         // `inout` on a struct is the borrow representation: the parser applies that where the
         // type is written, but a template's `inout t:T` had no type to apply it to until now. A
         // slice stays a slice: it is already a fat pointer, and `inout` only says the callee may
-        // write through it. Without this the stamped `take<Vec<long>>` took its parameter by
-        // value, and the `replace(t, fresh)` in its body was refused for not lending.
+        // write through it. Without this, the stamped `take<Vec<long>>` would take its parameter
+        // by value, and the `replace(t, fresh)` in its body would be refused for not lending.
         if (d.conv == Conv.Inout && t.base == Lit.Struct) { t = TypeRef { base: Lit.Ref, name: t.name }; }
         a.decls.push(VarDeclNode { name: d.name, kind: t.base, structName: t.name,
                                    isArray: d.isArray, count: self.concreteCount(d.count), conv: d.conv,
@@ -1101,6 +1124,13 @@ methods Mono {
             body: long = self.cloneBlock(a, w.body);
             a.whiles.push(WhileNode { cond: cond, body: body, step: step });
             return a.addStmt(StmtKind.While, a.whiles.len() - 1);
+        }
+        if (s.kind == StmtKind.Recover) {
+            w: WhileNode = a.whiles.get(s.at);
+            body: long = self.cloneBlock(a, w.body);
+            handler: long = self.cloneBlock(a, w.step);
+            a.whiles.push(WhileNode { cond: NO_NODE, body: body, step: handler });
+            return a.addStmt(StmtKind.Recover, a.whiles.len() - 1);
         }
         if (s.kind == StmtKind.Loop || s.kind == StmtKind.Unsafe || s.kind == StmtKind.Block) {
             bs: BlockStmtNode = a.blockStmts.get(s.at);
@@ -1314,7 +1344,7 @@ methods Mono {
     // argument is this one's parameter. Rebuilt under the current bindings, and asked for, since
     // `Mutex<FileOut>` is a type nobody has stamped and the run loop reads this table as it goes.
     substInstance &self n:Sym -> Sym {
-        at: long = gReg.findRequest(nameOf(n));
+        at: long = gReg.findRequestSym(n);
         if (at < 0) { return n; }
         r: GRequest = gReg.requestAt(at);
         if (!gReg.isPatternRequest(r)) { return n; }

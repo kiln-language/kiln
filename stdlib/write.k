@@ -3,7 +3,7 @@
 #include <{sys, core, mem, bytes}>
 
 // ─── FileOut: a borrowed fd ─────────────────────────────────────────────────
-// One writeAll(2) per write, and no Drop — it never closes the fd. Use `File` (file.k) to own
+// One writeAll(2) per write, and no Drop: it never closes the fd. Use `File` (file.k) to own
 // and manage a descriptor, `FileOut` to compose a sink over one you must not close.
 pub struct FileOut { fd: int }
 methods FileOut for Default {
@@ -19,14 +19,14 @@ methods FileOut for Write {
 // larger than it, or on Drop. `inner` is a concrete W, so `self.inner.write` is a direct call;
 // only a leaf reached through a `Write` trait object is dynamic.
 //
-// The buffer is part of the writer rather than a heap block, which is what lets stdout be built
-// at compile time and print without touching the allocator; its size is the type's length
-// parameter, so a writer in front of a file can hold more without anything else changing:
+// The buffer is part of the writer rather than a heap block, so stdout can be built at compile
+// time and print without touching the allocator. Its size is the type's length parameter, so a
+// writer in front of a file can hold more without anything else changing:
 //
 //     out: BufWriter<File, 65536> = bufWriterWith(f, BufferMode.Block);
 //     log: BufWriter<FileOut>     = bufWriter(FileOut { fd: 2 });     // N = 4096
 //
-// The struct constrains nothing itself — each impl states its own requirement, so `Default`
+// The struct constrains nothing itself; each impl states its own requirement, so `Default`
 // needs `W: Default` and the writing impls need `W: Write`, each checked at instantiation.
 
 // When a BufWriter passes what it holds on, besides when the buffer is full.
@@ -49,7 +49,7 @@ methods BufWriter<W: Write, N> for Write {
         if (len > self.cap - self.pos) { self.flush(); }
         if (len > self.cap) { return self.inner.write(ptr, len); }   // bigger than the buffer: through
         unsafe { memcpy(&self.data as long + self.pos, ptr, len); }
-        self.pos = self.pos + len;
+        self.pos += len;
         if (self.due()) { self.flush(); }
         return len;
     }
@@ -110,7 +110,7 @@ pub bufWriterWith<W: Write, N: long = 4096> inner:W mode:BufferMode -> BufWriter
 
 // ─── StringWriter: capture into a caller buffer ─────────────────────────────
 // Formatting into memory the caller already has, with no allocation: read the result back
-// through `.buf` / `.len`, or `view`. Fixed capacity — a write past `cap` is truncated, not grown.
+// through `.buf` / `.len`, or `view`. Fixed capacity: a write past `cap` is truncated, not grown.
 // (`string.format` is the growing, allocating form.)
 pub struct StringWriter { buf: *u8, cap: long, len: long }
 methods StringWriter for Write {
@@ -118,7 +118,7 @@ methods StringWriter for Write {
         n: long = len;
         if (n > self.cap - self.len) { n = self.cap - self.len; }
         unsafe { memcpy(self.buf + self.len, ptr, n); }   // *u8 arithmetic: byte-scaled
-        self.len = self.len + n;
+        self.len += n;
         return n;
     }
 }

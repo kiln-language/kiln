@@ -15,18 +15,18 @@
 // `--trace-fold`: say, per global, whether it folded and what stopped it if not.
 pub var gTraceFold: bool = false;
 
-// What one fold may cost before it is given up: `--fold-steps=N` and `--fold-heap=MiB`. A fold
-// that exceeds either is a refusal like any other -- an error for what must fold, a startup
-// initializer for a `var` -- never a compiler that hangs or eats the machine.
+// How much one fold may spend before it is given up (`--fold-steps=N` and `--fold-heap=MiB`). A
+// fold that runs past either limit is refused like any other: an error for a constant, which must
+// fold, and a startup initializer for a `var`. The compiler never hangs or exhausts the machine.
 pub var gStepLimit: long = 10000000;
 pub var gHeapLimit: long = 268435456;    // 256 MiB of compile-time heap
 
-// A scalar's bits; a pointer's address; an aggregate's address. `structName` is the companion
-// name the kind needs, as everywhere else.
+// One compile-time value. `bits` holds a scalar's bits, a pointer's address, or the address of an
+// aggregate's storage; `structName` is the companion name the kind needs, as everywhere else.
 pub struct CtValue { kind: Lit, structName: Sym, bits: long }
 
-// `n` zero bytes onto the end of one of the evaluator's memories: one reservation and one fill,
-// where a push per byte was what every frame, local and heap block paid.
+// Appends `n` zero bytes to one of the evaluator's memories with one reservation and one fill.
+// Pushing a byte at a time was a cost every frame, local and heap block paid.
 local zeroExtend inout v:Vec<u8> n:long -> void {
     if (n <= 0) { return; }
     v.reserve(n);
@@ -34,8 +34,8 @@ local zeroExtend inout v:Vec<u8> n:long -> void {
     v.count = v.count + n;
 }
 
-// Where the literal and heap segments live in the compile-time address space -- far above
-// anything the stack reaches, so a pointer says which segment it is in by its value.
+// Where the literal and heap segments live in the compile-time address space. They sit far above
+// anything the stack reaches, so a pointer's value alone says which segment it points into.
 local LIT_BASE: long  = 1099511627776;   // 2^40
 local HEAP_BASE: long = 2199023255552;   // 2^41
 
@@ -115,16 +115,19 @@ pub struct Evaluator {
     snames: Vec<Sym>,
     arrays: Vec<bool>,
     counts: Vec<long>,
+    // Which locals stand where another value lies rather than in their own slot (`forElement`,
+    // `bindBorrow`): a borrow the ownership pass has not made yet.
+    aliased: Vec<bool>,
     frameBase: Vec<long>,       // where each frame's locals begin in the lists above
     frameSp: Vec<long>,         // and where its memory began
-    // A runaway loop at compile time is a hang in the compiler. Bounded, and the bound is a
-    // refusal rather than a crash.
+    // A runaway loop at compile time would hang the compiler, so the steps are counted, and
+    // running out of them is a refusal rather than a crash.
     steps: long,
     stopped: bool,
     refusal: String,            // why the last evaluation stopped; empty when it did not
-    refused: bool,              // ...and it stopped by its own decision: an exit (`ctExit`)
-    // What compile-time code wrote to stderr (fd 2) through the `syscall` builtin: the text of
-    // the error if it then exits (`ctExit`), as it would have been the program's last words.
+    refused: bool,              // whether it stopped by its own choice, an exit (`ctExit`)
+    // What compile-time code wrote to stderr (fd 2) through the `syscall` builtin. If the code
+    // then exits (`ctExit`), this is the error's text, as it would have been its last words.
     ctErr: String,
     // Control leaving a statement: a `return` unwinds to the call that made the frame, a
     // `break` or `continue` to the loop around it, each carried as a flag the walk reads.
@@ -132,8 +135,9 @@ pub struct Evaluator {
     breaking: bool,
     continuing: bool,
     retVal: CtValue,
-    // The image being built by promotion, and the heap blocks it found pointers to, which are
-    // promoted after it -- each into an image of its own, once, however many pointers reach it.
+    // The image being built by promotion, and the heap blocks it found pointers to. Those are
+    // promoted after it, each into an image of its own and only once, however many pointers
+    // reach it.
     curBytes: Vec<u8>,
     curOff: Vec<long>,
     curKind: Vec<RelocKind>,
@@ -165,7 +169,12 @@ pub struct Evaluator {
     macroImage: Vec<u8>,
     macroFolded: Vec<bool>,
     macroPage: long,
-    macroPageLen: long
+    macroPageLen: long,
+    // The statement `execBlock` is running, for a store that asks what follows it (`bindBorrow`),
+    // and per such store whether what follows may write through what it binds (`mayWriteAfter`).
+    curBlock: long,
+    curAt: long,
+    writeAfter: HashMap<long, bool>
 }
 
 methods Evaluator for Default {
@@ -174,29 +183,30 @@ methods Evaluator for Default {
         return Evaluator { fnAt: map![], indexedPage: -1, indexedLen: -1, mem: vec![], lits: vec![], litAt: map![], litText: vec![], litStart: vec![], litLens: vec![],
                            heap: vec![], blocks: vec![], lastBlock: -1, offsets: map![], globalAddr: map![], globalsEnd: 0, committing: false,
                            gNames: vec![], gStarts: vec![], gDecls: vec![], folded: vec![], vtConcrete: vec![], vtTrait: vec![],
-                           names: vec![], slots: vec![], kinds: vec![], snames: vec![], arrays: vec![], counts: vec![],
+                           names: vec![], slots: vec![], kinds: vec![], snames: vec![], arrays: vec![], counts: vec![], aliased: vec![],
                            frameBase: vec![], frameSp: vec![], steps: 0, stopped: false, refusal: r, refused: false, ctErr: ce,
                            returning: false, breaking: false, continuing: false,
                            retVal: CtValue { kind: Lit.Void, structName: NO_SYM, bits: 0 },
                            curBytes: vec![], curOff: vec![], curKind: vec![], curTarget: vec![], curImage: vec![], curDelta: vec![],
                            queueBlock: vec![], queueKind: vec![], queueName: vec![],
                            nodeSym: NO_SYM, renames: map![], macroSeq: 0, macroRun: false, macroFile: NO_SYM, macroPkg: NO_SYM, poison: ps, extReady: map![], extBlocks: vec![],
-                           macroImage: vec![], macroFolded: vec![], macroPage: -1, macroPageLen: -1 };
+                           macroImage: vec![], macroFolded: vec![], macroPage: -1, macroPageLen: -1,
+                           curBlock: -1, curAt: 0, writeAfter: map![] };
     }
 }
 
 // ─── the entry point ─────────────────────────────────────────────────────────
 
 methods Evaluator {
-    // Try every file global's initializer, in declaration order, then promote what folded.
+    // Tries every file global's initializer in declaration order, then promotes what folded.
     // Returns how many folded.
     //
     // Every global gets its storage first, so an initializer that reads one already folded finds
-    // its bytes exactly where a later initializer would at runtime. Promotion waits until the
-    // end: a later initializer may write through a pointer into a heap block an earlier global
-    // owns, and the image must show the final state -- which is what the runtime order would
-    // have produced, since a folded initializer reaches a block only through a global no
-    // startup code writes, and all such initializers are folded in declaration order.
+    // its bytes exactly where a later initializer would at runtime. Promotion waits until the end
+    // because a later initializer may write through a pointer into a heap block an earlier global
+    // owns, and the image must show the final state. That is the state the runtime order would
+    // have produced: a folded initializer reaches a block only through a global no startup code
+    // writes, and all such initializers are folded in declaration order.
     foldGlobals &self inout a:Ast page:long -> long {
         self.indexFunctions(a, page);
         self.poison.reset(a);
@@ -238,7 +248,7 @@ methods Evaluator {
                     // A `const` is a promise that this is computed here; a refusal is then an
                     // error, and it says what stopped the computation.
                     if (!isVarGlobal(d.name)) {
-                        failStr(format("'{}' cannot be computed at compile time: it met {} -- a global is a constant unless declared `var {}: ...`, which initializes at startup instead", nameOf(d.name), self.refusal, lastComponentOf(nameOf(d.name))));
+                        failStr(format("`{}` cannot be computed at compile time: it met {}\nnote: a global is a constant unless it is declared `var`\nhelp: declare it `var {}: ...` to initialize it at startup instead", lastComponentOf(nameOf(d.name)), self.refusal, lastComponentOf(nameOf(d.name))));
                     }
                     self.poison.addExpr(a, d.init);
                 }
@@ -249,8 +259,8 @@ methods Evaluator {
         return count;
     }
 
-    // One initializer, into the global's own storage. Already a constant: only its bytes have
-    // to get there.
+    // Runs one initializer into the global's own storage. An initializer that is already a
+    // literal only needs its bytes put there.
     foldInit &self inout a:Ast d:VarDeclNode addr:long -> bool {
         e: Expr = a.expr(d.init);
         if (e.op == Op.Literal && !d.isArray && ctScalar(d.kind, d.structName)) {
@@ -264,15 +274,15 @@ methods Evaluator {
         v: CtValue = self.eval(a, d.init);
         if (self.stopped) { return false; }
         self.committing = true;
-        if (d.isArray) { self.copy(addr, v.bits, declaredBytesOf(d)); }
+        if (d.isArray) { self.copy(addr, self.arrayFrom(a, d.init, v), declaredBytesOf(d)); }
         else { self.assignTo(addr, d.kind, d.structName, v); }
         self.committing = false;
         return !self.stopped;
     }
 
-    // A global's literal initializer, into its storage: an integer's value, or a float literal's
-    // spelling rounded once at the global's width (that was left unwritten, and `G: f64 = 3.5`
-    // was 0.0).
+    // Writes a global's literal initializer into its storage: an integer's value, or a float
+    // literal's spelling rounded once at the global's width. A float literal arrives as text, so
+    // without the second case `G: f64 = 3.5` would start out as 0.0.
     storeLiteral &self addr:long d:VarDeclNode e:Expr -> void {
         match e.payload {
             Num(v) { self.store(addr, d.kind, d.structName, v); }
@@ -286,20 +296,20 @@ methods Evaluator {
 
     // ─── promotion: a value's bytes, with its pointers named ─────────────────
     //
-    // Walks each folded global by layout rather than copying raw bytes, because a word can only
-    // be told to be a pointer by its type: a `str` becomes a relocation to its literal's label;
-    // a pointer into the heap names the block it reaches, which is then promoted as an image
-    // of its own -- once, however many pointers reach it, so a shared block stays shared; a
-    // pointer into a global names that global; a function or a vtable its label. An address
-    // held in a plain integer, or one into the compile-time stack, has no `.data` counterpart
-    // and refuses, and that global initializes at startup after all.
+    // Promotion walks each folded global by its layout rather than copying raw bytes, because
+    // only the type can say whether a word is a pointer. A `str` becomes a relocation to its
+    // literal's label. A pointer into the heap names the block it reaches, which is then promoted
+    // as an image of its own, once however many pointers reach it, so a shared block stays
+    // shared. A pointer into a global names that global, and a function or a vtable names its
+    // label. An address held in a plain integer, or one into the compile-time stack, has no
+    // `.data` counterpart; it is refused, and that global initializes at startup after all.
     promoteAll &self inout a:Ast -> void {
         for g in 0..self.gDecls.len() {
             if (self.folded.get(g)) {
                 d: VarDeclNode = a.decls.get(self.gDecls.get(g));
                 if (!self.promoteGlobal(a, d, self.gStarts.get(g))) {
                     if (gTraceFold) { eprintln("promote {}: met {}", nameOf(d.name), self.refusal); }
-                    if (!isVarGlobal(d.name)) { failStr(format("'{}' cannot be placed in the binary: it met {} -- declare it `var` to build it at startup instead", nameOf(d.name), self.refusal)); }
+                    if (!isVarGlobal(d.name)) { failStr(format("`{}` cannot be placed in the binary: it met {}\nhelp: declare it `var {}: ...` to build it at startup instead", lastComponentOf(nameOf(d.name)), self.refusal, lastComponentOf(nameOf(d.name)))); }
                     self.folded.set(g, false);
                 } else if (gTraceFold) { eprintln("fold {}: in .data", nameOf(d.name)); }
             }
@@ -335,9 +345,9 @@ methods Evaluator {
         return true;
     }
 
-    // The blocks the last image reached, each into an image of its own; a block's walk may
-    // reach more. An image index was given to each when it was first reached, so a pointer to
-    // a block already promoted -- or being promoted, in a cycle -- names the same label.
+    // Promotes the blocks the last image reached, each into an image of its own; walking a block
+    // may reach more. Each was given its image index when it was first reached, so a pointer to a
+    // block already promoted, or still being promoted in a cycle, names the same label.
     promoteQueued &self inout a:Ast -> void {
         while (self.queueBlock.len() > 0 && !self.stopped) {
             b: long = self.queueBlock.pop();
@@ -413,7 +423,7 @@ methods Evaluator {
             if (w == 8) {
                 v: long = self.loadWord(addr);
                 if (v >= LIT_BASE && self.addressed(v)) {
-                    self.stop(stringOf("an address held in a plain integer, which .data cannot relocate")); return;
+                    self.stop(stringOf("an address held in a plain integer, which `.data` cannot relocate")); return;
                 }
             }
             self.rawBytes(addr, w);
@@ -465,11 +475,11 @@ methods Evaluator {
         }
         if (k == Lit.Struct || k == Lit.Tuple) {
             si: long = gReg.findStructSym(sname);
-            if (si < 0) { self.stop(format("a value of type {} it cannot lay out", nameOf(sname))); return; }
+            if (si < 0) { self.stop(format("a value of type `{}` it cannot lay out", nameOf(sname))); return; }
             self.imageStruct(a, addr, gReg.structDef(si));
             return;
         }
-        self.stop(format("a value of type {} it cannot promote", typeName(k)));
+        self.stop(format("a value of type `{}` it cannot promote", typeName(k)));
     }
 
     // A struct's fields in offset order, padding as raw bytes. A sum type overlaps its payloads,
@@ -480,8 +490,8 @@ methods Evaluator {
         first: long = 0;
         count: long = d.fieldCount;
         if (d.isEnum) {
-            ei: long = gReg.findEnum(nameOf(d.name));
-            if (ei < 0) { self.stop(format("a sum type ({}) it cannot lay out", nameOf(d.name))); return; }
+            ei: long = gReg.findEnumSym(d.name);
+            if (ei < 0) { self.stop(format("a sum type `{}` it cannot lay out", nameOf(d.name))); return; }
             ed: EnumDef = gReg.enumDef(ei);
             tag: long = self.load(addr, ed.backing, NO_SYM);
             self.rawBytes(addr, typeInfo(ed.backing).size);
@@ -491,7 +501,7 @@ methods Evaluator {
                 vd: VariantDef = gReg.variantAt(ed, v);
                 if (vd.value == tag) { first = 1 + vd.firstPayload; count = first + vd.payloadCount; }
             }
-            if (first < 0) { self.stop(format("a {} whose tag {} names no variant", nameOf(d.name), tag)); return; }
+            if (first < 0) { self.stop(format("a `{}` whose tag {} names no variant", nameOf(d.name), tag)); return; }
         }
         f: long = first;
         while (f < count && !self.stopped) {
@@ -520,8 +530,8 @@ methods Evaluator {
             if (b < 0 || !self.blocks.get(b).live) { self.stop(stringOf("a pointer to freed memory")); return; }
             blk: CtBlock = self.blocks.get(b);
             if (blk.image < 0) {
-                // First reached: give it its image now, so every other pointer to it -- and a
-                // pointer back to it from inside its own contents -- names the same one.
+                // The first time a block is reached it gets its image, so every other pointer to
+                // it, including one from inside its own contents, names the same one.
                 a.images.push(ImageNode { firstByte: 0, byteCount: 0, firstReloc: 0, relocCount: 0, isBlock: true });
                 blk.image = a.images.len() - 1;
                 self.blocks.set(b, blk);
@@ -545,13 +555,13 @@ methods Evaluator {
             self.rawBytes(addr, 8);
             return;
         }
-        self.stop(stringOf("a pointer into the compile-time stack, which .data cannot hold"));
+        self.stop(stringOf("a pointer into the compile-time stack, which `.data` cannot hold"));
     }
     rawBytes &self addr:long n:long -> void {
         for i in 0..n { self.curBytes.push(self.rawByte(addr + i)); }
     }
-    // Whether an integer value is an address in one of the segments -- what a plain `long`
-    // must not carry into `.data`.
+    // Whether an integer value is an address in one of the segments, which a plain `long` must
+    // not carry into `.data`.
     addressed &self v:long -> bool {
         if (v >= VT_BASE) { return v - VT_BASE < self.vtConcrete.len(); }
         if (v >= FN_BASE) { return true; }
@@ -581,11 +591,11 @@ methods Evaluator {
 
     // Every function on the page, by name. Rebuilt only when the page has actually changed.
     //
-    // This is called before every macro run, before the globals snapshot each one gets, and once
-    // per macro argument, and it cleared the table and re-indexed all fifteen hundred functions
-    // every time. A constructor with twenty `vec![]` fields paid it eighty times. It was the
-    // largest single cost in the compiler: `Registry_new` took 101 ms, `types::gTypeRows` 169 ms,
-    // and the stamping rounds 1.2 s between them, almost all of it here.
+    // This is called before every macro run, before the globals snapshot each run gets, and once
+    // per macro argument. Clearing the table and re-indexing all fifteen hundred functions every
+    // time made it the largest single cost in the compiler: a constructor with twenty `vec![]`
+    // fields paid for it eighty times, and `Registry_new` took 101 ms, `types::gTypeRows` 169 ms
+    // and the stamping rounds 1.2 s between them, almost all of it spent here.
     //
     // The length is enough to tell a changed page from an unchanged one: the page only ever grows
     // (derived definitions are appended), and a macro splice rewrites expressions inside a body
@@ -605,7 +615,7 @@ methods Evaluator {
     // Between two initializers: the frames are gone; the globals, the literals, the heap stay.
     reset &self -> void {
         self.names.clear(); self.slots.clear(); self.kinds.clear(); self.snames.clear();
-        self.arrays.clear(); self.counts.clear();
+        self.arrays.clear(); self.counts.clear(); self.aliased.clear();
         self.frameBase.clear();
         self.frameSp.clear();
         self.frameBase.push(0);
@@ -630,7 +640,7 @@ methods Evaluator {
     tick &self -> bool {
         self.steps = self.steps + 1;
         if (self.steps > gStepLimit) {
-            self.stop(format("a fold of more than {} steps (--fold-steps=N raises it)", gStepLimit));
+            self.stop(format("a fold of more than {} steps (`--fold-steps=N` raises the limit)", gStepLimit));
             return false;
         }
         return true;
@@ -648,15 +658,15 @@ methods Evaluator {
         zeroExtend(&self.mem, n);
         return addr;
     }
-    // A heap block: bump-allocated, 16-aligned, zeroed, never reused -- so a stale pointer
-    // finds a block marked dead rather than someone else's bytes.
+    // Hands out a heap block: bump-allocated, 16-aligned, zeroed and never reused, so a stale
+    // pointer finds a block marked dead rather than someone else's bytes.
     ctMalloc &self n:long -> long {
         zeroExtend(&self.heap, (16 - (self.heap.len() & 15)) & 15);
         start: long = HEAP_BASE + self.heap.len();
         size: long = n;
         if (size < 1) { size = 1; }
         if (size > gHeapLimit - self.heap.len()) {
-            self.stop(format("a compile-time heap past {} MiB (--fold-heap=MiB raises it)", gHeapLimit / 1048576));
+            self.stop(format("a compile-time heap past {} MiB (`--fold-heap=MiB` raises the limit)", gHeapLimit / 1048576));
             return start;
         }
         zeroExtend(&self.heap, size);
@@ -666,7 +676,7 @@ methods Evaluator {
     ctFree &self p:long -> void {
         if (p == 0) { return; }
         b: long = self.blockOf(p);
-        if (b < 0 || self.blocks.get(b).start != p) { self.stop(stringOf("a free of something malloc did not hand out")); return; }
+        if (b < 0 || self.blocks.get(b).start != p) { self.stop(stringOf("a free of something `malloc` did not hand out")); return; }
         blk: CtBlock = self.blocks.get(b);
         if (!blk.live) { self.stop(stringOf("a block freed twice")); return; }
         blk.live = false;
@@ -702,16 +712,16 @@ methods Evaluator {
         if (addr >= LIT_BASE) { return addr - LIT_BASE + n <= self.lits.len(); }
         return addr >= 0 && addr + n <= self.mem.len();
     }
-    // Whether a write may land on [addr, addr+n). A global's storage is what the program will
-    // start with, so a write to it here would be a startup effect that never happens at runtime
-    // once the initializer making it is folded away -- refused, and at the address rather than
-    // the name, so a pointer to a global is refused the same way.
+    // Whether a write may land on [addr, addr+n). A global's storage is what the program starts
+    // with, so a write to it here would be a startup effect that never happens at runtime once
+    // the initializer making it is folded away. It is refused by address rather than by name, so
+    // a write through a pointer to a global is refused the same way.
     writable &self addr:long n:long -> bool {
         if (addr >= LIT_BASE && addr < HEAP_BASE) { self.stop(stringOf("a write to a string literal")); return false; }
         if (!self.inBounds(addr, n)) { self.stop(stringOf("a write outside compile-time memory")); return false; }
         if (addr < self.globalsEnd && !self.committing && !self.macroRun) {
             g: long = self.globalOf(addr);
-            if (g >= 0) { self.stop(format("a write to the global '{}'", nameOf(self.gNames.get(g)))); }
+            if (g >= 0) { self.stop(format("a write to the global `{}`", nameOf(self.gNames.get(g)))); }
             else { self.stop(stringOf("a write to a global")); }
             return false;
         }
@@ -838,10 +848,13 @@ methods Evaluator {
 
     findLocal &self n:Sym -> long {
         base: long = self.frameBase.last();
-        i: long = self.names.len();
+        // This runs for every variable the evaluator reads or writes, so it walks the names as a
+        // slice, where reading an element is a plain load rather than a call to `get`.
+        xs: [Sym] = self.names.asSlice();
+        i: long = xs.len;
         while (i > base) {
             i = i - 1;
-            if (self.names.get(i) == n) { return i; }
+            if (xs[i] == n) { return i; }
         }
         return -1;
     }
@@ -853,6 +866,7 @@ methods Evaluator {
         self.snames.push(d.structName);
         self.arrays.push(d.isArray);
         self.counts.push(d.count);
+        self.aliased.push(false);
         return slot;
     }
     pushFrame &self -> void {
@@ -863,17 +877,17 @@ methods Evaluator {
         base: long = self.frameBase.pop();
         while (self.names.len() > base) {
             self.names.pop(); self.slots.pop(); self.kinds.pop(); self.snames.pop();
-            self.arrays.pop(); self.counts.pop();
+            self.arrays.pop(); self.counts.pop(); self.aliased.pop();
         }
         sp: long = self.frameSp.pop();
         self.mem.truncate(sp);
     }
 
-    // `x = $forpK[$foriK]` at the head of a `for x in xs` whose element is a struct, run before
-    // the ownership pass has made `x` the borrow it will be (`Checker.bmForLoop`): a macro runs
-    // in the checker's rounds, ahead of that pass. `x` is made to stand where the element lies,
-    // which is what the borrow means, so a write through it in `for x in &xs` reaches the
-    // collection and nothing is copied. True when this was that statement.
+    // Handles `x = $forpK[$foriK]` at the head of a `for x in xs` whose element is a struct. A
+    // macro runs during the checker's rounds, before the ownership pass has turned `x` into the
+    // borrow it will become (`Checker.bmForLoop`). So instead of copying, `x` is made to stand
+    // where the element lies, which is what the borrow means: a write through it in
+    // `for x in &xs` reaches the collection. Returns true when this was that statement.
     forElement &self inout a:Ast v:NodeId -> bool {
         e: Expr = a.expr(v);
         if (e.op != Op.Assignment || e.right == NO_NODE) { return false; }
@@ -891,14 +905,186 @@ methods Evaluator {
         addr: long = self.elemAddress(a, e.right);
         if (self.stopped) { return true; }
         self.slots.set(at, addr);
+        self.aliased.set(at, true);
         return true;
+    }
+
+    // A match's binding (`p = e.$Pt$0`), a destructured name (`a = $tupN.$0`), or the hidden local
+    // a match or a destructure reads its subject into (`$matchN = h.f`, `$bmatchN = x`,
+    // `$tupN = self.pair`), stored while a macro runs. Which of these are borrows is decided later
+    // (`Checker.borrowMatches`, and the guard's `promoteCopies` for a value that owns nothing), but
+    // a binding of a value this frame does not own is the value where it lies wherever the code
+    // after it may write through it, and so is a hidden local of such a value. So, as `forElement`
+    // does for a loop's element, the local is made to stand where its value lies instead of being
+    // a copy: a write through it reaches what it was bound from, as it will once compiled. A
+    // binding of a value this frame owns (a local, a by-value parameter) is the copy an owned match
+    // makes, and so is one nothing after it may write through. True when this was such a store.
+    bindBorrow &self inout a:Ast v:NodeId -> bool {
+        e: Expr = a.expr(v);
+        if (e.op != Op.Assignment || e.right == NO_NODE) { return false; }
+        l: Expr = a.expr(e.left);
+        if (l.op != Op.Lvalue || l.kind != Lit.Struct || namedScalar(l.kind, l.structName)) { return false; }
+        n: Sym = NO_SYM;
+        match l.payload { Name(x) { n = x; } _ { return false; } }
+        r: Expr = a.expr(e.right);
+        s: str = nameOf(n);
+        addr: long = 0;
+        if (strStartsWith(s, "$match") || strStartsWith(s, "$bmatch") || strStartsWith(s, "$tup")) {
+            if ((r.op == Op.FunctionCall || r.op == Op.MethodCall) && r.kind == Lit.Ref) {
+                // A borrow a call returned (`v.at(i)`): the local stands where it points.
+                at: long = self.findLocal(n);
+                if (at < 0) { return false; }
+                addr = self.eval(a, e.right).bits;
+                if (self.stopped) { return true; }
+                self.slots.set(at, addr);
+                self.aliased.set(at, true);
+                return true;
+            }
+            // Any other call's result is the match's own value, and a literal the destructure's.
+            if (r.op != Op.Lvalue && r.op != Op.FieldAccess && r.op != Op.ArrayIndex) { return false; }
+            if (!strStartsWith(s, "$bmatch") && !self.lentPlace(a, e.right)) { return false; }
+        } else {
+            // A payload slot (`$Pt$0`), or an element (`$0`) of a destructure's hidden local: the
+            // parser writes these, and only for a binding.
+            if (r.op != Op.FieldAccess) { return false; }
+            f: FieldNode = a.fields.get(0);
+            match r.payload { Field(i) { f = a.fields.get(i); } _ { return false; } }
+            if (!strStartsWith(nameOf(f.name), "$")) { return false; }
+            if (isTupleField(f.name)) {
+                b: Expr = a.expr(f.base);
+                if (b.op != Op.Lvalue) { return false; }
+                match b.payload { Name(x) { if (!strStartsWith(nameOf(x), "$tup")) { return false; } } _ { return false; } }
+            }
+            if (!self.lentPlace(a, f.base)) { return false; }
+            if (!gReg.needsDrop(l.structName) && !self.mayWriteAfter(a, v, n)) { return false; }
+        }
+        at: long = self.findLocal(n);
+        if (at < 0) { return false; }
+        addr = self.place(a, e.right);
+        if (self.stopped) { return true; }
+        self.slots.set(at, addr);
+        self.aliased.set(at, true);
+        return true;
+    }
+
+    // Whether the place `id` names lies outside what this frame owns: in a borrow (a `Ref`
+    // parameter or local), in a local that stands for another value (`aliased`), in a global, in
+    // what a call's borrow or a pointer reaches.
+    lentPlace &self inout a:Ast id:NodeId -> bool {
+        cur: NodeId = id;
+        while (cur != NO_NODE) {
+            e: Expr = a.expr(cur);
+            if (e.op == Op.Lvalue) {
+                match e.payload {
+                    Name(x) {
+                        at: long = self.findLocal(x);
+                        if (at < 0) { return true; }
+                        return self.kinds.get(at) == Lit.Ref || self.aliased.get(at);
+                    }
+                    _ { }
+                }
+                return false;
+            }
+            if (e.op == Op.FunctionCall || e.op == Op.MethodCall) {
+                return e.kind == Lit.Ref || e.kind == Lit.Ptr || e.kind == Lit.Slice;
+            }
+            if (e.op == Op.Deref) { return true; }
+            match e.payload {
+                Field(f) { cur = a.fields.get(f).base; }
+                Index(i) {
+                    ix: IndexNode = a.indexes.get(i);
+                    if (ix.base == NO_NODE) {
+                        at: long = self.findLocal(ix.name);
+                        if (at < 0) { return true; }
+                        return self.kinds.get(at) == Lit.Ref || self.aliased.get(at);
+                    }
+                    cur = ix.base;
+                }
+                Sub(v) { cur = v; }
+                _ { return false; }
+            }
+        }
+        return false;
+    }
+
+    // Whether the statements after store `v` (in the block `execBlock` is running) may write through
+    // local `n`: a field of it assigned, it lent with `&`, it or a part of it handed to any call, a
+    // `with` on it, a match on it, or a hidden local read out of it. Read off the tree once per store.
+    // Wider than what the guard will decide (a call that only reads counts), which is the side of a
+    // borrow: one only read reads the same where it lies, and nothing in the code after it writes
+    // the value it lies in, or the binding would be refused for it.
+    mayWriteAfter &self inout a:Ast v:NodeId n:Sym -> bool {
+        key: long = v as long;
+        hit: Option<bool> = self.writeAfter.find(key);
+        match hit { Some(w) { return w; } None { } }
+        w: bool = false;
+        if (self.curBlock >= 0) {
+            for k in self.curAt + 1..a.blockLen(self.curBlock) {
+                if (self.stmtWrites(a, a.stmtAt(self.curBlock, k), n)) { w = true; break; }
+            }
+        }
+        self.writeAfter.put(key, w);
+        return w;
+    }
+    stmtWrites &self inout a:Ast st:Stmt n:Sym -> bool {
+        if (st.kind == StmtKind.Match && a.matches.get(st.at).scrutinee == n) { return true; }
+        if (st.kind == StmtKind.With && a.withs.get(st.at).name == n) { return true; }
+        exprs: Vec<NodeId> = stmtExprs(a, st);
+        for x in exprs { if (self.exprWrites(a, x, n)) { return true; } }
+        kids: Vec<long> = childBlocks(a, st);
+        for b in kids {
+            if (b < 0) { continue; }
+            for k in 0..a.blockLen(b) { if (self.stmtWrites(a, a.stmtAt(b, k), n)) { return true; } }
+        }
+        return false;
+    }
+    exprWrites &self inout a:Ast id:NodeId n:Sym -> bool {
+        if (id == NO_NODE) { return false; }
+        e: Expr = a.expr(id);
+        if (e.op == Op.Assignment && rootedAt(a, e.left, n)) { return true; }
+        if (e.op == Op.Assignment && rootedAt(a, e.right, n)) {
+            // A hidden local read out of it: a match or a destructure, whose names may write it.
+            match a.expr(e.left).payload {
+                Name(x) {
+                    s: str = nameOf(x);
+                    if (strStartsWith(s, "$match") || strStartsWith(s, "$bmatch") || strStartsWith(s, "$tup")) { return true; }
+                }
+                _ { }
+            }
+        }
+        if (e.op == Op.AddressOf && rootedAt(a, id, n)) { return true; }
+        if (self.exprWrites(a, e.left, n) || self.exprWrites(a, e.right, n)) { return true; }
+        match e.payload {
+            Sub(x)   { return self.exprWrites(a, x, n); }
+            Field(f) { return self.exprWrites(a, a.fields.get(f).base, n); }
+            Index(i) {
+                ix: IndexNode = a.indexes.get(i);
+                return self.exprWrites(a, ix.base, n) || self.exprWrites(a, ix.index, n);
+            }
+            Call(c) {
+                cn: CallNode = a.calls.get(c);
+                if (rootedAt(a, cn.receiver, n)) { return true; }
+                for k in 0..cn.argCount {
+                    arg: NodeId = a.argAt(cn, k);
+                    if (rootedAt(a, arg, n) || self.exprWrites(a, arg, n)) { return true; }
+                }
+                return self.exprWrites(a, cn.receiver, n);
+            }
+            Lit(l) {
+                ln: LitNode = a.lits.get(l);
+                for k in 0..ln.initCount { if (self.exprWrites(a, a.inits.get(ln.firstInit + k).value, n)) { return true; } }
+                return self.exprWrites(a, ln.rest, n);
+            }
+            _ { }
+        }
+        return false;
     }
 
     // ─── places ──────────────────────────────────────────────────────────────
 
-    // Where the value an expression denotes lives. A local is its slot -- a borrow's slot holds
-    // the address, and `baseAddress` is what follows it; a field or element is an offset from
-    // its base; a temporary is wherever it was just built.
+    // Where the value an expression denotes lives. A local is its slot (a borrow's slot holds the
+    // address, and `baseAddress` is what follows it). A field or element is an offset from its
+    // base, and a temporary is wherever it was just built.
     place &self inout a:Ast id:NodeId -> long {
         if (self.stopped) { return 0; }
         e: Expr = a.expr(id);
@@ -947,20 +1133,20 @@ methods Evaluator {
             if (nameOf(field) == "ptr") { return 0; }
             return 8;
         }
-        // Asked of every field access a loop makes: the answer for (the base's type, the field) is
-        // kept for the rest of this evaluation (layouts settle between the checker's rounds, so not
-        // past it). A pointer's type names its pointee mangled, a name of its own, so the key
-        // tells the two apart.
+        // Every field access a loop makes asks this, so the offset for (the base's type, the
+        // field) is kept for the rest of this evaluation. Not longer, because layouts settle
+        // between the checker's rounds. A pointer's type names its pointee in mangled form, which
+        // is a name of its own, so the key keeps a pointer and its pointee apart.
         key: long = ((b.structName as long) << 32) | (field as long);
         hit: Option<long> = self.offsets.find(key);
         match hit { Some(o) { return o; } None { } }
         sname: Sym = b.structName;
         if (b.kind == Lit.Ptr && sname != NO_SYM) { sname = unmangledType(nameOf(sname)).name; }
         si: long = gReg.findStructSym(sname);
-        if (si < 0) { self.stop(format("a field of {}, which it cannot lay out", nameOf(sname))); return 0; }
+        if (si < 0) { self.stop(format("a field of `{}`, which it cannot lay out", nameOf(sname))); return 0; }
         d: StructDef = gReg.structDef(si);
         fi: long = gReg.findFieldSym(d, field);
-        if (fi < 0) { self.stop(format("a field '{}' that {} does not have", nameOf(field), nameOf(sname))); return 0; }
+        if (fi < 0) { self.stop(format("a field `{}` that `{}` does not have", nameOf(field), nameOf(sname))); return 0; }
         off: long = gReg.fieldAt(d, fi).offset;
         self.offsets.put(key, off);
         return off;
@@ -1006,15 +1192,16 @@ methods Evaluator {
             if (i < 0 || i >= self.counts.get(at)) { self.stop(stringOf("an index out of bounds")); return 0; }
             return self.slots.get(at) + i * w;
         }
-        gi: long = gReg.findGlobal(nameOf(ix.name));
-        if (gi < 0) { self.stop(format("an index into '{}', which it does not hold", nameOf(ix.name))); return 0; }
+        gi: long = gReg.findGlobalSym(ix.name);
+        if (gi < 0) { self.stop(format("an index into `{}`, which it does not hold", nameOf(ix.name))); return 0; }
         g: GlobalDef = gReg.globalDef(gi);
         if (i < 0 || i >= g.count) { self.stop(stringOf("an index out of bounds")); return 0; }
         return self.globalPlace(a, ix.name) + i * w;
     }
-    // `x[..]`, `x[lo..hi]`: a fresh {ptr, len} over part of the base -- a `str` or slice's own
-    // pair, an array's storage, a raw pointer's target (which has no length of its own, so both
-    // bounds must be written). Where the parser left a bound out, it is 0 or the base's length.
+    // `x[..]` and `x[lo..hi]`: a fresh {ptr, len} pair over part of the base, which is a `str`'s
+    // or a slice's own pair, an array's storage, or a raw pointer's target. A raw pointer has no
+    // length of its own, so both bounds must be written. A bound the parser left out is 0 or the
+    // base's length.
     sliceOf &self inout a:Ast ix:IndexNode -> long {
         base: NodeId = ix.base;
         ptr: long = 0;
@@ -1026,8 +1213,8 @@ methods Evaluator {
                 ptr = self.slots.get(at); len = self.counts.get(at);
                 w = typeBytes(self.kinds.get(at), self.snames.get(at));
             } else {
-                gi: long = gReg.findGlobal(nameOf(ix.name));
-                if (gi < 0) { self.stop(format("a slice of '{}', which it does not hold", nameOf(ix.name))); return 0; }
+                gi: long = gReg.findGlobalSym(ix.name);
+                if (gi < 0) { self.stop(format("a slice of `{}`, which it does not hold", nameOf(ix.name))); return 0; }
                 g: GlobalDef = gReg.globalDef(gi);
                 ptr = self.globalPlace(a, ix.name); len = g.count;
                 w = typeBytes(g.kind, g.structName);
@@ -1047,7 +1234,7 @@ methods Evaluator {
                 ptr = self.eval(a, base).bits;
                 if (b.structName != NO_SYM) { t: TypeRef = unmangledType(nameOf(b.structName)); w = typeBytes(t.base, t.name); }
             } else {
-                self.stop(format("a slice of a value of type {}", typeName(b.kind))); return 0;
+                self.stop(format("a slice of a value of type `{}`", typeName(b.kind))); return 0;
             }
         }
         if (self.stopped) { return 0; }
@@ -1064,6 +1251,15 @@ methods Evaluator {
         self.storeBits(pair + 8, 8, hi - lo);
         return pair;
     }
+    // Where the bytes of a whole array lie. An array literal's value is its address, but a named
+    // array or an array field has to be found by its place: its value is what its `kind` (the
+    // element's) reads there, which is the first element rather than an address.
+    arrayFrom &self inout a:Ast id:NodeId v:CtValue -> long {
+        o: Op = a.expr(id).op;
+        if (o == Op.Lvalue || o == Op.FieldAccess) { return self.place(a, id); }
+        return v.bits;
+    }
+
     // How many elements the base of an index has, when its declaration says: an array local, an
     // array global, an array field. -1 when nothing does.
     arrayLength &self inout a:Ast base:NodeId -> long {
@@ -1073,7 +1269,7 @@ methods Evaluator {
                 Name(n) {
                     at: long = self.findLocal(n);
                     if (at >= 0) { if (self.arrays.get(at)) { return self.counts.get(at); } return -1; }
-                    gi: long = gReg.findGlobal(nameOf(n));
+                    gi: long = gReg.findGlobalSym(n);
                     if (gi >= 0) { g: GlobalDef = gReg.globalDef(gi); if (g.isArray) { return g.count; } }
                 }
                 _ { }
@@ -1105,12 +1301,12 @@ methods Evaluator {
         match hit { Some(p) { addr = p; } None { } }
         if (addr < 0) {
             if (self.fnAt.has(n as long)) { return -1; }   // a function's name: a value, not a place
-            self.stop(format("the variable '{}', which is not in scope at compile time", nameOf(n))); return 0;
+            self.stop(format("the variable `{}`, which is not in scope at compile time", nameOf(n))); return 0;
         }
         // A dependency's global: what its own compile folded it to, loaded on first read.
         if (isExternGlobal(n)) {
             if (!self.macroRun && self.poison.mayWrite(n)) {
-                self.stop(format("the global '{}', which an earlier initializer that runs at startup may write", nameOf(n)));
+                self.stop(format("the global `{}`, which an earlier initializer that runs at startup may write", nameOf(n)));
                 return 0;
             }
             if (!self.extReady.has(nameOf(n))) {
@@ -1128,11 +1324,11 @@ methods Evaluator {
                 self.folded.set(g, true);
                 v: CtValue = self.eval(a, d.init);
                 if (self.stopped) {
-                    self.stop(format("the global '{}', whose initializer could not run: it met {}", nameOf(n), self.refusal));
+                    self.stop(format("the global `{}`, whose initializer could not run: it met {}", nameOf(n), self.refusal));
                     return 0;
                 }
                 self.committing = true;
-                if (d.isArray) { self.copy(addr, v.bits, declaredBytesOf(d)); }
+                if (d.isArray) { self.copy(addr, self.arrayFrom(a, d.init, v), declaredBytesOf(d)); }
                 else { self.assignTo(addr, d.kind, d.structName, v); }
                 self.committing = false;
                 if (self.stopped) { return 0; }
@@ -1140,7 +1336,7 @@ methods Evaluator {
             return addr;
         }
         if (self.poison.mayWrite(n)) {
-            self.stop(format("the global '{}', which an earlier initializer that runs at startup may write", nameOf(n)));
+            self.stop(format("the global `{}`, which an earlier initializer that runs at startup may write", nameOf(n)));
             return 0;
         }
         return addr;
@@ -1155,7 +1351,7 @@ methods Evaluator {
         e: Expr = a.expr(id);
         if (e.left != NO_NODE) { return self.evalBinary(a, e); }
         if (e.op == Op.Literal) {
-            if (!ctScalar(e.kind, e.structName)) { return self.stop(format("a literal of type {}", typeName(e.kind))); }
+            if (!ctScalar(e.kind, e.structName)) { return self.stop(format("a literal of type `{}`", typeName(e.kind))); }
             match e.payload {
                 Num(v) { return make(e.kind, e.structName, v); }
                 // A float literal is its spelling, rounded here to the width it was given.
@@ -1204,14 +1400,14 @@ methods Evaluator {
                     if (self.stopped) { return none; }
                     // Between a pointer and an integer a cast is the bits: every address here
                     // is the evaluator's own and the same on every build.
-                    // A word read as a fn value (`slot[0] as fn(long, Write)->void`) is a handle
-                    // only if it was one: what a `methodTable` holds.
+                    // A word cast to a fn value (`slot[0] as fn(long, Write)->void`, reading what
+                    // a `methodTable` holds) keeps its bits, so it is a handle only if it was one.
                     if (e.kind == Lit.Ptr || e.kind == Lit.Ref || e.kind == Lit.Fn) { return CtValue { kind: e.kind, structName: e.structName, bits: x.bits }; }
-                    // `s as [u8]`: one fat pointer read as another -- the same pair, differently typed.
+                    // `s as [u8]` reads one fat pointer as another: the same pair, typed differently.
                     if ((e.kind == Lit.Str || e.kind == Lit.Slice) && (x.kind == Lit.Str || x.kind == Lit.Slice)) {
                         return CtValue { kind: e.kind, structName: e.structName, bits: x.bits };
                     }
-                    if (!ctScalar(e.kind, e.structName)) { return self.stop(format("a cast to {}", typeName(e.kind))); }
+                    if (!ctScalar(e.kind, e.structName)) { return self.stop(format("a cast to `{}`", typeName(e.kind))); }
                     return make(e.kind, e.structName, convertBits(x.bits, storedKind(x.kind, x.structName), storedKind(e.kind, e.structName)));
                 }
                 _ { }
@@ -1264,12 +1460,12 @@ methods Evaluator {
     fnValue &self inout a:Ast n:Sym sig:Sym -> CtValue {
         hit: Option<long> = self.fnAt.find(n as long);
         match hit { Some(i) { return CtValue { kind: Lit.Fn, structName: sig, bits: FN_BASE + i }; } None { } }
-        return self.stop(format("the address of '{}', which is not a function the program holds", nameOf(n)));
+        return self.stop(format("the address of `{}`, which is not a function the program holds", nameOf(n)));
     }
 
-    // `{data, vtable}` for a concrete value seen as a trait object: the data is where the value
-    // is (a borrow's is what it holds), the vtable a handle naming (concrete, trait) -- which is
-    // what dispatch reads and what promotion turns into the table's label.
+    // Builds the `{data, vtable}` pair for a concrete value seen as a trait object. The data is
+    // where the value is (for a borrow, the address it holds), and the vtable is a handle naming
+    // (concrete, trait), which dispatch reads and promotion turns into the table's label.
     traitObject &self inout a:Ast inner:NodeId trait:Sym -> CtValue {
         none: CtValue = CtValue { kind: Lit.Void, structName: NO_SYM, bits: 0 };
         data: long = self.baseAddress(a, inner);
@@ -1297,7 +1493,7 @@ methods Evaluator {
         if (kind == Lit.Struct || kind == Lit.Tuple || kind == Lit.Str || kind == Lit.Slice || kind == Lit.TraitObj) {
             return CtValue { kind: kind, structName: sname, bits: addr };
         }
-        return self.stop(format("a value of type {}", typeName(kind)));
+        return self.stop(format("a value of type `{}`", typeName(kind)));
     }
 
     // Store a value where a place of this type is: a scalar at its width, an aggregate by copy,
@@ -1314,7 +1510,7 @@ methods Evaluator {
             self.copy(addr, v.bits, typeBytes(kind, sname));
             return;
         }
-        self.stop(format("a store of type {}", typeName(kind)));
+        self.stop(format("a store of type `{}`", typeName(kind)));
     }
 
     // `T { f: v, ... }`, `E.V(a, b)`, `(a, b)`: fresh zeroed storage, then each named field. A
@@ -1326,7 +1522,7 @@ methods Evaluator {
         sname: Sym = e.structName;
         if (sname == NO_SYM) { sname = l.typeName; }
         si: long = gReg.findStructSym(sname);
-        if (si < 0) { return self.stop(format("a literal of {}, which it cannot lay out", nameOf(sname))); }
+        if (si < 0) { return self.stop(format("a literal of `{}`, which it cannot lay out", nameOf(sname))); }
         d: StructDef = gReg.structDef(si);
         addr: long = self.alloc(d.size);
         if (l.rest != NO_NODE) {
@@ -1338,11 +1534,11 @@ methods Evaluator {
             in: InitNode = a.inits.get(l.firstInit + k);
             fi: long = k;                      // a tuple names nothing: positional
             if (in.name != NO_SYM) { fi = gReg.findFieldSym(d, in.name); }
-            if (fi < 0 || fi >= d.fieldCount) { return self.stop(format("a field '{}' that {} does not have", nameOf(in.name), nameOf(sname))); }
+            if (fi < 0 || fi >= d.fieldCount) { return self.stop(format("a field `{}` that `{}` does not have", nameOf(in.name), nameOf(sname))); }
             fd: FieldDef = gReg.fieldAt(d, fi);
             v: CtValue = self.eval(a, in.value);
             if (self.stopped) { return none; }
-            if (fd.isArray) { self.copy(addr + fd.offset, v.bits, fd.count * typeBytes(fd.kind, fd.structName)); }
+            if (fd.isArray) { self.copy(addr + fd.offset, self.arrayFrom(a, in.value, v), fd.count * typeBytes(fd.kind, fd.structName)); }
             else { self.assignTo(addr + fd.offset, fd.kind, fd.structName, v); }
             if (self.stopped) { return none; }
         }
@@ -1375,6 +1571,12 @@ methods Evaluator {
             l: Expr = a.expr(e.left);
             addr: long = self.place(a, e.left);
             if (self.stopped) { return none; }
+            // A whole fixed array: every element, from where the source array lies.
+            n: long = self.arrayLength(a, e.left);
+            if (n >= 0) {
+                self.copy(addr, self.arrayFrom(a, e.right, v), n * typeBytes(l.kind, l.structName));
+                return v;
+            }
             self.assignTo(addr, l.kind, l.structName, v);
             if (self.stopped) { return none; }
             return self.valueAt(addr, l.kind, l.structName);
@@ -1421,7 +1623,7 @@ methods Evaluator {
             else if (e.op == Op.GreaterThan) { co = 4; }
             else if (e.op == Op.IsGreaterOrEqual) { co = 5; }
             if (co >= 0) { return make(Lit.Bool, NO_SYM, boolBits(fpCompare(co, l.bits, r.bits, single))); }
-            return self.stop(format("an operator over a {}", typeName(fk)));
+            return self.stop(format("an operator over a value of type `{}`", typeName(fk)));
         }
         // Pointer arithmetic strides by the pointee, as at runtime; the difference of two
         // pointers is an element count.
@@ -1445,13 +1647,15 @@ methods Evaluator {
         if (l.kind == Lit.Ref || l.kind == Lit.Fn) { l = CtValue { kind: Lit.Long, structName: NO_SYM, bits: l.bits }; }
         if (r.kind == Lit.Ref || r.kind == Lit.Fn) { r = CtValue { kind: Lit.Long, structName: NO_SYM, bits: r.bits }; }
         if (!ctScalar(l.kind, l.structName) || !ctScalar(r.kind, r.structName)) {
-            return self.stop(format("an operator over a value of type {}", typeName(l.kind)));
+            return self.stop(format("an operator over a value of type `{}`", typeName(l.kind)));
         }
         // The result's type is the operation's, as the checker decided; a comparison is at the
         // operands' width and signedness and yields a bool.
         t: Lit = storedKind(e.kind, e.structName);
         if (!(isInteger(t) || t == Lit.Bool)) { t = higherPrecedence(storedKind(l.kind, l.structName), storedKind(r.kind, r.structName)); }
-        uns: bool = isUnsignedInt(storedKind(l.kind, l.structName));
+        // A comparison orders at the operands' common type, as the lowerer's `commonKind` does:
+        // a `u8` against a `char` meets at `i16`, so 200 is not below -1.
+        uns: bool = isUnsignedInt(higherPrecedence(storedKind(l.kind, l.structName), storedKind(r.kind, r.structName)));
         if (e.op == Op.Addition)       { return make(t, NO_SYM, l.bits + r.bits); }
         if (e.op == Op.Subtraction)    { return make(t, NO_SYM, l.bits - r.bits); }
         if (e.op == Op.Multiplication) { return make(t, NO_SYM, l.bits * r.bits); }
@@ -1494,9 +1698,9 @@ methods Evaluator {
 
     // ─── calls ───────────────────────────────────────────────────────────────
 
-    // A call: direct by name; through a function value (`SLOT_FNPTR`: the value a variable or
-    // an expression holds); or dispatched through a trait object (its vtable handle names the
-    // impl, the slot the method). Every one ends in `invoke`.
+    // A call is direct by name, through a function value (`SLOT_FNPTR`, the value a variable or
+    // an expression holds), or dispatched through a trait object, whose vtable handle names the
+    // impl while the call's slot names the method. Every one ends in `invoke`.
     call &self inout a:Ast c:CallNode -> CtValue {
         none: CtValue = CtValue { kind: Lit.Void, structName: NO_SYM, bits: 0 };
         if (c.slot == SLOT_FNPTR) {
@@ -1523,17 +1727,17 @@ methods Evaluator {
             concrete: Sym = self.vtConcrete.get(h - VT_BASE);
             trait: Sym = self.vtTrait.get(h - VT_BASE);
             ii: long = gReg.findImplMangled(concrete, trait);
-            if (ii < 0) { return self.stop(format("a dispatch to {} as {}, which nothing implements", nameOf(concrete), nameOf(trait))); }
+            if (ii < 0) { return self.stop(format("a dispatch to `{}` as `{}`, which nothing implements", nameOf(concrete), nameOf(trait))); }
             im: TraitImplDef = gReg.implAt(ii);
-            ti: long = gReg.findTrait(nameOf(im.trait.name));
-            if (ti < 0) { return self.stop(format("a dispatch through {}, a trait it cannot find", nameOf(trait))); }
+            ti: long = gReg.findTraitSym(im.trait.name);
+            if (ti < 0) { return self.stop(format("a dispatch through `{}`, a trait it cannot find", nameOf(trait))); }
             t: TraitDef = gReg.traitDef(ti);
             if (c.slot < 0 || c.slot >= t.methodCount) { return self.stop(stringOf("a dispatch past the vtable's end")); }
             m: Sym = implMethodName(im, gReg.traitMethodAt(t, c.slot).name);
             mh: Option<long> = self.fnAt.find(m as long);
             fi: long = -1;
             match mh { Some(i) { fi = i; } None { } }
-            if (fi < 0) { return self.stop(format("a dispatch to '{}', whose body the compiler does not hold", nameOf(m))); }
+            if (fi < 0) { return self.stop(format("a dispatch to `{}`, whose body the compiler does not hold", nameOf(m))); }
             nodes: Vec<NodeId>;
             for k in 0..c.argCount { nodes.push(a.argAt(c, k)); }
             return self.invokeWithSelf(a, fi, data, nodes);
@@ -1541,7 +1745,7 @@ methods Evaluator {
         hit: Option<long> = self.fnAt.find(c.name as long);
         at: long = -1;
         match hit { Some(i) { at = i; } None { } }
-        if (at < 0) { return self.stop(format("a call to '{}', whose body the compiler does not hold (a syscall, or external)", nameOf(c.name))); }
+        if (at < 0) { return self.stop(format("a call to `{}`, whose body the compiler does not hold (a syscall, or an external function)", nameOf(c.name))); }
         bk: long = builtinOf(a.fns.get(at));
         if (bk != 0) { return self.builtin(a, at, bk, c); }
         nodes: Vec<NodeId>;
@@ -1552,7 +1756,8 @@ methods Evaluator {
 
     // ─── builtins: declarations whose bodies the compiler provides ───────────
     //
-    // Found by the declaration (`builtin name ...;`, its kind on the node), never by a spelling.
+    // A builtin is found by its declaration (`builtin name ...;`, with its kind on the node),
+    // never by how its name is spelled.
     builtin &self inout a:Ast at:long bk:long c:CallNode -> CtValue {
         none: CtValue = CtValue { kind: Lit.Void, structName: NO_SYM, bits: 0 };
         if (!self.tick()) { return none; }
@@ -1579,14 +1784,52 @@ methods Evaluator {
             if (self.stopped) { return none; }
             return CtValue { kind: Lit.Long, structName: NO_SYM, bits: r };
         }
+        // An atomic: the evaluator runs one thread, so it is the plain access it stands for.
+        if (isAtomicBuiltin(bk)) {
+            vals: Vec<long>;
+            for k in 0..c.argCount {
+                v: CtValue = self.eval(a, a.argAt(c, k));
+                if (self.stopped) { return none; }
+                vals.push(v.bits);
+            }
+            op: long = atomicOpOf(bk);
+            k: Lit = Lit.Long;
+            if (op != bk) { k = Lit.Int; }
+            p: long = vals.get(0);
+            if (op == BI_ATOMIC_STORE || op == BI_ATOMIC_STORE_SC) { self.store(p, k, NO_SYM, vals.get(1)); return none; }
+            old: long = self.load(p, k, NO_SYM);
+            if (self.stopped) { return none; }
+            if (op == BI_ATOMIC_SWAP) { self.store(p, k, NO_SYM, vals.get(1)); }
+            if (op == BI_ATOMIC_ADD) { self.store(p, k, NO_SYM, wrapTo(old + vals.get(1), k)); }
+            if (op == BI_ATOMIC_CAS && old == wrapTo(vals.get(1), k)) { self.store(p, k, NO_SYM, vals.get(2)); }
+            if (self.stopped) { return none; }
+            return CtValue { kind: k, structName: NO_SYM, bits: old };
+        }
+        // A block copy, a byte at a time.
+        if (bk == BI_MEMCPY) {
+            vals: Vec<long>;
+            for k in 0..c.argCount {
+                v: CtValue = self.eval(a, a.argAt(c, k));
+                if (self.stopped) { return none; }
+                vals.push(v.bits);
+            }
+            for i in 0..vals.get(2) {
+                b: long = self.load(vals.get(1) + i, Lit.U8, NO_SYM);
+                if (self.stopped) { return none; }
+                self.store(vals.get(0) + i, Lit.U8, NO_SYM, b);
+                if (self.stopped || !self.tick()) { return none; }
+            }
+            return none;
+        }
         return self.stop(format("a builtin it does not know ({})", bk));
     }
 
-    // The operating system compile-time code runs on: anonymous memory (`mmap`, `munmap`,
-    // `mremap` over the compile-time heap, a fresh zeroed block each), a write to stderr (kept,
-    // and the error's text if the code then exits), and `exit`/`exit_group`, which end the
-    // evaluation as the program's own decision. Nothing else: a read, a file, a clock, a thread
-    // would make what folds differ between builds, and is refused naming the call.
+    // The operating system that compile-time code runs on. It offers anonymous memory (`mmap`,
+    // `munmap` and `mremap` over the compile-time heap, each mapping a fresh zeroed block),
+    // writes to stderr (kept, and used as the error's text if the code then exits), and
+    // `exit`/`exit_group`, which end the evaluation as the program's own decision. Nothing else:
+    // a read, a file, a clock or a thread would make what folds differ between builds, so any
+    // other call is refused by name.
     ctSyscall &self args:Vec<long> -> long {
         nr: long = args.get(0);
         a1: long = 0; a2: long = 0; a3: long = 0; a4: long = 0; a5: long = 0;
@@ -1597,7 +1840,7 @@ methods Evaluator {
         if (args.len() > 5) { a5 = args.get(5); }
         if (nr == SYS_WRITE) {
             if (a1 == 1) {
-                self.stop(stringOf("a write to stdout (fd 1): compile-time code has no output -- what it writes to stderr (fd 2) becomes the error if it then exits"));
+                self.stop(stringOf("a write to stdout (fd 1): compile-time code has no output, though what it writes to stderr (fd 2) becomes the error if it then exits"));
                 return 0;
             }
             if (a1 != 2) { self.stop(format("a write to file descriptor {}: compile-time code writes only to stderr (fd 2)", a1)); return 0; }
@@ -1607,22 +1850,22 @@ methods Evaluator {
             return a3;
         }
         if (nr == SYS_MMAP) {
-            if ((a4 & MAP_ANONYMOUS) == 0 || a5 != -1) { self.stop(stringOf("an mmap of a file: compile-time code maps anonymous memory only")); return 0; }
-            if ((a4 & MAP_FIXED) != 0) { self.stop(stringOf("an mmap at a fixed address: compile-time memory is the compiler's to place")); return 0; }
+            if ((a4 & MAP_ANONYMOUS) == 0 || a5 != -1) { self.stop(stringOf("an `mmap` of a file: compile-time code may map only anonymous memory")); return 0; }
+            if ((a4 & MAP_FIXED) != 0) { self.stop(stringOf("an `mmap` at a fixed address: compile-time memory is the compiler's to place")); return 0; }
             if (a2 <= 0) { return -22; }
             return self.ctMalloc(a2);
         }
         if (nr == SYS_MUNMAP) {
             if (!self.mappingAt(a1)) {
-                self.stop(stringOf("an munmap of memory mmap did not hand out (compile-time code unmaps a whole mapping, from its start)"));
+                self.stop(stringOf("an `munmap` of memory `mmap` did not hand out (compile-time code unmaps a whole mapping, from its start)"));
                 return 0;
             }
             self.ctFree(a1);
             return 0;
         }
         if (nr == SYS_MREMAP) {
-            if (!self.mappingAt(a1)) { self.stop(stringOf("an mremap of memory mmap did not hand out")); return 0; }
-            if ((a4 & MREMAP_FIXED) != 0) { self.stop(stringOf("an mremap to a fixed address: compile-time memory is the compiler's to place")); return 0; }
+            if (!self.mappingAt(a1)) { self.stop(stringOf("an `mremap` of memory `mmap` did not hand out")); return 0; }
+            if ((a4 & MREMAP_FIXED) != 0) { self.stop(stringOf("an `mremap` to a fixed address: compile-time memory is the compiler's to place")); return 0; }
             have: long = self.blocks.get(self.blockOf(a1)).size;
             if (a3 <= have) { return a1; }
             if ((a4 & MREMAP_MAYMOVE) == 0) { return -12; }
@@ -1635,7 +1878,10 @@ methods Evaluator {
             return q;
         }
         if (nr == SYS_EXIT || nr == SYS_EXIT_GROUP) { self.ctExit(a1); return 0; }
-        self.stop(format("the syscall {}{}: compile-time code may map memory, write to stderr and exit, and nothing else -- anything more would make what it computes differ between builds",
+        // The rule goes on a note line of its own. A refusal always ends the first line of the
+        // message it is spliced into, so the note lands under the error where it belongs.
+        self.stop(format("the syscall {}{}
+note: compile-time code may only map memory, write to stderr and exit, so that every build computes the same result",
                          nr, syscallNote(nr)));
         return 0;
     }
@@ -1645,9 +1891,10 @@ methods Evaluator {
         return b >= 0 && self.blocks.get(b).start == p && self.blocks.get(b).live;
     }
 
-    // The code ended itself: the evaluation stops, and its error is what it wrote to stderr
-    // (a `panic`'s "panic: ..." line, a derive's `refuse` reason), or its status when it wrote
-    // nothing. `refused`: the code's own decision, not a limit the evaluator met.
+    // The code ended itself. The evaluation stops, and its error is what the code wrote to
+    // stderr (a `panic`'s "panic: ..." line, a derive's `refuse` reason), or its exit status when
+    // it wrote nothing. `refused` marks this as the code's own decision rather than a limit the
+    // evaluator met.
     ctExit &self status:long -> CtValue {
         text: String;
         bytes: str = "";
@@ -1661,21 +1908,21 @@ methods Evaluator {
         return CtValue { kind: Lit.Void, structName: NO_SYM, bits: 0 };
     }
 
-    // The receiver of a method is its first argument. A struct parameter arrives by value -- a
-    // copy of the caller's bytes into the callee's own slot -- and a borrow (`&self`, `inout`,
-    // a read parameter the checker retyped) as the address, exactly the split the prologue
-    // makes. An aggregate result is built where the caller made room for it, before the
-    // callee's frame goes.
+    // A method's receiver is its first argument. A struct parameter arrives by value, as a copy
+    // of the caller's bytes into the callee's own slot, and a borrow (`&self`, `inout`, or a read
+    // parameter the checker retyped) arrives as the address: exactly the split the prologue
+    // makes. An aggregate result is built where the caller made room for it, before the callee's
+    // frame goes away.
     invoke &self inout a:Ast at:long nodes:Vec<NodeId> -> CtValue {
         none: CtValue = CtValue { kind: Lit.Void, structName: NO_SYM, bits: 0 };
         f: FnNode = a.fns.get(at);
-        if (f.isTemplate) { return self.stop(format("a call to '{}', which is a template", nameOf(f.name))); }
+        if (f.isTemplate) { return self.stop(format("a call to `{}`, which is a template", nameOf(f.name))); }
         // A trailing `...T` takes every remaining argument: they are packed into a slice the way
         // the call builds one on the stack, and the slice is the parameter's value.
         fixed: long = f.argCount;
         if (f.argCount > 0 && a.paramAt(f, f.argCount - 1).isVariadic) { fixed = f.argCount - 1; }
         if (nodes.len() < fixed || (fixed == f.argCount && nodes.len() != fixed)) {
-            return self.stop(format("a call to '{}' with the wrong number of arguments", nameOf(f.name)));
+            return self.stop(format("a call to `{}` with the wrong number of arguments", nameOf(f.name)));
         }
         vals: Vec<CtValue>;
         for k in 0..fixed {
@@ -1708,10 +1955,10 @@ methods Evaluator {
         self.storeBits(pair + 8, 8, n);
         return CtValue { kind: Lit.Slice, structName: p.structName, bits: pair };
     }
-    // A `...any` run, boxed as the lowerer boxes it (`Lowerer.boxAny`), so `format` and its
-    // kin run here unchanged: 24 bytes per argument, {tag, x, y} as `stdlib/fmt.k`'s `AnyBox`
-    // reads them. A `str` is its pointer and length; a value whose type implements `Display`,
-    // or a `Display` object, is its address and a vtable `callDisplay` reads slot 0 of; anything
+    // Boxes a `...any` run the way the lowerer does (`Lowerer.boxAny`), so `format` and its kin
+    // run here unchanged. Each argument takes 24 bytes, {tag, x, y}, as `stdlib/fmt.k`'s `AnyBox`
+    // reads them. A `str` is its pointer and length; a value whose type implements `Display`, or
+    // a `Display` object, is its address and a vtable whose slot 0 `callDisplay` reads; anything
     // else is its value, tagged by width and signedness.
     packAny &self inout a:Ast p:VarDeclNode nodes:Vec<NodeId> from:long -> CtValue {
         none: CtValue = CtValue { kind: Lit.Void, structName: NO_SYM, bits: 0 };
@@ -1775,16 +2022,16 @@ methods Evaluator {
         return CtValue { kind: Lit.Slice, structName: p.structName, bits: pair };
     }
 
-    // A vtable as memory, for code that reads one as words (`fmt.k`'s `callDisplay` loads slot 0
-    // and calls it): each method's handle in the trait's order. A trait object's own vtable is a
-    // handle that dispatch decodes (`vtableHandle`), which code reading words cannot follow. In
-    // the caller's frame, which the call it is built for runs inside.
+    // Lays out a vtable in memory for code that reads one as words (`fmt.k`'s `callDisplay` loads
+    // slot 0 and calls it): each method's handle, in the trait's order. A trait object's own
+    // vtable is a handle that dispatch decodes (`vtableHandle`), which code reading words cannot
+    // follow. The table goes in the caller's frame, since the call it is built for runs inside it.
     methodTable &self concrete:Sym trait:Sym -> long {
         ii: long = gReg.findImplMangled(concrete, trait);
-        if (ii < 0) { self.stop(format("{} as {}, which nothing implements", nameOf(concrete), nameOf(trait))); return 0; }
+        if (ii < 0) { self.stop(format("`{}` as `{}`, which nothing implements", nameOf(concrete), nameOf(trait))); return 0; }
         im: TraitImplDef = gReg.implAt(ii);
-        ti: long = gReg.findTrait(nameOf(im.trait.name));
-        if (ti < 0) { self.stop(format("a trait it cannot find, {}", nameOf(trait))); return 0; }
+        ti: long = gReg.findTraitSym(im.trait.name);
+        if (ti < 0) { self.stop(format("a trait it cannot find, `{}`", nameOf(trait))); return 0; }
         t: TraitDef = gReg.traitDef(ti);
         tab: long = self.alloc(8 * t.methodCount + 8);
         for k in 0..t.methodCount {
@@ -1800,7 +2047,7 @@ methods Evaluator {
     invokeWithSelf &self inout a:Ast at:long selfAddr:long nodes:Vec<NodeId> -> CtValue {
         none: CtValue = CtValue { kind: Lit.Void, structName: NO_SYM, bits: 0 };
         f: FnNode = a.fns.get(at);
-        if (f.argCount != nodes.len() + 1) { return self.stop(format("a dispatch to '{}' with the wrong number of arguments", nameOf(f.name))); }
+        if (f.argCount != nodes.len() + 1) { return self.stop(format("a dispatch to `{}` with the wrong number of arguments", nameOf(f.name))); }
         vals: Vec<CtValue>;
         p0: VarDeclNode = a.paramAt(f, 0);
         vals.push(CtValue { kind: Lit.Ref, structName: p0.structName, bits: selfAddr });
@@ -1810,16 +2057,18 @@ methods Evaluator {
         }
         return self.run(a, at, vals);
     }
-    // An argument in the caller's frame: an address for a borrow of an aggregate or for an array,
-    // a value for anything else -- an aggregate's value being its address, copied once the frame
-    // exists. A borrow of a scalar is not an address; see `refToScalar`.
+    // Evaluates an argument in the caller's frame: an address for a borrow of an aggregate or
+    // for an array, and a value for anything else. An aggregate's value is its address, and it is
+    // copied once the callee's frame exists. A borrow of a scalar is not an address; see
+    // `refToScalar`.
     argValue &self inout a:Ast p:VarDeclNode n:NodeId -> CtValue {
         none: CtValue = CtValue { kind: Lit.Void, structName: NO_SYM, bits: 0 };
-        if (p.isVariadic) { return self.stop(format("a call passing a variadic ('{}')", nameOf(p.name))); }
+        if (p.isVariadic) { return self.stop(format("a call that passes a variadic (`{}`)", nameOf(p.name))); }
         if (p.kind == Lit.Ref && !p.isArray && !refToScalar(p.structName)) {
-            // An address handed over as a number or a raw pointer -- a call through a fn value
-            // typed `fn(long, ...)`, as `fmt.k`'s `callDisplay` makes to a `display &self` -- is
-            // the address the borrow is: the register holds it, so here the value does.
+            // An address handed over as a number or a raw pointer is the address the borrow is.
+            // That happens in a call through a fn value typed `fn(long, ...)`, which is how
+            // `fmt.k`'s `callDisplay` calls a `display &self`: at runtime the register holds the
+            // address, so here the value does.
             ak: Lit = a.expr(n).kind;
             if (ak == Lit.Long || ak == Lit.Ptr || ak == Lit.U64) {
                 return CtValue { kind: Lit.Ref, structName: p.structName, bits: self.eval(a, n).bits };
@@ -1835,7 +2084,7 @@ methods Evaluator {
         // A dependency's body is only typed if this compile checked it for exactly this; one the
         // walk from the macros and initializers did not reach is a body nobody vouched for.
         if (isUnchecked(at)) {
-            return self.stop(format("a call to '{}', a dependency's function this package did not prepare to run at compile time", nameOf(f.name)));
+            return self.stop(format("a call to `{}`, a dependency's function this package did not prepare to run at compile time", nameOf(f.name)));
         }
         ret: long = 0;
         aggRet: bool = f.returnKind != Lit.Void && f.returnKind != Lit.Ref && f.returnKind != Lit.Ptr
@@ -1871,7 +2120,7 @@ methods Evaluator {
                     result = CtValue { kind: f.returnKind, structName: f.returnStruct, bits: self.retVal.bits };
                 }
             } else if (f.returnKind != Lit.Void) {
-                self.stop(format("'{}' fell off its end without returning", nameOf(f.name)));
+                self.stop(format("the end of `{}` without a `return`", nameOf(f.name)));
             }
         }
         self.popFrame();
@@ -1883,11 +2132,14 @@ methods Evaluator {
 
     // Runs a block's statements until one leaves it: a return, a break, a continue, a refusal.
     execBlock &self inout a:Ast b:long -> void {
-        // Nothing to run: the body is in another object, and a fold that reaches one cannot
-        // finish. `Evaluator::call` refuses the call before it gets here; this is the backstop.
+        // There is nothing to run when the body is in another object, and a fold that reaches
+        // one cannot finish. `Evaluator::call` refuses such a call before it gets here; this is
+        // only the backstop.
         if (b < 0) { return; }
         n: long = a.blockLen(b);
         for k in 0..n {
+            self.curBlock = b;
+            self.curAt = k;
             self.exec(a, a.stmtAt(b, k));
             if (self.stopped || self.returning || self.breaking || self.continuing) { return; }
         }
@@ -1898,19 +2150,20 @@ methods Evaluator {
         if (st.kind == StmtKind.VarDecl) {
             d: VarDeclNode = a.decls.get(st.at);
             if (d.init == NO_NODE) { self.declare(d); return; }
-            // The initializer first, in the frame as it is: a struct literal or a call builds
-            // a temporary, and the new local is a copy of it -- which is the one place a
-            // declaration and an assignment differ, and only in which storage is fresh.
+            // The initializer runs first, in the frame as it is. A struct literal or a call
+            // builds a temporary, and the new local is a copy of it. That is the only way a
+            // declaration differs from an assignment: which storage is fresh.
             v: CtValue = self.eval(a, d.init);
             if (self.stopped) { return; }
             slot: long = self.declare(d);
-            if (d.isArray) { self.copy(slot, v.bits, declaredBytesOf(d)); }
+            if (d.isArray) { self.copy(slot, self.arrayFrom(a, d.init, v), declaredBytesOf(d)); }
             else { self.assignTo(slot, d.kind, d.structName, v); }
             return;
         }
         if (st.kind == StmtKind.Expr || st.kind == StmtKind.Call) {
             v: NodeId = a.exprStmts.get(st.at).value;
             if (self.forElement(a, v)) { return; }
+            if (self.macroRun && self.bindBorrow(a, v)) { return; }
             self.eval(a, v);
             return;
         }
@@ -1979,6 +2232,7 @@ methods Evaluator {
         }
         if (st.kind == StmtKind.Asm)   { self.stop(stringOf("an `asm` block")); return; }
         if (st.kind == StmtKind.With)  { self.stop(stringOf("a `with` block")); return; }
+        if (st.kind == StmtKind.Recover) { self.stop(stringOf("a `recover` statement")); return; }
         self.stop(stringOf("a statement it does not run yet"));
     }
 }
@@ -1993,7 +2247,7 @@ local strideOf n:Sym -> long {
 }
 
 pub isVarGlobal n:Sym -> bool {
-    gi: long = gReg.findGlobal(nameOf(n));
+    gi: long = gReg.findGlobalSym(n);
     if (gi < 0) { return true; }
     return gReg.globalDef(gi).isVar;
 }
@@ -2045,8 +2299,8 @@ pub convertBits v:long from:Lit to:Lit -> long {
     return v;
 }
 
-// `v` at the width and signedness of `t` -- sign- or zero-extended from `t`'s own bytes, which
-// is exactly what a load of that type does on the machine. A bool is 0 or 1.
+// `v` at the width and signedness of `t`: sign- or zero-extended from `t`'s own bytes, exactly as
+// a load of that type does on the machine. A bool is 0 or 1.
 pub wrapTo v:long t:Lit -> long {
     if (t == Lit.Bool) { return boolBits(v != 0); }
     size: long = typeInfo(t).size;
@@ -2061,8 +2315,8 @@ pub wrapTo v:long t:Lit -> long {
 local make k:Lit n:Sym v:long -> CtValue { return CtValue { kind: k, structName: n, bits: wrapTo(v, storedKind(k, n)) }; }
 local boolBits b:bool -> long { if (b) { return 1; } return 0; }
 
-// The storage a declaration needs -- `declaredBytes` as the lowerer computes it, for the same
-// declaration, so a compile-time slot is exactly the size of the runtime one.
+// The storage a declaration needs. This is `declaredBytes` as the lowerer computes it for the
+// same declaration, so a compile-time slot is exactly the size of the runtime one.
 pub declaredBytesOf d:VarDeclNode -> long {
     unit: long = typeBytes(d.kind, d.structName);
     if (d.isArray) { return unit * d.count; }
@@ -2074,13 +2328,13 @@ pub declaredBytesOf d:VarDeclNode -> long {
 // ─── effects ─────────────────────────────────────────────────────────────────
 //
 // Which globals a piece of runtime code may write. A global's initializer that did not fold
-// still runs at startup, before the initializers after it; so a later one may be folded only if
+// still runs at startup, before the initializers after it, so a later one may be folded only if
 // nothing that earlier code can reach writes the globals it reads. That is a question about the
-// call graph, answered here: each function's own effects are scanned once -- the globals it
-// assigns, lends with `&`, or calls a method on, and whether it does anything opaque (a store
-// through a pointer, a call with no known target), which counts as writing everything -- and
-// the set grows monotonically as initializers are added, so every function is visited at most
-// once over the whole fold.
+// call graph, and it is answered here. Each function's own effects are scanned once: the globals
+// it assigns, lends with `&` or calls a method on, and whether it does anything opaque (a store
+// through a pointer, a call with no known target), which counts as writing everything. The set
+// only grows as initializers are added, so every function is visited at most once over the
+// whole fold.
 
 methods Effects for Default {
     new -> Effects {
@@ -2166,7 +2420,7 @@ methods Effects {
             e: Expr = a.expr(at);
             if (e.op == Op.Lvalue) {
                 match e.payload {
-                    Name(n) { if (gReg.findGlobal(nameOf(n)) >= 0) { self.mark(n); } }
+                    Name(n) { if (gReg.findGlobalSym(n) >= 0) { self.mark(n); } }
                     _ { }
                 }
                 return;
@@ -2178,7 +2432,7 @@ methods Effects {
                 Index(i) {
                     ix: IndexNode = a.indexes.get(i);
                     next = ix.base;
-                    if (next == NO_NODE && gReg.findGlobal(nameOf(ix.name)) >= 0) { self.mark(ix.name); }
+                    if (next == NO_NODE && gReg.findGlobalSym(ix.name) >= 0) { self.mark(ix.name); }
                 }
                 Sub(v) { next = v; }
                 _ { }
@@ -2191,8 +2445,8 @@ methods Effects {
         hit: Option<long> = self.fnAt.find(name as long);
         at: long = -1;
         match hit { Some(i) { at = i; } None { } }
-        // No body to read: a syscall wrapper's `asm` is inside one it does have, so a name the
-        // program does not define is something outside it entirely -- assume the worst.
+        // No body to read. A syscall wrapper's `asm` sits inside a body the program does have, so
+        // a name the program does not define is something outside it entirely: assume the worst.
         if (at < 0) { self.all = true; return; }
         // A dependency's body that was not checked here: its writes are unknown, so assume all.
         if (isUnchecked(at)) { self.all = true; return; }
@@ -2225,7 +2479,7 @@ methods Effects {
             }
             return;
         }
-        if (st.kind == StmtKind.While) {
+        if (st.kind == StmtKind.While || st.kind == StmtKind.Recover) {
             w: WhileNode = a.whiles.get(st.at);
             self.addExpr(a, w.cond);
             self.addBlock(a, w.body);
@@ -2243,23 +2497,23 @@ methods Effects {
         }
         if (st.kind == StmtKind.With) {
             w: WithNode = a.withs.get(st.at);
-            if (gReg.findGlobal(nameOf(w.name)) >= 0) { self.mark(w.name); }
+            if (gReg.findGlobalSym(w.name) >= 0) { self.mark(w.name); }
             self.addBlock(a, w.body);
             return;
         }
         if (st.kind == StmtKind.Destructure) { self.addExpr(a, a.destructures.get(st.at).value); return; }
         if (st.kind == StmtKind.Break || st.kind == StmtKind.Continue || st.kind == StmtKind.StructDecl
             || st.kind == StmtKind.FunctionDef) { return; }
-        // An `asm` block reaches a program global two ways only: an `out` naming it, or a line
-        // of text spelling its `gbl_` symbol. Its `in` expressions are ordinary expressions --
-        // `&g` among them counts as a write of `g` like any other borrow -- and whatever else the
+        // An `asm` block reaches a program global in only two ways: an `out` naming it, or a line
+        // of text spelling its `gbl_` symbol. Its `in` expressions are ordinary expressions (so a
+        // `&g` among them counts as a write of `g`, like any other borrow), and whatever else the
         // text touches (the allocator's own labels, a syscall) is not a program global.
         if (st.kind == StmtKind.Asm) {
             n: AsmNode = a.asms.get(st.at);
             for k in 0..n.pieceCount {
                 pc: AsmPiece = a.asmPieces.get(n.firstPiece + k);
                 if (pc.kind == AsmKind.In) { self.addExpr(a, pc.value); }
-                if (pc.kind == AsmKind.Out && gReg.findGlobal(nameOf(pc.name)) >= 0) { self.mark(pc.name); }
+                if (pc.kind == AsmKind.Out && gReg.findGlobalSym(pc.name) >= 0) { self.mark(pc.name); }
                 if (pc.kind == AsmKind.Text && strContains(nameOf(pc.text), "gbl_")) { self.all = true; }
             }
             return;
@@ -2270,27 +2524,27 @@ methods Effects {
 
 // ─── macros ──────────────────────────────────────────────────────────────────
 //
-// A macro is a function the compiler runs while checking. The checker hands over the callee
-// and its arguments -- each already a value in this evaluator's memory: a `Node` built by
-// quoting the caller's argument tree, or a constant -- and takes back the result: a scalar,
-// or a `Node` that `spliceExpr`/`spliceStmt` turn back into syntax. That deserialization walks
-// the `Node` value by `stdlib::ast`'s own layout, exactly as promotion walks any struct, so the
-// evaluator knows nothing about the tree's shape beyond the variant names.
+// A macro is a function the compiler runs while checking. The checker hands over the callee and
+// its arguments, each already a value in this evaluator's memory (a `Node` built by quoting the
+// caller's argument tree, or a constant), and takes back the result: a scalar, or a `Node` that
+// `spliceExpr`/`spliceStmt` turn back into syntax. Turning it back walks the `Node` value by
+// `stdlib::ast`'s own layout, exactly as promotion walks any struct, so the evaluator knows
+// nothing about the tree's shape beyond the variant names.
 //
-// Hygiene: a name the spliced code declares (`Let`) is given a fresh, unspellable name, and
-// every mention of it inside the same splice follows; every other name resolves where the
-// splice lands, which is how a quoted `panic(...)` finds `panic` and a quoted argument finds
+// Hygiene: a name the spliced code declares (`Let`) is given a fresh name that no source can
+// spell, and every mention of it inside the same splice follows. Every other name resolves where
+// the splice lands, which is how a quoted `panic(...)` finds `panic` and a quoted argument finds
 // the caller's variable.
 
 methods Evaluator {
-    // Run function `at` on `vals`, with no globals in reach: a macro's inputs are its arguments.
+    // Runs function `at` on `vals` as a macro, over the globals snapshot `beginMacro` laid out.
     // Frames from any previous run are gone; the literal segment and the heap persist, and a
     // `Node` the caller built for an argument stays where it is.
     runMacro &self inout a:Ast page:long at:long vals:Vec<CtValue> -> CtValue {
         self.indexFunctions(a, page);
         if (self.mem.len() == 0) { self.alloc(16); self.globalsEnd = self.mem.len(); }
         self.names.clear(); self.slots.clear(); self.kinds.clear(); self.snames.clear();
-        self.arrays.clear(); self.counts.clear();
+        self.arrays.clear(); self.counts.clear(); self.aliased.clear();
         self.frameBase.clear(); self.frameBase.push(0);
         self.frameSp.clear(); self.frameSp.push(self.mem.len());
         self.steps = 0;
@@ -2305,15 +2559,15 @@ methods Evaluator {
         return self.run(a, at, vals);
     }
 
-    // Before a macro's arguments are built: the globals as a macro sees them. A snapshot -- one
-    // with a literal initializer holds it, any other is zero -- that a write lands in and that
-    // goes with the run, which is what a table filled on first use wants, and what keeps a
-    // macro's write to a global from being a startup effect the program never sees. Reading a
-    // global whose initializer is not a literal is refused: it has not run yet.
+    // Lays out the globals as a macro sees them, before its arguments are built. This is a
+    // snapshot: a global with a literal initializer holds its value, and any other is zero until
+    // something reads it. A macro's writes land in the snapshot and go away with the run, which
+    // is what a table filled on first use wants, and which keeps a macro's write to a global from
+    // becoming a startup effect the program never sees.
     //
-    // The same for every run on one page: built once, and copied (an initializer that was not a
-    // literal when it was built is evaluated on first read from whatever it is now, which is what
-    // laying it out again would have found).
+    // The snapshot is the same for every run on one page, so it is built once and copied. An
+    // initializer that was not a literal when it was built is evaluated on first read
+    // (`globalPlace`) from whatever it is now, which is what laying it out again would have found.
     beginMacro &self inout a:Ast page:long -> void {
         self.indexFunctions(a, page);
         self.extReady.clear();
@@ -2359,13 +2613,13 @@ methods Evaluator {
         self.macroPage = page;
         self.macroPageLen = a.blockLen(page);
     }
-    // One expression on its own -- a macro argument -- in a fresh frame that is never popped, so
-    // the value it built (a `Node` on the stack) stays for the macro to read.
+    // Evaluates one expression on its own (a macro argument) in a fresh frame that is never
+    // popped, so the value it built (a `Node` on the stack) stays for the macro to read.
     evalExpr &self inout a:Ast page:long id:NodeId -> CtValue {
         self.indexFunctions(a, page);
         if (self.mem.len() == 0) { self.alloc(16); self.globalsEnd = self.mem.len(); }
         self.names.clear(); self.slots.clear(); self.kinds.clear(); self.snames.clear();
-        self.arrays.clear(); self.counts.clear();
+        self.arrays.clear(); self.counts.clear(); self.aliased.clear();
         self.frameBase.clear(); self.frameBase.push(0);
         self.frameSp.clear(); self.frameSp.push(self.mem.len());
         self.steps = 0;
@@ -2399,22 +2653,22 @@ methods Evaluator {
         ps: Parser = parserOf(keepString(text));
         id: NodeId = ps.parseExpr();
         if (!ps.check(Tok.FileEnd)) {
-            failStr(format("parseExpr: text left over after the expression, at `{}`", tokName(ps.cur.kind)));
+            failStr(format("unexpected `{}` after the expression given to `parseExpr`\nnote: `parseExpr` reads exactly one expression", tokName(ps.cur.kind)));
         }
         return self.nodeValueOf(&ps.ast, id);
     }
 
     // A fresh Node on the compile-time heap, tagged.
     newNode &self variant:str -> long {
-        d: StructDef = gReg.structDef(gReg.findStruct(nameOf(self.nodeSym)));
-        ed: EnumDef = gReg.enumDef(gReg.findEnum(nameOf(self.nodeSym)));
+        d: StructDef = gReg.structDef(gReg.findStructSym(self.nodeSym));
+        ed: EnumDef = gReg.enumDef(gReg.findEnumSym(self.nodeSym));
         addr: long = self.ctMalloc(d.size);
         self.store(addr, ed.backing, NO_SYM, gReg.variantAt(ed, gReg.findVariant(ed, variant)).value);
         return addr;
     }
     // Whether the library's Node declares a variant of this name.
     nodeHas &self variant:str -> bool {
-        ei: long = gReg.findEnum(nameOf(self.nodeSym));
+        ei: long = gReg.findEnumSym(self.nodeSym);
         if (ei < 0) { return false; }
         return gReg.findVariant(gReg.enumDef(ei), variant) >= 0;
     }
@@ -2422,7 +2676,7 @@ methods Evaluator {
     opTag &self owner:str name:str -> long {
         ed: EnumDef = gReg.enumDef(gReg.findEnum(owner));
         vi: long = gReg.findVariant(ed, name);
-        if (vi < 0) { failStr(format("{} has no variant '{}'", owner, name)); }
+        if (vi < 0) { failStr(format("no variant `{}` in enum `{}`", name, owner)); }
         return gReg.variantAt(ed, vi).value;
     }
     // A `str` payload: the bytes copied to the heap, the pair written at `at`.
@@ -2440,7 +2694,7 @@ methods Evaluator {
         self.storeBits(at, 8, b);
     }
     // A `Vec<Node>` or `Vec<str>` payload: a block of the elements, and the header written at
-    // `at` by the instance's own layout -- `buf` is a `RawVec {ptr, cap}`, then `count`.
+    // `at` by the instance's own layout (`buf` is a `RawVec {ptr, cap}`, followed by `count`).
     putVec &self at:long sname:Sym buf:long n:long -> void {
         d: StructDef = gReg.structDef(gReg.findStructSym(sname));
         bf: FieldDef = gReg.fieldAt(d, gReg.findField(d, "buf"));
@@ -2475,7 +2729,7 @@ methods Evaluator {
         e: Expr = pa.expr(id);
         if (e.left != NO_NODE) {
             bn: str = binOpName(e.op);
-            if (bn.len == 0) { failStr(format("parseExpr cannot hand over this expression (operator {})", e.op as long)); }
+            if (bn.len == 0) { failStr(format("`parseExpr` does not support this expression (operator {})", e.op as long)); }
             nd: long = self.newNode("Binary");
             self.store(nd + self.payload("Binary", 0).offset, Lit.Int, NO_SYM, self.opTag("ast::BinOp", bn));
             self.putBox(nd + self.payload("Binary", 1).offset, self.nodeValueOf(pa, e.left));
@@ -2492,11 +2746,11 @@ methods Evaluator {
         }
         if (e.op == Op.Literal) {
             // A float literal keeps its spelling, as the parser left it, in the Node variant
-            // `Float(str)` when the library's Node has one; read as an `Int` it was 0.
+            // `Float(str)` when the library's Node has one. Read as an `Int`, it would become 0.
             match e.payload {
                 Text(t) {
                     if (!self.nodeHas("Float")) {
-                        failStr(format("parseExpr cannot hand over the float literal {}: stdlib::ast's Node has no `Float(str)` variant to carry it", nameOf(t)));
+                        failStr(format("`parseExpr` cannot pass on the float literal `{}`\nnote: `Node` in `stdlib::ast` has no `Float(str)` variant to carry it", nameOf(t)));
                     }
                     nd: long = self.newNode("Float");
                     self.putStr(nd + self.payload("Float", 0).offset, nameOf(t));
@@ -2568,7 +2822,7 @@ methods Evaluator {
         if (e.op == Op.ArrayIndex) {
             ix: IndexNode = pa.indexes.get(0);
             match e.payload { Index(i) { ix = pa.indexes.get(i); } _ { } }
-            if (ix.whole || ix.index == NO_NODE) { failStr(stringOf("parseExpr cannot hand over a slice expression yet")); }
+            if (ix.whole || ix.index == NO_NODE) { failStr(stringOf("`parseExpr` does not support slice expressions yet")); }
             base: long = 0;
             if (ix.base != NO_NODE) { base = self.nodeValueOf(pa, ix.base); }
             else { base = self.newNode("Name"); self.putStr(base + self.payload("Name", 0).offset, nameOf(ix.name)); }
@@ -2580,7 +2834,7 @@ methods Evaluator {
         if (e.op == Op.StructLit || e.op == Op.TupleLit) {
             l: LitNode = pa.lits.get(0);
             match e.payload { Lit(i) { l = pa.lits.get(i); } _ { } }
-            if (l.rest != NO_NODE) { failStr(stringOf("parseExpr cannot hand over `..rest` yet")); }
+            if (l.rest != NO_NODE) { failStr(stringOf("`parseExpr` does not support `..rest` in a literal yet")); }
             names: Vec<Sym>;
             vals: Vec<long>;
             for k in 0..l.initCount {
@@ -2602,7 +2856,7 @@ methods Evaluator {
             self.putNodeVec(nd + vf.offset, vf.structName, vals);
             return nd;
         }
-        failStr(format("parseExpr cannot hand over this expression (operator {})", e.op as long));
+        failStr(format("`parseExpr` does not support this expression (operator {})", e.op as long));
         return 0;
     }
 
@@ -2610,7 +2864,7 @@ methods Evaluator {
 
     // The variant a Node at `addr` holds, by name, and where its payloads start.
     nodeVariant &self addr:long -> str {
-        ei: long = gReg.findEnum(nameOf(self.nodeSym));
+        ei: long = gReg.findEnumSym(self.nodeSym);
         ed: EnumDef = gReg.enumDef(ei);
         tag: long = self.load(addr, ed.backing, NO_SYM);
         for v in 0..ed.variantCount {
@@ -2621,7 +2875,7 @@ methods Evaluator {
     }
     // Payload `k` of a variant: where it is inside the Node, and what it is.
     payload &self variant:str k:long -> FieldDef {
-        d: StructDef = gReg.structDef(gReg.findStruct(nameOf(self.nodeSym)));
+        d: StructDef = gReg.structDef(gReg.findStructSym(self.nodeSym));
         fi: long = gReg.findFieldSym(d, enumPayloadField(variant, k));
         return gReg.fieldAt(d, fi);
     }
@@ -2688,6 +2942,10 @@ methods Evaluator {
             // BinOp is declared in Op's order less the leading Assignment, which comes last.
             bop: Op = Op.Assignment;
             if (op < 18) { bop = (op + 1) as Op; }
+            // A store a macro built is held to what a written one is (`Parser.refuseNonPlace`).
+            if (bop == Op.Assignment && !isPlaceOp(a.expr(l).op)) {
+                failStr(format("cannot assign to {}\nnote: a store needs a place: a local, a field, an element or `*p`", nonPlaceText(a, l)));
+            }
             return a.binary(bop, l, r, Lit.Long);
         }
         if (v == "Unary") {
@@ -2706,14 +2964,14 @@ methods Evaluator {
                                     structName: t.name, isParen: false, payload: Payload.Sub(e) });
         }
         if (v == "Call" || v == "Method") {
-            // `E.V(a)` built as a method call on the enum's name -- what a quote of
-            // `@(e).@(v)(a)` gives -- is the variant it names, as the parser makes it.
+            // `E.V(a)` built as a method call on the enum's name, which is what a quote of
+            // `@(e).@(v)(a)` gives, means the variant it names, just as the parser reads it.
             if (v == "Method") {
                 ra: long = self.readBox(addr + self.payload(v, 0).offset);
                 if (self.nodeVariant(ra) == "Name") {
                     en: Sym = self.readStr(ra + self.payload("Name", 0).offset);
                     vn: Sym = self.readStr(addr + self.payload(v, 1).offset);
-                    ei: long = gReg.findEnum(nameOf(en));
+                    ei: long = gReg.findEnumSym(en);
                     if (ei >= 0 && gReg.enumDef(ei).hasPayload && gReg.findVariant(gReg.enumDef(ei), nameOf(vn)) >= 0) {
                         vargs: Vec<NodeId> = self.spliceList(a, addr + self.payload(v, 2).offset, self.payload(v, 2).structName);
                         return self.variantLit(a, en, vn, vargs);
@@ -2772,7 +3030,7 @@ methods Evaluator {
             return self.variantLit(a, en, vn, args);
         }
         if (v == "Splice") { failStr(stringOf("a macro returned a tree still holding a splice placeholder")); }
-        failStr(format("a macro put a {} where an expression belongs", v));
+        failStr(format("a macro put a `{}` node where an expression belongs", v));
         return NO_NODE;
     }
 
@@ -2878,29 +3136,29 @@ methods Evaluator {
 // ─── derives: a type as a value, and declarations back as syntax ────────────
 //
 // A trait's derive macro (`trait Encode derive deriveEncode`) is handed the declaration of the
-// type it writes an implementation for -- `stdlib::reflect`'s `Struct`, `Enum`, or `Decl`
-// holding either -- built here from the registry's own tables, and returns a `MethodsDecl`
-// Node, turned back into functions here for the checker to hold to the trait. The view's
-// fields are filled by name, each one only if the view declares it, so `reflect.k` may grow a
-// field without this knowing; what it says is listed in that file.
+// type it writes an implementation for, as `stdlib::reflect`'s `Struct`, `Enum`, or a `Decl`
+// holding either, built here from the registry's own tables. It returns a `MethodsDecl` Node,
+// which is turned back into functions here for the checker to hold to the trait. The view's
+// fields are filled by name, each only if the view declares it, so `reflect.k` may grow a field
+// without this code knowing; that file documents what each field says.
 
 methods Evaluator {
     // A `Variant(E, V, args)`: the struct literal the parser makes of `E.V(args)`, the tag and
     // then the variant's payload slots.
     variantLit &self inout a:Ast en:Sym vn:Sym args:Vec<NodeId> -> NodeId {
-        ei: long = gReg.findEnum(nameOf(en));
+        ei: long = gReg.findEnumSym(en);
         if (ei < 0) {
             q: Sym = gReg.resolveBare(stemOf(nameOf(self.macroFile)), nameOf(en));
-            ei = gReg.findEnum(nameOf(q));
+            ei = gReg.findEnumSym(q);
             if (ei >= 0) { en = q; }
         }
-        if (ei < 0) { failStr(format("a macro built a variant of '{}', which is not a sum type", nameOf(en))); }
+        if (ei < 0) { failStr(format("a macro built a variant of `{}`, which is not a sum type", nameOf(en))); }
         d: EnumDef = gReg.enumDef(ei);
         vi: long = gReg.findVariant(d, nameOf(vn));
-        if (vi < 0) { failStr(format("a macro built '{}.{}', and {} has no such variant", nameOf(en), nameOf(vn), nameOf(en))); }
+        if (vi < 0) { failStr(format("no variant `{}` in enum `{}`\nnote: a macro built `{}.{}`", nameOf(vn), nameOf(en), nameOf(en), nameOf(vn))); }
         vd: VariantDef = gReg.variantAt(d, vi);
         if (vd.payloadCount != args.len()) {
-            failStr(format("a macro built '{}.{}' with {} value(s); it carries {}", nameOf(en), nameOf(vn), args.len(), vd.payloadCount));
+            failStr(format("a macro built `{}.{}` with the wrong number of values: expected {}, found {}", nameOf(en), nameOf(vn), vd.payloadCount, args.len()));
         }
         inits: Vec<InitNode>;
         inits.push(InitNode { name: intern(enumTagField()), value: a.leaf(Op.Literal, Payload.Num(vd.value), d.backing) });
@@ -2915,19 +3173,19 @@ methods Evaluator {
     // ─── the view ────────────────────────────────────────────────────────────
 
     // The declaration of `owner` as a value of the view type `view` (a struct the derive macro's
-    // parameter names), built on the compile-time stack. Its address.
+    // parameter names), built on the compile-time stack. Returns its address.
     reflectView &self owner:Sym view:Sym -> long {
         at: long = self.alloc(typeBytes(Lit.Struct, view));
         v: str = lastComponentOf(nameOf(view));
-        isEnum: bool = gReg.findEnum(nameOf(owner)) >= 0;
+        isEnum: bool = gReg.findEnumSym(owner) >= 0;
         if (v == "Struct") { self.putStructView(at, view, owner); return at; }
         if (v == "Enum") { self.putEnumView(at, view, owner); return at; }
         // `Decl`: whichever of the two it is, as that variant.
-        ed: EnumDef = gReg.enumDef(gReg.findEnum(nameOf(view)));
+        ed: EnumDef = gReg.enumDef(gReg.findEnumSym(view));
         arm: str = "OfStruct";
         if (isEnum) { arm = "OfEnum"; }
         vi: long = gReg.findVariant(ed, arm);
-        if (vi < 0) { failStr(format("stdlib::reflect's {} has no variant '{}'", nameOf(view), arm)); }
+        if (vi < 0) { failStr(format("no variant `{}` in enum `{}`\nnote: the compiler needs it to describe a type to a derive macro", arm, nameOf(view))); }
         self.store(at + self.viewField(view, enumTagField()).offset, ed.backing, NO_SYM, gReg.variantAt(ed, vi).value);
         slot: FieldDef = self.viewField(view, nameOf(enumPayloadField(arm, 0)));
         if (isEnum) { self.putEnumView(at + slot.offset, slot.structName, owner); }
@@ -2935,7 +3193,7 @@ methods Evaluator {
         return at;
     }
     putStructView &self at:long view:Sym owner:Sym -> void {
-        d: StructDef = gReg.structDef(gReg.findStruct(nameOf(owner)));
+        d: StructDef = gReg.structDef(gReg.findStructSym(owner));
         self.putViewStr(at, view, "name", nameOf(owner));
         fs: FieldDef = self.viewField(view, "fields");
         elem: Sym = ctVecElem(fs.structName);
@@ -2949,9 +3207,9 @@ methods Evaluator {
         self.putVec(at + fs.offset, fs.structName, buf, d.fieldCount);
     }
     putEnumView &self at:long view:Sym owner:Sym -> void {
-        ed: EnumDef = gReg.enumDef(gReg.findEnum(nameOf(owner)));
-        // An enum of named integers has no struct row: it IS its backing integer, and has no tag.
-        si: long = gReg.findStruct(nameOf(owner));
+        ed: EnumDef = gReg.enumDef(gReg.findEnumSym(owner));
+        // An enum of named integers has no struct row: it is just its backing integer, with no tag.
+        si: long = gReg.findStructSym(owner);
         self.putViewStr(at, view, "name", nameOf(owner));
         self.putViewLong(at, view, "isBacked", Lit.Bool, ctBit(!ed.hasPayload));
         self.putViewStr(at, view, "backing", typeName(ed.backing));
@@ -2995,23 +3253,23 @@ methods Evaluator {
     putViewStr &self at:long view:Sym field:str text:str -> void {
         fi: long = self.viewFieldAt(view, field);
         if (fi < 0) { return; }
-        self.putStr(at + gReg.fieldAt(gReg.structDef(gReg.findStruct(nameOf(view))), fi).offset, text);
+        self.putStr(at + gReg.fieldAt(gReg.structDef(gReg.findStructSym(view)), fi).offset, text);
     }
     putViewLong &self at:long view:Sym field:str k:Lit v:long -> void {
         fi: long = self.viewFieldAt(view, field);
         if (fi < 0) { return; }
-        self.store(at + gReg.fieldAt(gReg.structDef(gReg.findStruct(nameOf(view))), fi).offset, k, NO_SYM, v);
+        self.store(at + gReg.fieldAt(gReg.structDef(gReg.findStructSym(view)), fi).offset, k, NO_SYM, v);
     }
     viewFieldAt &self view:Sym field:str -> long {
-        si: long = gReg.findStruct(nameOf(view));
+        si: long = gReg.findStructSym(view);
         if (si < 0) { return -1; }
         return gReg.findField(gReg.structDef(si), field);
     }
     // A field the view cannot do without.
     viewField &self view:Sym field:str -> FieldDef {
         fi: long = self.viewFieldAt(view, field);
-        if (fi < 0) { failStr(format("stdlib::reflect's {} has no field '{}'", nameOf(view), field)); }
-        return gReg.fieldAt(gReg.structDef(gReg.findStruct(nameOf(view))), fi);
+        if (fi < 0) { failStr(format("no field `{}` on type `{}`\nnote: the compiler needs it to describe a type to a derive macro", field, nameOf(view))); }
+        return gReg.fieldAt(gReg.structDef(gReg.findStructSym(view)), fi);
     }
 
     // ─── declarations ────────────────────────────────────────────────────────
@@ -3030,12 +3288,13 @@ methods Evaluator {
         return out;
     }
     fnDeclName &self addr:long -> Sym {
-        if (self.nodeVariant(addr) != "FnDecl") { failStr(format("a methods block holds a {} where a method (FnDecl) belongs", self.nodeVariant(addr))); }
+        if (self.nodeVariant(addr) != "FnDecl") { failStr(format("a `methods` block holds a `{}` node where a method (`FnDecl`) belongs", self.nodeVariant(addr))); }
         return self.readStr(addr + self.payload("FnDecl", 0).offset);
     }
-    // One `FnDecl` as the function `name`, a method of `owner`: its parameters declared, its body
-    // spliced with the hygiene every macro's statements get, written in `file`/`pkg` (where its
-    // bare names resolve). Not added to the tree's function list: the caller puts it in place.
+    // Turns one `FnDecl` into the function `name`, a method of `owner`. Its parameters are
+    // declared, and its body is spliced with the hygiene every macro's statements get, as if
+    // written in `file`/`pkg` (where its bare names resolve). It is not added to the tree's
+    // function list; the caller puts it in place.
     spliceFnDecl &self inout a:Ast addr:long owner:Sym name:Sym file:Sym pkg:Sym -> FnNode {
         pd: FieldDef = self.payload("FnDecl", 1);
         buf: long = self.vecBuf(addr + pd.offset, pd.structName);
@@ -3044,7 +3303,7 @@ methods Evaluator {
         params: Vec<long>;
         for k in 0..n {
             p: long = buf + k * w;
-            if (self.nodeVariant(p) != "ParamDecl") { failStr(format("'{}': a parameter list holds a {}", nameOf(name), self.nodeVariant(p))); }
+            if (self.nodeVariant(p) != "ParamDecl") { failStr(format("the parameter list of `{}` holds a `{}` node where a parameter (`ParamDecl`) belongs", nameOf(name), self.nodeVariant(p))); }
             pn: Sym = self.readStr(p + self.payload("ParamDecl", 0).offset);
             t: TypeRef = self.spelledType(nameOf(self.readStr(p + self.payload("ParamDecl", 1).offset)), owner);
             cs: str = nameOf(self.readStr(p + self.payload("ParamDecl", 2).offset));
@@ -3052,7 +3311,7 @@ methods Evaluator {
             if (cs == "inout") { conv = Conv.Inout; if (t.base == Lit.Struct) { t = TypeRef { base: Lit.Ref, name: t.name }; } }
             else if (cs == "sink") { conv = Conv.Sink; }
             else if (cs == "read") { conv = Conv.Read; }
-            else if (cs.len > 0) { failStr(format("'{}': '{}' is not a parameter convention", nameOf(name), cs)); }
+            else if (cs.len > 0) { failStr(format("unknown parameter convention `{}` in `{}`\nnote: a parameter is taken `inout`, `sink` or `read`, or written with no convention", cs, nameOf(name))); }
             // The receiver says how it is taken by its type, as `&self` and `self` do in source.
             if (k == 0 && nameOf(pn) == "self" && cs.len == 0) {
                 if (t.base == Lit.Ref) { conv = Conv.Inout; } else { conv = Conv.Sink; }
@@ -3079,7 +3338,7 @@ methods Evaluator {
         }
         if (s.len == 0) { return TypeRef { base: Lit.Void, name: NO_SYM }; }
         t: TypeRef = unmangledType(s);
-        if (t.base == Lit.Struct && gReg.findTrait(nameOf(t.name)) >= 0) { return TypeRef { base: Lit.TraitObj, name: t.name }; }
+        if (t.base == Lit.Struct && gReg.findTraitSym(t.name) >= 0) { return TypeRef { base: Lit.TraitObj, name: t.name }; }
         return t;
     }
 }
@@ -3088,8 +3347,8 @@ local ctBit b:bool -> long { if (b) { return 1; } return 0; }
 
 // The element type of a `Vec<T>` instance, from the request that stamped it.
 local ctVecElem inst:Sym -> Sym {
-    r: long = gReg.findRequest(nameOf(inst));
-    if (r < 0) { failStr(format("'{}' is not a Vec instance the compiler stamped", nameOf(inst))); }
+    r: long = gReg.findRequestSym(inst);
+    if (r < 0) { failStr(format("`{}` is not a `Vec` instance the compiler stamped", nameOf(inst))); }
     return gReg.gArgAt(gReg.requestAt(r), 0).name;
 }
 
@@ -3107,16 +3366,16 @@ methods Evaluator {
     loadExternGlobal &self inout a:Ast n:Sym addr:long -> void {
         self.extReady.put(nameOf(n), true);
         gi: long = gFacts.globalFact(n);
-        if (gi < 0) { self.stop(format("the global '{}', which its package's .klib records nothing about", nameOf(n))); return; }
+        if (gi < 0) { self.stop(format("the global `{}`, which its package's `.klib` records nothing about", nameOf(n))); return; }
         g: GlobalFact = gFacts.globals.get(gi);
         if (g.state == GlobalState.Startup) {
-            self.stop(format("the global '{}', which its package initializes at startup", nameOf(n)));
+            self.stop(format("the global `{}`, which its package initializes at startup", nameOf(n)));
             return;
         }
         if (g.state == GlobalState.Zero) { return; }      // storage starts zeroed, as it does here
         if (g.state == GlobalState.Scalar) {
-            di: long = gReg.findGlobal(nameOf(n));
-            if (di < 0) { self.stop(format("the global '{}', which nothing declares", nameOf(n))); return; }
+            di: long = gReg.findGlobalSym(n);
+            if (di < 0) { self.stop(format("the global `{}`, which nothing declares", nameOf(n))); return; }
             gd: GlobalDef = gReg.globalDef(di);
             k: Lit = storedKind(gd.kind, gd.structName);
             w: long = typeInfo(k).size;
@@ -3145,14 +3404,14 @@ methods Evaluator {
                 hit: Option<long> = self.globalAddr.find(nameOf(r.target));
                 ga: long = -1;
                 match hit { Some(p) { ga = p; } None { } }
-                if (ga < 0) { self.stop(format("a pointer to the global '{}', which this program does not hold", nameOf(r.target))); return; }
+                if (ga < 0) { self.stop(format("a pointer to the global `{}`, which this program does not hold", nameOf(r.target))); return; }
                 if (isExternGlobal(r.target) && !self.extReady.has(nameOf(r.target))) { self.loadExternGlobal(a, r.target, ga); }
                 v = ga + r.delta;
             } else if (r.kind == RelocKind.Fn) {
                 fh: Option<long> = self.fnAt.find(r.target as long);
                 fi: long = -1;
                 match fh { Some(i) { fi = i; } None { } }
-                if (fi < 0) { self.stop(format("a pointer to '{}', a function this package has not stamped", nameOf(r.target))); return; }
+                if (fi < 0) { self.stop(format("a pointer to `{}`, a function this package has not stamped", nameOf(r.target))); return; }
                 v = FN_BASE + fi;
             } else {
                 v = self.vtableHandle(r.concrete, r.trait);
@@ -3174,10 +3433,30 @@ methods Evaluator {
         return at;
     }
 
-    // A word written where nothing may be written otherwise: what a load from the facts is, the
-    // same commit `foldInit` makes.
+    // Writes a word where nothing else may write, bypassing `writable`: loading from the facts
+    // is the same kind of commit `foldInit` makes.
     putBits &self addr:long w:long v:long -> void {
         x: long = v;
         for i in 0..w { self.rawSet(addr + i, (x & 255) as u8); x = x >> 8; }
     }
+}
+
+// Whether the place `id` names is `n` or a part of it: `n`, a field or element of it, `&` of one.
+local rootedAt inout a:Ast id:NodeId n:Sym -> bool {
+    cur: NodeId = id;
+    while (cur != NO_NODE) {
+        e: Expr = a.expr(cur);
+        match e.payload {
+            Name(x) { return e.op == Op.Lvalue && x == n; }
+            Sub(v) { cur = v; }
+            Field(f) { cur = a.fields.get(f).base; }
+            Index(i) {
+                ix: IndexNode = a.indexes.get(i);
+                if (ix.base == NO_NODE) { return ix.name == n; }
+                cur = ix.base;
+            }
+            _ { return false; }
+        }
+    }
+    return false;
 }

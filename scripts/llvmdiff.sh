@@ -1,10 +1,13 @@
 #!/bin/bash
-# The corpus down both back ends: same stdout and same exit code, or say which stage failed.
-# The native path is the oracle. `$1` is a stride, so `5` checks every fifth program.
+# Runs the corpus through both back ends and checks that each program prints the same output and
+# exits with the same code, or says which stage failed. The native path is the oracle. `$1` is a
+# stride, so `5` checks every fifth program.
 #
 # Output is compared byte for byte. NUL bytes are dropped from both sides only because bash
 # cannot hold one in a variable, not to make the comparison lenient.
 cd "$(dirname "$0")/.."
+# The exit code compared is the program's, not `tr`'s at the end of the pipe that captures its output.
+set -o pipefail
 ./bootstrap/kilnc main.k -o /tmp/cd.s > /dev/null
 nasm -O1 -felf64 /tmp/cd.s -o /tmp/cd.o
 ld /tmp/cd.o -o /tmp/cd

@@ -11,7 +11,10 @@
 //
 // so changing a file changes its package's key, and through the dependency keys every package
 // downstream of it, the way Rust's SVH propagates; and a package whose inputs did not change is
-// not touched. Nothing here looks at a timestamp.
+// not touched. Nothing here looks at a timestamp. A cached `.klib` with the right key is still
+// checked whole before anything reads it (`usable`, `Klib.checkKlib`: every archive member there,
+// the metadata's body against the hash its header gives), and one that is damaged or of another
+// format is rebuilt from source with a note saying why, not reported as an error.
 //
 // The compiler is run once per stale package, as a separate process (this same executable, with
 // `--klib`), then `nasm` and `ar`, and at the end `ld`, all found on PATH. A package's dependents
@@ -38,7 +41,8 @@ local struct Pkg {
     // Where its dependents read its metadata: the archive when it was already current, the
     // compile's own output when it was rebuilt in this run (available before the archive is).
     meta: str,
-    archive: str           // its archive in the scratch directory, when it was built in this run
+    archive: str,          // its archive in the scratch directory, when it was built in this run
+    checked: bool          // its cached archive was found whole in this run (`usable`)
 }
 
 local struct Plan {
@@ -52,7 +56,8 @@ local struct Plan {
     scratch: str,              // this run's own directory for intermediate files
     // The previous package's assembler and archiver, still running while the next compiles.
     pending: Vec<long>,        // pids
-    pendingWhat: Vec<str>
+    pendingWhat: Vec<str>,
+    built: long                // packages compiled in this run
 }
 
 pub runBuild args:[str] -> int {
@@ -64,39 +69,40 @@ pub runBuild args:[str] -> int {
     while (i < args.len) {
         x: str = args[i];
         if (x == "-o" || x == "--cache") {
-            if (i + 1 >= args.len) { failStr(format("missing argument to {}", x)); }
+            if (i + 1 >= args.len) { failStr(format("missing argument to `{}`", x)); }
             i = i + 1;
             if (x == "-o") { out = args[i]; } else { cache = args[i]; }
         } else if (x.len > 0 && charAt(x, 0) == '-') {
-            failStr(format("unknown option to build: '{}'", x));
+            failStr(format("unknown option `{}` to `kilnc build`\nhelp: `kilnc build` takes a package directory, `-o <exe>` and `--cache <dir>`", x));
         } else {
             root = x;
         }
         i = i + 1;
     }
     p: Plan = Plan { pkgs: vec![], deps: vec![], files: vec![], byName: map![], order: vec![],
-                     cache: cache, compilerId: "", scratch: "", pending: vec![], pendingWhat: vec![] };
+                     cache: cache, compilerId: "", scratch: "", pending: vec![], pendingWhat: vec![], built: 0 };
     pm: PackageMap;
     // The root names a package's own directory: a manifest found further up is another package.
     if (!fileExists(joinKept(normalizeRoot(root), MANIFEST))) {
-        failStr(format("{} has no {}: nothing to build", root, MANIFEST));
+        failStr(format("no package to build in `{}`\nnote: a package's directory holds its `{}`", root, MANIFEST));
     }
     top: long = discover(&p, &pm, normalizeRoot(root));
-    if (top < 0) { failStr(format("{} has no {}: nothing to build", root, MANIFEST)); }
+    if (top < 0) { failStr(format("no package to build in `{}`\nnote: a package's directory holds its `{}`", root, MANIFEST)); }
     ensureDir(cache);
     p.scratch = makeScratch();
 
     // The compiler is an input to everything it builds.
     p.compilerId = compilerIdentity();
 
-    built: long = 0;
     for k in 0..p.order.len() {
         at: long = p.order.get(k);
         pk: Pkg = p.pkgs.get(at);
         // Current when the cached archive was built from exactly what is here now: the key it
-        // carries is the one these files, this compiler and these dependencies make.
+        // carries is the one these files, this compiler and these dependencies make. Whether the
+        // rest of it is whole is asked when something is about to read it (`usable`).
         klib: str = cachePath(&p, pk.name, ".klib");
         hdr: KlibHeader = readKlibHeader(klib);
+        why: String;
         if (hdr.ok) {
             key: String = packageKey(&p, at, hdr.extras);
             same: bool = false;
@@ -109,13 +115,10 @@ pub runBuild args:[str] -> int {
                 println("  fresh  {}", pk.name);
                 continue;
             }
+        } else if (hdr.present) {
+            why = hdr.why;
         }
-        one: Instant = monotonic();
-        if (!compilePackage(&p, at)) { finishPending(&p); removeTree(p.scratch); return 1; }
-        pk = p.pkgs.get(at);
-        built = built + 1;
-        println("  built  {}  ({} ms)", pk.name, elapsedMs(one));
-        flush();
+        if (!rebuild(&p, at, why)) { finishPending(&p); removeTree(p.scratch); return 1; }
     }
     if (!finishPending(&p)) { removeTree(p.scratch); return 1; }
 
@@ -123,11 +126,48 @@ pub runBuild args:[str] -> int {
     if (rootPkg.hasEntry) {
         exe: str = out;
         if (exe.len == 0) { exe = keepString(format("build/{}", rootPkg.name)); }
-        if (!link(&p, top, exe)) { removeTree(p.scratch); return 1; }
+        if (!link(&p, top, exe)) { finishPending(&p); removeTree(p.scratch); return 1; }
     }
     removeTree(p.scratch);
-    println("build: {} of {} packages rebuilt, {} ms", built, p.order.len(), elapsedMs(start));
+    println("build: {} of {} packages rebuilt, {} ms", p.built, p.order.len(), elapsedMs(start));
     return 0;
+}
+
+// Package `at` compiled, saying first why when there was a cached archive that could not be used
+// although its sources are these: one with another key is the ordinary rebuild, and says nothing.
+// The rebuilt archive has the key the old one had, so its dependents are compiled as their keys
+// say.
+local rebuild inout p:Plan at:long why:String -> bool {
+    pk: Pkg = p.pkgs.get(at);
+    if (why.length() > 0) {
+        flush();
+        eprintln("note: rebuilding `{}`: its cached .klib {}", pk.name, why);
+        flushErr();
+    }
+    one: Instant = monotonic();
+    if (!compilePackage(p, at)) { return false; }
+    pk = p.pkgs.get(at);
+    p.built = p.built + 1;
+    println("  built  {}  ({} ms)", pk.name, elapsedMs(one));
+    flush();
+    return true;
+}
+
+// Whether package `at`'s archive may be read now. One built in this run may. A cached one is
+// checked whole the first time something is about to read it, a compile its metadata or the link
+// its object (`Klib.checkKlib`: every member there, the format, the body against its hash), and
+// rebuilt if it cannot be used, so a build with nothing to compile or link reads nothing past the
+// headers.
+local usable inout p:Plan at:long -> bool {
+    pk: Pkg = p.pkgs.get(at);
+    if (pk.archive.len > 0 || pk.checked) { return true; }
+    c: KlibCheck = checkKlib(cachePath(p, pk.name, ".klib"));
+    if (c.ok) {
+        pk.checked = true;
+        p.pkgs.set(at, pk);
+        return true;
+    }
+    return rebuild(p, at, c.why);
 }
 
 // ─── the package graph ───────────────────────────────────────────────────────
@@ -149,7 +189,7 @@ local discover inout p:Plan inout pm:PackageMap dir:str -> long {
     hit: Option<long> = p.byName.find(info.name);
     match hit {
         Some(at) {
-            if (at == DISCOVERING) { failStr(format("package '{}' depends on itself", info.name)); }
+            if (at == DISCOVERING) { failStr(format("package `{}` depends on itself", info.name)); }
             return at;
         }
         None { }
@@ -159,7 +199,7 @@ local discover inout p:Plan inout pm:PackageMap dir:str -> long {
     for k in 0..pm.depCountAt(idx) {
         d: PackageDep = pm.depAt(idx, k);
         at: long = discover(p, pm, d.root);
-        if (at < 0) { failStr(format("dependency '{}' at {} has no {}", d.name, d.root, MANIFEST)); }
+        if (at < 0) { failStr(format("dependency `{}` has no `{}` at `{}`", d.name, MANIFEST, d.root)); }
         mine.push(at);
     }
     if (!(info.name == STDLIB_PKG)) {
@@ -167,7 +207,7 @@ local discover inout p:Plan inout pm:PackageMap dir:str -> long {
         // without `stdlib/`, the walk up reaches the working directory's package.
         si: long = pm.loadAt(STDLIB_ROOT);
         if (si < 0 || !(pm.at(si).name == STDLIB_PKG)) {
-            failStr(format("no standard library at {}/{}: paths are taken from the working directory, so run `kilnc build` from the directory that holds `{}/`, naming the package's directory (`kilnc build examples/ember`)",
+            failStr(format("cannot find the standard library at `{}/{}`\nnote: paths are taken from the working directory\nhelp: run `kilnc build` from the directory that holds `{}/`, naming the package's directory (`kilnc build examples/ember`)",
                            STDLIB_ROOT, MANIFEST, STDLIB_ROOT));
         }
         mine.push(discover(p, pm, STDLIB_ROOT));
@@ -176,7 +216,7 @@ local discover inout p:Plan inout pm:PackageMap dir:str -> long {
     at: long = p.pkgs.len();
     p.pkgs.push(Pkg { name: info.name, root: info.root, firstDep: p.deps.len(), depCount: mine.len(),
                       firstMember: p.files.len(), memberCount: members.len(), key: "", hasEntry: false,
-                      meta: "", archive: "" });
+                      meta: "", archive: "", checked: false });
     p.deps.extend(mine);
     p.files.extend(members);
     p.byName.put(info.name, at);
@@ -235,14 +275,15 @@ local packageKey inout p:Plan at:long extras:Vec<str> -> String {
     }
     return klibKey(p.compilerId, pk.name, joinKept(pk.root, MANIFEST), srcs, deps);
 }
+
 // ─── one package ─────────────────────────────────────────────────────────────
 //
-// The intermediate files -- the assembly, the object, the metadata, the archive while it is being
-// put together, and the linked program -- live in a scratch directory of this run's own under
-// $TMPDIR, and only a finished `.klib` or executable is copied into the tree. The reason is the
-// tools: `ar` and `ld` read and write with many small seeks, which costs nothing on a local disk
-// and is forty times slower on a mounted one (WSL's /mnt/c, a network share), where a link that
-// takes 40 ms took two seconds. A whole file copied in one pass is cheap on either.
+// The intermediate files (the assembly, the object, the metadata, the archive while it is being
+// put together, and the linked program) live in this run's own scratch directory under $TMPDIR,
+// and only a finished `.klib` or executable is copied into the tree. The reason is the tools:
+// `ar` and `ld` read and write with many small seeks, which costs nothing on a local disk and is
+// forty times slower on a mounted one (WSL's /mnt/c, a network share), where a link that takes
+// 40 ms took two seconds. A whole file copied in one pass is cheap on either.
 
 local cachePath inout p:Plan name:str ext:str -> str {
     v: str = "";
@@ -274,8 +315,8 @@ local removeTree dir:str -> void {
     gone: bool = runTool("rm", "rm", args);
 }
 
-// Compile package `at` against its dependencies' metadata, then assemble and archive it -- the
-// last two in the background, so the next package's compile overlaps them.
+// Compile package `at` against its dependencies' metadata, then assemble and archive it. The
+// last two run in the background, so the next package's compile overlaps them.
 local compilePackage inout p:Plan at:long -> bool {
     pk: Pkg = p.pkgs.get(at);
     // The metadata has to be called `kiln.meta` inside the archive, and `ar` names a member by
@@ -298,6 +339,8 @@ local compilePackage inout p:Plan at:long -> bool {
     for k in 0..p.pkgs.len() { seen.push(false); }
     collectBelow(p, at, &seen, &below);
     for b in below {
+        // Its metadata is read by the compile: checked first, and rebuilt if it cannot be used.
+        if (!usable(p, b)) { return false; }
         d: Pkg = p.pkgs.get(b);
         args.push("--extern");
         args.push(keepString(format("{}={}", d.name, d.meta)));
@@ -305,7 +348,7 @@ local compilePackage inout p:Plan at:long -> bool {
     flush();
     if (!runTool("/proc/self/exe", "kilnc", args)) { return false; }
     hdr: KlibHeader = readKlibHeader(metaPath);
-    if (!hdr.ok) { eprintln("build: the compile of {} wrote no usable metadata at {}", pk.name, metaPath); return false; }
+    if (!hdr.ok) { eprintln("error: the compile of package `{}` wrote no usable metadata at `{}`", pk.name, metaPath); return false; }
     pk.hasEntry = hdr.entry;
     pk.meta = metaPath;
     unsafe { pk.key = keep(hdr.key.view()); }
@@ -326,7 +369,7 @@ local compilePackage inout p:Plan at:long -> bool {
     c: Result<Child, long> = spawnProcess("sh", sargs);
     match c {
         Ok(child) { p.pending.push(child.pid); p.pendingWhat.push(pk.name); }
-        Err(e) { eprintln("build: cannot start the assembler for {} (errno {})", pk.name, e); return false; }
+        Err(e) { eprintln("error: cannot start the assembler for package `{}` (errno {})", pk.name, e); return false; }
     }
     return true;
 }
@@ -351,11 +394,11 @@ local finishPending inout p:Plan -> bool {
         match st {
             Ok(s) {
                 if (!s.success()) {
-                    eprintln("build: assembling and archiving {} failed: the job {}", p.pendingWhat.get(k), s.describe());
+                    eprintln("error: assembling and archiving package `{}` failed (the job {})", p.pendingWhat.get(k), s.describe());
                     ok = false;
                 }
             }
-            Err(e) { eprintln("build: lost the assembler for {} (errno {})", p.pendingWhat.get(k), e); ok = false; }
+            Err(e) { eprintln("error: cannot wait for the assembler of package `{}` (errno {})", p.pendingWhat.get(k), e); ok = false; }
         }
     }
     p.pending.clear();
@@ -368,11 +411,11 @@ local finishPending inout p:Plan -> bool {
 // Link the root package's object and every package below it. The archives go in one group, so
 // the order they are named in does not matter; `--gc-sections` drops every function no path
 // from `_start` reaches, which is what keeps a library from costing a program its whole surface.
-// Skipped when the executable is still the one this cache linked from exactly this root key: the
-// stamp names the key (the compiler's identity and every package's sources, dependencies
-// included), the path, and the size and modification time the executable had when it was
-// written. Anything else that wrote to the path since -- another cache's build, a copy by hand --
-// changes those, and the program is linked again.
+// The link is skipped when the executable is still the one this cache linked from exactly this
+// root key. The stamp records the key (the compiler's identity and every package's sources,
+// dependencies included), the path, and the size and modification time the executable had when
+// it was written. Anything else that has written to the path since, such as another cache's
+// build or a copy by hand, changes those, and the program is linked again.
 local link inout p:Plan top:long exe:str -> bool {
     rootPkg: Pkg = p.pkgs.get(top);
     stamp: str = cachePath(p, rootPkg.name, ".link");
@@ -389,6 +432,12 @@ local link inout p:Plan top:long exe:str -> bool {
         }
         Err(_) { }
     }
+    // The link reads every archive: each is checked first, and rebuilt if it cannot be used,
+    // its assembler done before `ld` runs.
+    for k in 0..p.order.len() {
+        if (!usable(p, p.order.get(k))) { return false; }
+    }
+    if (!finishPending(p)) { return false; }
     one: Instant = monotonic();
     // Every archive into the scratch directory: the ones built in this run are there already,
     // the rest are copied, one sequential read each.
@@ -444,10 +493,10 @@ local runTool program:str shown:str args:Vec<str> -> bool {
     match r {
         Ok(s) {
             if (s.success()) { return true; }
-            eprintln("build: {} {}", commandLine(shown, args), s.describe());
+            eprintln("error: `{}` {}", commandLine(shown, args), s.describe());
             return false;
         }
-        Err(e) { eprintln("build: cannot run {} (errno {})", shown, e); return false; }
+        Err(e) { eprintln("error: cannot run `{}` (errno {})", shown, e); return false; }
     }
     return false;
 }

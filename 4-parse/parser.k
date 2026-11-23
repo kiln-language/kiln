@@ -5,7 +5,7 @@
 // renamed on declaration, and a top-level name is qualified with the module that declared it.
 #include <{ast, astdump, diag, quoter, regops, registry, upstream, types}>
 #include <lex::{lexer, token}>
-#include <stdlib::{chars, path, pathbuf, fmt, map, option, string, vec}>
+#include <stdlib::{chars, path, pathbuf, fmt, map, option, recover, string, vec}>
 #include <support::compiler>
 
 // "no statement yet", for a methods block that has not produced one.
@@ -21,9 +21,9 @@ pub struct TplRef { known: bool, own: bool, first: long, count: long }
 
 // The sum type a `match` is reading, as whichever of three registrations answers for it.
 //
-// A concrete enum is in the enum table. An instance -- `Option<long>` -- is not a type at parse
-// time, because monomorphization runs later, so what it holds is read from the template with the
-// request's arguments substituted. And inside `methods Option<T>` the value's type is the
+// A concrete enum is in the enum table. An instance such as `Option<long>` is not a type yet at
+// parse time, because monomorphization runs later, so what it holds is read from the template
+// with the request's arguments substituted. And inside `methods Option<T>` the value's type is the
 // template itself, where a payload stays the parameter it is and the monomorph pass substitutes
 // it along with everything else.
 pub struct SumInfo { owner: Sym, enumAt: long, tmplAt: long, reqAt: long, backing: Lit }
@@ -50,9 +50,9 @@ pub struct Capture { level: long, name: Sym, value: NodeId, kind: Lit, structNam
 // Where a `macro` declaration was met, to be parsed once the whole program has been: the
 // lexer's position and the token in hand, so the declaration is re-read from the same source
 // with its own line numbers. A macro is written against `ast`'s `Node`, and `ast` is built on
-// `Vec` -- so `vec.k` declares its literal before `ast` is parsed, and the body can only be
-// read afterwards. Deferring the declaration -- signature and body -- is what lets a module
-// name a type that arrives later, for the one construct that needs to.
+// `Vec`, so `vec.k` declares its literal before `ast` is parsed and the body can only be read
+// afterwards. Deferring the whole declaration, signature and body, is what lets a module name a
+// type that arrives later, for the one construct that needs to.
 pub struct MacroSnap { name: Sym, pos: long, line: long, col: long, file: Sym, pkg: Sym,
                        cur: Token, peeked: Token, hasPeeked: bool, vis: Vis, curPos: long, peekPos: long,
                        // The module's own text, which the lexer is put back on; the module's index in
@@ -64,6 +64,27 @@ pub struct MacroSnap { name: Sym, pos: long, line: long, col: long, file: Sym, p
 // where one declared below its use has been read too: the trait of a `methods X for T`
 // (`isType` false), or the template of a `T<args>` (`isType` true).
 pub struct ImplCheck { trait: Sym, owner: Sym, line: long, col: long, file: Sym, isType: bool }
+
+// Where the parser is in its text: the lexer and the token or two in hand.
+pub struct Cursor { lx: Lexer, cur: Token, peeked: Token, hasPeeked: bool, curPos: long, peekPos: long }
+
+// Where a top-level declaration began, and how far everything it can add to reached then: what
+// the parser cuts back to when an error cuts the declaration short (`rewindTo`). The lists are
+// lengths; the rest is the state a declaration starts in, which the error may have left changed.
+pub struct ParseMark {
+    ast: AstMark, reg: RegMark, ops: OpsMark, startPos: long, gPos: long,
+    pendingMacros: long, tplBounds: long, scopes: long, scopeStart: long, implChecks: long,
+    pendingInits: long, closureBound: long, closureName: long, captures: long,
+    closureFile: str, closureSeq: long, fnReturnsAdded: long, pending: long, typeVars: long,
+    lenVars: long, tplParams: long, selfParams: long, selfInfo: long, pageIds: long,
+    tryHole: long, toOrder: long, contPre: long,
+    inImpl: bool, uniq: long, matchSeq: long, forSeq: long, loopDepth: long, fnDepth: long,
+    implMangled: Sym, noCast: long, inPointee: long, quoteDepth: long, unsafeDepth: long,
+    vis: Vis, varDecl: bool, boundFirst: long, boundCount: long, selfTpl: Sym, lenArgOk: bool,
+    typeVarUses: long, plainBody: bool, blanketVar: Sym, blanketAs: Sym, retTy: TypeRef,
+    retOk: bool, toMark: long, toImpure: bool, toCond: long, toLhs: long, contIf: long,
+    retNever: bool, fnAttrs: long, lastStmt: long
+}
 
 pub struct Parser {
     lx:  Lexer,
@@ -91,8 +112,7 @@ pub struct Parser {
     noCast: long,              // nonzero while reading a prefix operator's operand
     // Nonzero while reading a pointee. `next: *Node` inside `struct Node` names the struct being
     // declared, which is not registered yet, and a pointer is 8 bytes whatever it points at, so
-    // the name need not resolve for the type to be known. The C++ parser gets this for free by
-    // reading a pointee with `parsePtrCompanion`, which does not resolve at all.
+    // the name need not resolve for the type to be known.
     inPointee: long,
     quoteDepth: long,          // nonzero inside a `quote { }`, where `@x` is a splice
     pendingInits: Vec<long>,   // a declaration's initializer, waiting to be handed back
@@ -104,6 +124,9 @@ pub struct Parser {
     closureName: Vec<Sym>,
     captures: Vec<Capture>,
     closureSeq: HashMap<str, long>,   // closures read so far, per file: the next one's number
+    // Nonzero while reading an `unsafe { }` block or an `unsafe` function's body. A closure
+    // written there is the one kind whose body is trusted, since that is where its text stands.
+    unsafeDepth: long,
     fnReturns: HashMap<str, Lit>,  // what a already-parsed function returns, for a call's type
     vis: Vis,                  // the visibility keyword the current declaration carried
     varDecl: bool,             // `var` was read before the current top-level declaration
@@ -167,7 +190,20 @@ pub struct Parser {
     // What the declaration being read says beyond its signature: `-> never` (`parseRetType`),
     // `builtin` (`fnAttrs` carries the bit until `parseFunctionDef` reads it).
     retNever: bool,
-    fnAttrs: long
+    fnAttrs: long,
+    // The statement read last, so that an `=` starting the next one can say what it follows
+    // (`{ x } = 1`: a block is not something a store can go to).
+    lastStmt: long,
+    // Going on past a declaration with an error in it (`parseDeclRecovering`): the type the
+    // top-level declaration being read declares, once its name is read; the types of the ones taken
+    // back, and whether the declaration being read has named one, which drops it without a report
+    // (`dropIfAbandoned`); the module's own cursor while compiler-written text is read in its place
+    // (`parseSynthetic`); and the names `fnReturns` gained, in order.
+    declName: Sym,
+    abandoned: Vec<Sym>,
+    usesAbandoned: bool,
+    synthSaved: Vec<Cursor>,
+    fnReturnsAdded: Vec<Sym>
 }
 
 pub parserOf source:str -> Parser {
@@ -179,7 +215,7 @@ pub parserOf source:str -> Parser {
                          implMangled: NO_SYM, implChecks: vec![], noCast: 0, inPointee: 0, quoteDepth: 0, pendingInits: vec![], fnReturns: map![],
                          peeked: tokenOf(Tok.FileEnd), hasPeeked: false,
                          closureBound: vec![], closureName: vec![], captures: vec![], closureSeq: map![],
-                         vis: Vis.Local, varDecl: false,
+                         unsafeDepth: 0, vis: Vis.Local, varDecl: false,
                          pending: vec![], typeVars: vec![],
                          boundFirst: 0, boundCount: 0,
                          lenVars: vec![], tplParams: vec![], selfTpl: NO_SYM, selfParams: vec![],
@@ -188,7 +224,9 @@ pub parserOf source:str -> Parser {
                          curPos: 0, peekPos: 0, blanketVar: NO_SYM, blanketAs: NO_SYM , retTy: typeRefOf(Lit.Void), retOk: false,
                          tryHole: vec![], tryOperand: vec![], tryName: vec![], toMark: 0, toImpure: false,
                          toCond: 0, toLhs: 0, toOrder: vec![], contIf: -1, contPre: vec![],
-                         retNever: false, fnAttrs: 0 };
+                         retNever: false, fnAttrs: 0, lastStmt: -1,
+                         declName: NO_SYM, abandoned: vec![], usesAbandoned: false, synthSaved: vec![],
+                         fnReturnsAdded: vec![] };
     p.advance();
     p.pushScope();
     return p;
@@ -201,6 +239,7 @@ methods Parser {
         was: Token = self.cur;
         if (self.hasPeeked) { self.cur = self.peeked; self.curPos = self.peekPos; self.hasPeeked = false; }
         else { self.cur = self.lx.next(); self.curPos = self.lexPos(); }
+        if (self.abandoned.len() > 0 && self.cur.kind == Tok.Id) { self.noteAbandonedUse(); }
         return was;
     }
 
@@ -235,15 +274,40 @@ methods Parser {
     }
     expect &self k:Tok -> Token {
         if (self.cur.kind != k) {
-            self.err(format("Expected token of type {}, but found {}",
-                            tokName(k), tokName(self.cur.kind)));
+            self.err(format("expected {}, found {}", describeKind(k), describeTok(self.cur)));
         }
         return self.advance();
     }
+    // A syntax error, reported where the current token begins: the token the parser could not
+    // use, which is where gcc and rustc point too. Before the first token has a position (a
+    // lexer run on raw text), the lexer's own cursor is the best there is.
     err &self msg:String -> void {
-        where: str = "";
-        if (self.lx.currentFile != NO_SYM) { where = nameOf(self.lx.currentFile); }
-        failAtStr(where, self.lx.fileLine, self.lx.charNumber, msg);
+        p: long = self.curPos;
+        if (p == 0 || posFile(p) == NO_SYM) {
+            self.dropIfAbandoned();
+            where: str = "";
+            if (self.lx.currentFile != NO_SYM) { where = nameOf(self.lx.currentFile); }
+            failAtStr(where, self.lx.fileLine, self.lx.charNumber, msg);
+        }
+        self.errAt(p, msg);
+    }
+    // A syntax error at position `p`.
+    errAt &self p:long msg:String -> void {
+        self.dropIfAbandoned();
+        failAtStr(nameOf(posFile(p)), posLine(p), posCol(p), msg);
+    }
+    // A declaration that names a type whose own declaration was taken back is taken back too,
+    // without a word: its error may be no more than that one's, met again, and the compile stops
+    // after the parse either way. The raise is the parser's own, to the `recover` the declaration
+    // is read under (`parseDeclRecovering`).
+    dropIfAbandoned &self -> void {
+        if (self.usesAbandoned && recoverArmed()) { unsafe { raise(); } }
+    }
+    // Whether the token just taken is the name of a type a declaration taken back was declaring.
+    noteAbandonedUse &self -> void {
+        for k in 0..self.abandoned.len() {
+            if (self.abandoned.get(k) == self.cur.text) { self.usesAbandoned = true; }
+        }
     }
 
     // `<file>:<line>` for the token being parsed, what a diagnostic says, in the one place a
@@ -280,13 +344,13 @@ methods Parser {
         while (j > frame) {
             j = j - 1;
             if (self.scopes.get(j).name == n) {
-                self.err(format("'{}' is already declared in this block", nameOf(n)));
+                self.err(format("`{}` is already declared in this block", nameOf(n)));
             }
         }
         // A length parameter is a value in the body, so a variable of the same name would make
         // `N` mean two things; monomorphization writes the length over every use of the name.
         if (self.isLenVar(n)) {
-            self.err(format("'{}' is a length parameter here, and cannot also name a variable", nameOf(n)));
+            self.err(format("`{}` is a length parameter here, so it cannot also name a variable", nameOf(n)));
         }
         renamed: Sym = n;
         if (self.lookupLocal(n) != NO_SYM) {
@@ -337,8 +401,9 @@ methods Parser {
     // for a scalar, which is captured by pointer so a write inside reaches the original.
     //
     // Closures nest, and a variable named by an inner one is captured by every closure between it
-    // and its declaration -- each from the one around it, so the inner reads a field of the outer's
-    // struct rather than the original variable, which is no longer in scope where it is built.
+    // and its declaration, each from the one around it. The inner closure reads a field of the
+    // outer one's struct rather than the original variable, which is no longer in scope where the
+    // inner one is built.
     captureOf &self n:Sym -> NodeId {
         lv: long = self.closureBound.len() - 1;
         if (lv < 0) { return NO_NODE; }
@@ -346,27 +411,70 @@ methods Parser {
         if (at == NOT_FOUND || at >= self.closureBound.get(lv)) { return NO_NODE; }
         b: Binding = self.scopes.get(at);
         if (b.kind == Lit.Ref && isInoutScalarName(b.structName)) {
-            self.err(format("'{}' is an `inout` scalar parameter, which a closure cannot capture -- copy it into a local first",
+            self.err(format("a closure cannot capture `inout` scalar parameter `{}`\nhelp: copy it into a local first, and capture that",
                             nameOf(n)));
         }
         // A scalar is captured by pointer, so a write inside the closure lands on the original;
         // a struct by borrow; anything already a handle (str, slice, trait object, fn) by copy.
-        byPtr: bool = !isAggregate(b.kind) && b.kind != Lit.Fn;
+        // A backed enum or a distinct type is spelled like a struct but is its integer, so it is
+        // a scalar here.
+        //
+        // A ref needs care, because `&` of a ref hands on the address it holds rather than taking
+        // the address of where it is held. A borrow of a struct (`&self`, an `inout` parameter)
+        // is captured as that borrow; through a pointer to it, every read would go through one
+        // load too many. The `&self` of `methods long`, `methods str` or a backed enum holds the
+        // value itself, and a store to it is refused, so the closure holds a copy. A `&T` keeps
+        // the pointer: at a scalar `T` it is the scalar, whose address `&` does take.
+        held: Binding = b;
+        lent: bool = false;
+        copied: bool = false;
+        if (b.kind == Lit.Ref && b.structName != NO_SYM && !self.isTypeVar(b.structName)
+            && !isInoutScalarName(b.structName)) {
+            q: str = nameOf(b.structName);
+            if (namesScalar(q)) {
+                copied = true;
+                held.kind = scalarNamed(q);
+                held.structName = NO_SYM;
+            } else if (namedScalar(Lit.Struct, b.structName)) {
+                copied = true;
+                held.kind = Lit.Struct;
+            } else {
+                lent = true;
+                // `self` in a generic type's methods is declared with the template's bare name,
+                // which monomorphization reads as the instance only inside those methods. The
+                // capture struct is a template of its own, so its field names the instance at
+                // the block's parameters.
+                if (b.structName == self.selfTpl) {
+                    none: Vec<TypeRef>;
+                    held.structName = self.instanceOf(b.structName, none).name;
+                }
+            }
+        }
+        named: bool = b.kind == Lit.Struct && namedScalar(Lit.Struct, b.structName);
+        byPtr: bool = (!isAggregate(b.kind) || named) && b.kind != Lit.Fn && !lent && !copied;
 
         // The outermost closure the declaration is not inside is the first that has to capture it.
         j: long = 0;
         while (at >= self.closureBound.get(j)) { j = j + 1; }
 
         v: NodeId = self.ast.leafOf(Op.Lvalue, Payload.Name(b.renamed), b.kind, b.structName);
-        if (byPtr || b.kind == Lit.Struct) { v = self.ast.unary(Op.AddressOf, v, Lit.Ptr); }
-        while (j <= lv) { v = self.captureAt(j, n, b, byPtr, v); j = j + 1; }
+        if (byPtr || lent || b.kind == Lit.Struct) { v = self.ast.unary(Op.AddressOf, v, Lit.Ptr); }
+        while (j <= lv) { v = self.captureAt(j, n, held, byPtr, v); j = j + 1; }
         if (byPtr) { return self.ast.unary(Op.Deref, v, b.kind); }
         return v;
     }
 
+    // The type a capture's field holds: a pointer to a scalar, a borrow of a struct, or the value
+    // itself for a handle or a copied `&self`.
+    captureField &self kind:Lit sn:Sym byPtr:bool -> TypeRef {
+        if (byPtr) { return TypeRef { base: Lit.Ptr, name: intern(typeMangleName(kind, sn)) }; }
+        if (kind == Lit.Struct && !namedScalar(Lit.Struct, sn)) { return TypeRef { base: Lit.Ref, name: sn }; }
+        return TypeRef { base: kind, name: sn };
+    }
+
     // Record `n` among closure level `lv`'s captures unless it is already there, and return the
-    // field access that reads it inside that closure -- which is also what the closure one level
-    // in stores, since by then the variable itself is out of scope.
+    // field access that reads it inside that closure. That access is also what the closure one
+    // level further in stores, since by then the variable itself is out of scope.
     captureAt &self lv:long n:Sym b:Binding byPtr:bool v:NodeId -> NodeId {
         seen: bool = false;
         for k in 0..self.captures.len() {
@@ -380,14 +488,11 @@ methods Parser {
         recv: NodeId = self.ast.leafOf(Op.Lvalue, Payload.Name(intern("__cl")), Lit.Ref,
                                        self.closureName.get(lv));
         self.ast.fields.push(FieldNode { base: recv, name: n });
-        fk: Lit = b.kind;
-        fs: Sym = b.structName;
-        if (byPtr) { fk = Lit.Ptr; fs = intern(typeMangleName(b.kind, b.structName)); }
-        else if (b.kind == Lit.Struct) { fk = Lit.Ref; }
-        return self.ast.leafOf(Op.FieldAccess, Payload.Field(self.ast.fields.len() - 1), fk, fs);
+        f: TypeRef = self.captureField(b.kind, b.structName, byPtr);
+        return self.ast.leafOf(Op.FieldAccess, Payload.Field(self.ast.fields.len() - 1), f.base, f.name);
     }
 
-    // Level `lv`'s captures, in the order they were met, removed from the flat list -- every
+    // Level `lv`'s captures, in the order they were met, taken out of the flat list. Every other
     // closure still open keeps its own.
     takeCaptures &self lv:long -> Vec<Capture> {
         out: Vec<Capture>;
@@ -400,11 +505,11 @@ methods Parser {
         return out;
     }
 
-    // `|x: T| expr` / `|x: T| { ... }` / `|| ...` -- desugared here into the three things it
-    // actually is: a struct holding one field per captured variable, a `call` method whose body is
-    // the closure's with each capture read through that struct, and a literal building it. The
-    // `Fn` trait for its arity is implemented by the struct, so a closure goes wherever a bound or
-    // a trait object asks for one and nothing downstream knows closures exist.
+    // A closure (`|x: T| expr`, `|x: T| { ... }` or `|| ...`) is desugared here into the three
+    // things it actually is: a struct holding one field per captured variable, a `call` method
+    // whose body is the closure's with each capture read through that struct, and a literal
+    // building it. The struct implements the `Fn` trait for its arity, so a closure goes wherever
+    // a bound or a trait object asks for one, and nothing downstream knows closures exist.
     parseClosure &self -> NodeId {
         // Numbered within the file it is written in, and marked with that file's path: the name
         // is a symbol, and a package compiled on its own must give a closure the same one its
@@ -456,7 +561,7 @@ methods Parser {
     }
 
     // What a block body returns: the first `return` it reaches, wherever it is nested. A closure
-    // whose body returns nothing is a `void` one -- which is most of the ones written for effect.
+    // whose body returns nothing is a `void` one, as most closures written for their effect are.
     firstReturnType &self b:long -> TypeRef {
         none: TypeRef = TypeRef { base: Lit.Void, name: NO_SYM };
         for k in 0..self.ast.blockLen(b) {
@@ -487,6 +592,12 @@ methods Parser {
             return none;
         }
         if (st.kind == StmtKind.While) { return self.firstReturnType(self.ast.whiles.get(st.at).body); }
+        if (st.kind == StmtKind.Recover) {
+            w: WhileNode = self.ast.whiles.get(st.at);
+            r: TypeRef = self.firstReturnType(w.body);
+            if (r.base != Lit.Void) { return r; }
+            return self.firstReturnType(w.step);
+        }
         if (st.kind == StmtKind.Loop || st.kind == StmtKind.Unsafe || st.kind == StmtKind.Block) {
             return self.firstReturnType(self.ast.blockStmts.get(st.at).body);
         }
@@ -501,7 +612,7 @@ methods Parser {
         return none;
     }
 
-    // `|a: T, b: U|`, or `||` for none -- the lexer fuses the empty pair into one token.
+    // `|a: T, b: U|`, or `||` for none (the lexer reads the empty pair as one token).
     parseClosureParams &self -> Vec<long> {
         out: Vec<long>;
         if (self.eat(Tok.LogicalOr)) { return out; }
@@ -543,10 +654,9 @@ methods Parser {
         cursor: long = 0;
         for k in 0..caps.len() {
             c: Capture = caps.get(k);
-            fk: Lit = c.kind;
-            fs: Sym = c.structName;
-            if (c.byPtr) { fk = Lit.Ptr; fs = intern(typeMangleName(c.kind, c.structName)); }
-            else if (c.kind == Lit.Struct) { fk = Lit.Ref; }
+            f: TypeRef = self.captureField(c.kind, c.structName, c.byPtr);
+            fk: Lit = f.base;
+            fs: Sym = f.name;
             p: Placed = placeField(cursor, FieldDef { name: c.name, kind: fk, structName: fs,
                                                       offset: 0, isArray: false, count: 0 });
             fields.push(p.field);
@@ -556,6 +666,7 @@ methods Parser {
         }
         if (self.typeVars.len() == 0) {
             regAddStruct(base, fields, alignUp(cursor, 8), false);
+            regMarkClosure(base);
         } else {
             // The layout computed above is discarded: a field whose type is still a parameter has
             // no size yet, and the stamp lays each instance out from what its arguments turned
@@ -573,6 +684,7 @@ methods Parser {
             self.tplParams = self.paramInfosOf(params);
             self.recordTemplate(base, params, gfields, false);
             self.tplParams = saved;
+            regMarkClosure(base);
             regRequest(base, self.closurePattern(base), args, self.plainBody);
         }
         self.ast.structDecls.push(base);
@@ -591,7 +703,7 @@ methods Parser {
     fnTraitFor &self n:long -> Sym {
         // A trait's name is flat, so the spelling IS the name and there is nothing to resolve.
         q: Sym = internString(format("Fn{}", n));
-        if (gReg.findTrait(nameOf(q)) >= 0) { return q; }
+        if (gReg.findTraitSym(q) >= 0) { return q; }
 
         params: Vec<TypeRef>;
         ps: Vec<long>;
@@ -638,9 +750,12 @@ methods Parser {
 
         name: Sym = methodName(base, intern("call"));
         first: long = self.ast.addParams(all);
+        // Trusted exactly where its text is: inside `unsafe`, the body is one trusted region, and
+        // elsewhere it is safe code. The capture reads this desugaring wrote are not the author's
+        // raw-pointer reads, and the checker knows them by shape (`Checker.captureRead`).
         self.ast.fns.push(FnNode { name: name, returnKind: ret.base, returnStruct: ret.name,
                                    visibility: Vis.Pub, file: self.lx.currentFile,
-                                   pkg: self.lx.currentPackage, isUnsafe: true,
+                                   pkg: self.lx.currentPackage, isUnsafe: self.unsafeDepth > 0,
                                    // A template alongside its struct, so the stamp clones it per
                                    // instance: `$closureN_call` is what `cloneMethods` finds by
                                    // the struct's own prefix.
@@ -672,9 +787,7 @@ methods Parser {
 
     currentModule &self -> str { return stemOf(nameOf(self.lx.currentFile)); }
 
-    // A top-level name belongs to the module that declared it, so that two modules may use the
-    // same one without colliding.
-    // The one name the runtime looks up bare, so it is never qualified: `main`, what `_start`
+    // The one name the runtime looks up bare, so it is never qualified: `main`, which `_start`
     // calls. (Startup and shutdown hooks are declared `@init`/`@fini`, never found by name.)
     isRuntimeHook &self n:str -> bool { return n == "main"; }
 
@@ -711,7 +824,7 @@ methods Parser {
     requireTypeNameFree &self bare:str -> void {
         owner: str = self.typeNameOwner(bare);
         if (owner.len > 0) {
-            self.err(format("type name '{}' is already {}", bare, owner));
+            self.err(format("the type name `{}` is already taken by {}", bare, owner));
         }
     }
     // The same, asking only about this module's own names: what a file-owned trait claims.
@@ -724,10 +837,12 @@ methods Parser {
         else if (gReg.findTemplate(q) >= 0) { owner = "a generic type"; }
         else if (gReg.findEnum(q) >= 0) { owner = "an enum"; }
         if (owner.len > 0) {
-            self.err(format("type name '{}' is already {}", bare, owner));
+            self.err(format("the type name `{}` is already taken by {}", bare, owner));
         }
     }
 
+    // A top-level name belongs to the module that declared it, so that two modules may use the
+    // same one without colliding.
     qualify &self bare:str -> Sym {
         if (self.isRuntimeHook(bare)) { return intern(bare); }
         s: String;
@@ -793,8 +908,13 @@ methods Parser {
         return v;
     }
 
-    parseExprHere &self -> NodeId {
-        head: NodeId = self.parseAtom();
+    parseExprHere &self -> NodeId { return self.continueExpr(self.parseAtom()); }
+
+    // The rest of an expression whose first operand is read: each operator and the operand after
+    // it, put where precedence says. A statement that begins with a name reads the name's chain
+    // first and only then finds an operator after it.
+    continueExpr &self first:NodeId -> NodeId {
+        head: NodeId = first;
         going: bool = true;
         while (going) {
             op: Op = self.peekBinOp();
@@ -825,7 +945,7 @@ methods Parser {
                         // value, `long`'s minimum.
                         if (e.kind == Lit.U64) {
                             if (n != 0 - n) {
-                                self.err(format("-{} is below the smallest integer (`long`'s, -9223372036854775808)", n as u64));
+                                self.err(format("literal `-{}` out of range for `long`\nnote: the smallest `long` is -9223372036854775808", n as u64));
                             }
                             return self.numberLit(n, Lit.Long);
                         }
@@ -872,7 +992,8 @@ methods Parser {
             v: NodeId = self.parseOperand();
             // What `*p` yields is the pointee, which only the checker can read out of the
             // pointer's companion name. Until then the node carries the operand's own type
-            // rather than a guess at `long`, which was wrong for every pointer to anything else.
+            // rather than a guess at `long`, which would be wrong for every pointer to anything
+            // else.
             return self.parsePostfix(self.ast.unary(Op.Deref, v, self.ast.expr(v).kind));
         }
         if (self.check(Tok.Ampersand)) {
@@ -913,10 +1034,10 @@ methods Parser {
             return self.parsePostfix(self.numberLit(v, Lit.Bool));
         }
 
-        // `@x` inside a quote: a splice -- the Node that `x` holds goes here. Only meaningful
-        // inside a quote; anywhere else `@` still opens a macro statement.
-        // `@x` is the variable alone and `@(e)` the parenthesized expression, so what follows --
-        // `.f`, `.m(...)`, `[i]` -- is quoted, applying to the spliced tree.
+        // `@x` inside a quote is a splice: the Node that `x` holds goes here. Outside a quote `@`
+        // still opens a macro statement. `@x` is the variable alone and `@(e)` the parenthesized
+        // expression, so whatever follows (`.f`, `.m(...)`, `[i]`) is quoted, and applies to the
+        // spliced tree.
         if (self.quoteDepth > 0 && self.check(Tok.AtSign)) {
             self.advance();
             held: NodeId = self.parseSpliceHeld();
@@ -948,8 +1069,8 @@ methods Parser {
             // its backing int and loses which enum it was.
             bare: Token = self.expect(Tok.Id);
             en: Sym = self.resolveHere(nameOf(bare.text));
-            if (!gReg.isEnumType(nameOf(en))) {
-                self.err(format("nameof(E, v) names the variants of an enum — '{}' is not one",
+            if (!gReg.isEnumTypeSym(en)) {
+                self.err(format("`{}` is not an enum\nnote: `nameof(E, v)` names the variant of enum `E` that `v` holds",
                                 nameOf(bare.text)));
             }
             self.expect(Tok.Comma);
@@ -973,7 +1094,7 @@ methods Parser {
             return self.ast.leaf(Op.ArrayLit, Payload.Lit(self.ast.lits.len() - 1), Lit.Void);
         }
 
-        self.err(format("Expected an expression, but found {}", tokName(self.cur.kind)));
+        self.err(format("expected an expression, found {}", describeTok(self.cur)));
         return NO_NODE;
     }
 
@@ -999,8 +1120,8 @@ methods Parser {
     // The same, for a caller that has already taken the identifier off the stream: a statement
     // beginning with a name looks like a declaration or a function definition until several
     // tokens later, so `parseFromName` consumes it before it can know. It is one function rather
-    // than two because a statement's leading name means everything an expression's does:
-    // including being a closure capture, which the second copy this replaced did not know.
+    // than two because a statement's leading name means everything an expression's does,
+    // including being a closure capture, and a second copy would have to keep up with all of it.
     parseNamedFrom &self name:Token -> NodeId {
         // `T.max()` inside a blanket implementation: the scalar this reading is for.
         if (self.blanketVar != NO_SYM && name.text == self.blanketVar && self.bindingOf(name.text).renamed == NO_SYM) {
@@ -1017,15 +1138,14 @@ methods Parser {
         // A name a local declares is that local, and nothing else. Asked once, before any of the
         // branches that read a name as a type: `s.len` where `s` is a variable must not become a
         // member of a type that happens to share its name, and `a < b` must not become an
-        // instantiation. The C++ parser guards its own bare-name type resolution the same way
-        // (`variableTypes.find(name) == end()`), which is what kept an enum out of the way there.
+        // instantiation.
         isLocal: bool = self.bindingOf(name.text).renamed != NO_SYM;
 
         // `Name { ... }`: a struct literal, but only for a name that is a struct: an ordinary
         // variable followed by a block is a condition, not a construction.
         if (!isLocal && self.check(Tok.LessThan)) {
             base: Sym = self.resolveHere(nameOf(name.text));
-            if (gReg.isGeneric(nameOf(base))) {
+            if (gReg.isGenericSym(base)) {
                 inst: TypeRef = self.parseGenericArgs(base);
                 return self.parsePostfix(self.parseStructLit(inst.name));
             }
@@ -1034,7 +1154,7 @@ methods Parser {
             q: Sym = self.resolveHere(nameOf(name.text));
             // A template counts: inside `methods Vec<T>` the literal `Vec { ... }` names the
             // instance being stamped out, which does not exist as a struct yet.
-            if (gReg.hasStruct(nameOf(q)) || gReg.isGeneric(nameOf(q))) {
+            if (gReg.hasStructSym(q) || gReg.isGenericSym(q)) {
                 return self.parsePostfix(self.parseStructLit(q));
             }
         }
@@ -1061,15 +1181,15 @@ methods Parser {
                 return self.parsePostfix(self.parseVariant(owner, v.text));
             }
             // An enum with no payloads is a set of named integers: `BoxTag.Str` is its value and
-            // nothing downstream ever sees a variant. Read as a field access it became a load
-            // from a global nobody declared, and every comparison against one was false.
-            if (gReg.isEnumType(nameOf(owner))) {
+            // nothing downstream ever sees a variant. Read as a field access it would become a
+            // load from a global nobody declared, and every comparison against one would be false.
+            if (gReg.isEnumTypeSym(owner)) {
                 self.advance();
                 v: Token = self.expect(Tok.Id);
-                // `Color.decode(inp)`: not a variant but a static method of the enum -- one a
-                // trait gives it, `methods Color for Decode` -- called on the type.
+                // `Color.decode(inp)`: not a variant but a static method of the enum (one a
+                // trait gives it, `methods Color for Decode`), called on the type.
                 if (self.check(Tok.LeftParen)
-                    && gReg.findVariant(gReg.enumDef(gReg.findEnum(nameOf(owner))), nameOf(v.text)) < 0) {
+                    && gReg.findVariant(gReg.enumDef(gReg.findEnumSym(owner)), nameOf(v.text)) < 0) {
                     self.advance();
                     sargs: Vec<NodeId> = self.parseArgs();
                     self.ast.calls.push(CallNode { name: v.text, receiver: self.nameRef(owner, Lit.Struct, owner),
@@ -1099,12 +1219,13 @@ methods Parser {
                                                    Lit.Void));
         }
 
-        // `name!(args)` -- a macro call: the compiler runs `name` while checking and puts what it
-        // returned here. The arguments are read as ordinary expressions; which of them the macro
-        // takes as a tree is decided by its signature, once the checker has it.
-        // `name![ ... ]` -- the raw form: the macro gets the source text between the brackets as a
-        // `str` and reads it however it likes, `parseExpr` being what reads a piece of it as code.
-        // Parentheses: the compiler parses the arguments; brackets: the macro does.
+        // `name!(args)` is a macro call: the compiler runs `name` while checking and puts what it
+        // returned here. The arguments are read as ordinary expressions, and the macro's
+        // signature decides, once the checker has it, which of them it takes as a tree.
+        // `name![ ... ]` is the raw form: the macro gets the source text between the brackets as
+        // a `str` and reads it however it likes, using `parseExpr` to read a piece of it as code.
+        // In short, with parentheses the compiler parses the arguments, and with brackets the
+        // macro does.
         if (self.check(Tok.Exclamation) && self.peekNext().kind == Tok.LeftSquare) {
             self.advance();
             self.advance();
@@ -1172,7 +1293,6 @@ methods Parser {
         return out;
     }
 
-    // `.field`, `.method(...)`, `[index]`, and `as Type`, chained for as long as they continue.
     // A prefix operator's operand: everything a postfix chain gives, minus the cast.
     parseOperand &self -> NodeId {
         self.noCast = self.noCast + 1;
@@ -1181,6 +1301,7 @@ methods Parser {
         return v;
     }
 
+    // `.field`, `.method(...)`, `[index]`, `?` and `as Type`, chained for as long as they continue.
     parsePostfix &self v:NodeId -> NodeId {
         going: bool = true;
         while (going) {
@@ -1231,9 +1352,9 @@ methods Parser {
                                                   whole: ix.whole, rawPointerBase: false,
                                                   sliceStart: ix.lo, sliceEnd: ix.hi, at: at });
                 id: long = self.ast.indexes.len() - 1;
-                // `int` as the placeholder an index carries until the checker reads the element
-                // type out of the base: the same placeholder the C++ parser leaves, so an
-                // assignment over one is typed the same on both sides.
+                // `int` is the placeholder an index carries until the checker reads the element
+                // type out of the base. It is the placeholder the earlier compiler left, so an
+                // assignment over one is typed the same way it was there.
                 v = self.ast.leaf(Op.ArrayIndex, Payload.Index(id), Lit.Int);
             } else if (self.noCast == 0 && self.word("as")) {
                 self.advance();
@@ -1281,11 +1402,11 @@ methods Parser {
             return lengthArg(self.parseAngleLength());
         }
         // `@(t.name)` where a quote reads a type: the macro computes its spelling, a `str`. It
-        // stands alone -- `&@(x)` would have to build a spelling at the macro's run time -- so a
-        // borrow of one is written `inout p:@(x)`, or spelled in full by the macro.
+        // has to stand alone, because `&@(x)` would have to build a spelling at the macro's run
+        // time. A borrow of one is written `inout p:@(x)`, or spelled in full by the macro.
         if (self.quoteDepth > 0 && self.check(Tok.AtSign)) {
             self.advance();
-            if (self.inPointee > 0) { self.err(stringOf("a spliced type stands alone: build the whole spelling in the macro")); }
+            if (self.inPointee > 0) { self.err(stringOf("a spliced type cannot be part of another type\nhelp: build the whole spelling in the macro")); }
             return TypeRef { base: Lit.Struct, name: splicedName(self.parseSpliceHeld()) };
         }
         // `(A, B)`: a structural aggregate. Its elements are what it is, so they are registered
@@ -1301,14 +1422,14 @@ methods Parser {
             while (!self.check(Tok.RightParen) && !self.check(Tok.FileEnd)) {
                 t: TypeRef = self.parseTypeRef();
                 if (t.base == Lit.Ref || t.base == Lit.Void || t.base == Lit.Len) {
-                    self.err(format("a tuple element is a value: '{}' cannot be one",
+                    self.err(format("`{}` cannot be a tuple element\nnote: a tuple element must be a value",
                                     typeMangleName(t.base, t.name)));
                 }
                 elems.push(t);
                 self.eat(Tok.Comma);
             }
             self.expect(Tok.RightParen);
-            if (elems.len() == 0) { self.err(stringOf("`()` is not a type: a tuple has at least one element")); }
+            if (elems.len() == 0) { self.err(stringOf("`()` is not a type\nnote: a tuple has at least one element")); }
             return namedTypeRef(Lit.Struct, regTuple(elems));
         }
         if (self.check(Tok.Star)) {                      // *T
@@ -1329,7 +1450,7 @@ methods Parser {
             }
             if (inner.base == Lit.Ref) { return inner; }
             if (typeInfo(inner.base).aggregate) {
-                self.err(format("'&' can borrow a struct or a type parameter, not a {}", typeName(inner.base)));
+                self.err(format("`&` cannot borrow a {}\nnote: `&T` borrows a struct or a type parameter", typeName(inner.base)));
             }
             return inner;
         }
@@ -1376,7 +1497,7 @@ methods Parser {
         if (self.isTypeVar(name.text)) {
             self.typeVarUses = self.typeVarUses + 1;
             if (!allowLen && self.isLenVar(name.text)) {
-                self.err(format("'{}' is a length parameter, not a type — it goes where a length does: `[T; {}]`, a value, or a template's length argument",
+                self.err(format("`{}` is a length parameter, not a type\nhelp: use it as an array's length (`[T; {}]`), as a value, or as a template's length argument",
                                 spelling, spelling));
             }
             return TypeRef { base: Lit.TypeVar, name: name.text };
@@ -1402,7 +1523,7 @@ methods Parser {
         // of a trait, not an instance of a generic struct, and reading it as the latter asks for
         // a type nobody declared. Its arguments stamp a concrete trait, so everything downstream
         // deals only in those. One vtable per instance, one set of signatures.
-        ti: long = gReg.findTrait(nameOf(q));
+        ti: long = gReg.findTraitSym(q);
         if (ti >= 0) {
             targs: Vec<TypeRef>;
             if (self.check(Tok.LessThan)) {
@@ -1419,18 +1540,18 @@ methods Parser {
             // an instance nobody declared.
             want: long = gReg.traitDef(ti).paramCount;
             if (want > 0 && targs.len() == 0) {
-                self.err(format("trait '{}' takes type arguments — write {}<...>",
+                self.err(format("missing type arguments for trait `{}`\nhelp: write `{}<...>`",
                                 spelling, spelling));
             }
             if (want == 0 && targs.len() > 0) {
-                self.err(format("trait '{}' takes no type arguments", spelling));
+                self.err(format("trait `{}` takes no type arguments", spelling));
             }
             return TypeRef { base: Lit.TraitObj, name: regStampTrait(q, targs) };
         }
         if (self.check(Tok.LessThan)) { return self.parseGenericArgs(q); }
-        if (gReg.isGeneric(nameOf(q))) { return self.defaultInstance(q); }
-        // A type alias is a second spelling of a type, not a type of its own. Expanding it here (
-        // the one place a type is read) is what keeps every later phase from having to know
+        if (gReg.isGenericSym(q)) { return self.defaultInstance(q); }
+        // A type alias is a second spelling of a type, not a type of its own. Expanding it here,
+        // the one place a type is read, is what keeps every later phase from having to know
         // aliases exist: `AtomicInt` becomes `Atomic_int`, with its size, fields and methods.
         al: long = gReg.findAlias(nameOf(q));
         if (al >= 0) { return gReg.aliasDef(al).target; }
@@ -1438,7 +1559,7 @@ methods Parser {
         // itself later it becomes a struct with no fields and no size, and what gets reported is
         // whichever offset or copy that silence eventually breaks.
         if (self.inPointee == 0 && !gReg.declares(nameOf(q))) {
-            self.err(format("Unknown type '{}'", written));
+            self.err(format("cannot find type `{}` in this scope", written));
         }
         return TypeRef { base: Lit.Struct, name: q };
     }
@@ -1450,6 +1571,48 @@ pub unquoted t:Sym -> Sym {
     s: str = nameOf(t);
     if (s.len >= 2 && charAt(s, 0) == '"') { return intern(strSlice(s, 1, s.len - 2)); }
     return t;
+}
+
+// What a store can go to: a variable, a field, an element, or what a pointer points at.
+pub isPlaceOp op:Op -> bool {
+    return op == Op.Lvalue || op == Op.FieldAccess || op == Op.ArrayIndex || op == Op.Deref;
+}
+
+// What the target of a store is, said the way a refusal names it, for one that is not a place:
+// "a tuple expression", "the result of a call to `f`", "the result of `+`".
+pub nonPlaceText a:Ast id:NodeId -> String {
+    e: Expr = a.expr(id);
+    o: Op = e.op;
+    if (o == Op.TupleLit) { return stringOf("a tuple expression"); }
+    if (o == Op.StructLit) { return stringOf("a struct literal"); }
+    if (o == Op.ArrayLit) { return stringOf("an array literal"); }
+    if (o == Op.Literal || o == Op.StringLit) { return stringOf("a literal"); }
+    if (o == Op.Cast) { return stringOf("a cast"); }
+    if (o == Op.FunctionCall || o == Op.MethodCall || o == Op.MacroCall) {
+        callee: str = "";
+        match e.payload { Call(ix) { callee = sourceName(a.calls.get(ix).name); } _ { } }
+        if (o == Op.MacroCall) { return format("the result of `{}!`", callee); }
+        if (callee.len == 0) { return stringOf("the result of a call"); }
+        return format("the result of a call to `{}`", callee);
+    }
+    if (o == Op.AddressOf) { return stringOf("an address"); }
+    if (o == Op.Assignment) { return stringOf("an assignment"); }
+    if (o == Op.Sizeof || o == Op.Nameof) { return format("the result of `{}`", opName(o)); }
+    if (e.left != NO_NODE || o == Op.LogicalNot || o == Op.BitwiseNot) { return format("the result of `{}`", opName(o)); }
+    return stringOf("this expression");
+}
+
+// A name as its declaration spelled it: without the module a top-level name is qualified with,
+// or the `$n` a shadowing local was renamed with.
+local sourceName n:Sym -> str {
+    s: str = nameOf(n);
+    from: long = 0;
+    for i in 0..s.len {
+        if (i + 1 < s.len && charAt(s, i) == ':' && charAt(s, i + 1) == ':') { from = i + 2; }
+    }
+    to: long = s.len;
+    for i in from..s.len { if (charAt(s, i) == '$' && to == s.len) { to = i; } }
+    return strSlice(s, from, to - from);
 }
 
 // Where each operator sits on the ladder: higher binds tighter. Leaves and the prefix operators
@@ -1487,11 +1650,11 @@ methods Parser {
     parseStmtsUntilClose &self -> Vec<long> {
         ids: Vec<long>;
         // A queued initializer belongs to the block that declared it, so the queue is drained
-        // before the brace closes. Stopping at the brace left the last declaration's store behind,
-        // and the enclosing block's next statement handed it back, so `if (c) { a: long = 1; }`
-        // ran the store unconditionally, writing a variable scoped to the inner block. Only the
-        // last declaration of a block was affected, because every earlier one has a following
-        // statement to be handed back at.
+        // before the brace closes. Stopping at the brace would leave the last declaration's store
+        // behind for the enclosing block's next statement to hand back, so
+        // `if (c) { a: long = 1; }` would run the store unconditionally, writing a variable scoped
+        // to the inner block. Only a block's last declaration is at risk, because every earlier
+        // one has a following statement to be handed back at.
         going: bool = true;
         while (going) {
             if (self.pendingInits.len() == 0
@@ -1547,6 +1710,7 @@ methods Parser {
         }
         self.ast.stmtPos.set(id, start);
         gPos = was;
+        self.lastStmt = id;
         return id;
     }
 
@@ -1573,8 +1737,9 @@ methods Parser {
             if ((self.word("match") && !self.namedHere()))    { self.advance(); return self.parseMatch(); }
             if ((self.word("for") && !self.namedHere()))      { self.advance(); return self.parseFor(); }
             if ((self.word("unsafe") && !self.namedHere()))   { self.advance(); return self.parseUnsafe(); }
+            if ((self.word("recover") && !self.namedHere()))  { self.advance(); return self.parseRecover(); }
             if ((self.word("asm") && !self.namedHere()))      { self.advance(); return self.parseAsmBlock(); }
-            // `assert!(cond);` -- a statement macro. The `!` is what marks a macro call, so a
+            // `assert!(cond);` is a statement macro. The `!` is what marks a macro call, so a
             // function named `assert` is still an ordinary call.
             if (self.word("assert") && self.peekNext().kind == Tok.Exclamation
                 && !gReg.isMacro(self.resolveHere("assert"))) {
@@ -1589,7 +1754,7 @@ methods Parser {
             return self.finishAssignOrExpr(lhs);
         }
         if (self.check(Tok.AtSign)) {
-            self.err(stringOf("`@` splices a Node inside a `quote`; a macro is called as `name!(...)`"));
+            self.err(stringOf("unexpected `@` outside a `quote`\nnote: `@x` splices a Node into a quote\nhelp: a macro is called as `name!(...)`"));
         }
         if (self.check(Tok.Star)) {              // *p = v: a store through a pointer
             lhs: NodeId = self.parseAtom();
@@ -1602,7 +1767,22 @@ methods Parser {
                                  || self.check(Tok.Literal) || self.check(Tok.LeftParen))) {
             return self.finishAssignOrExpr(self.parseExpr());
         }
-        self.err(format("Expected a statement, but found {}", tokName(self.cur.kind)));
+        // `{ x } = 1;`, `if (c) { a } else { b } = 1;`: a block, an `if`, a `match` or a loop is a
+        // statement here and yields no value, so what follows it cannot store into it.
+        if (self.check(Tok.Equals) && self.lastStmt >= 0) {
+            k: StmtKind = self.ast.stmts.get(self.lastStmt).kind;
+            what: str = "";
+            if (k == StmtKind.Block) { what = "a block"; }
+            else if (k == StmtKind.If) { what = "an `if`"; }
+            else if (k == StmtKind.Match) { what = "a `match`"; }
+            else if (k == StmtKind.Unsafe) { what = "an `unsafe` block"; }
+            else if (k == StmtKind.Recover) { what = "a `recover`"; }
+            else if (k == StmtKind.While || k == StmtKind.Loop) { what = "a loop"; }
+            if (what.len > 0) {
+                self.err(format("cannot assign to {}\nnote: it is a statement and yields no value, so a store has nothing to go to\nhelp: assign inside it (`{{ x = v; }}`), or to a variable it sets", what));
+            }
+        }
+        self.err(format("expected a statement, found {}", describeTok(self.cur)));
         return 0;
     }
 
@@ -1649,6 +1829,22 @@ methods Parser {
         return self.ast.addStmt(StmtKind.Loop, self.ast.blockStmts.len() - 1);
     }
 
+    // `recover { body } else { handler }`. The handler is not optional: a `recover` that
+    // swallows a `raise` and says nothing about it is better written with an empty one, where
+    // the reader can see it.
+    parseRecover &self -> long {
+        if (!self.check(Tok.LeftCurly)) {
+            self.err(format("expected `{{` after `recover`, found {}\nhelp: write `recover {{ ... }} else {{ ... }}`", describeTok(self.cur)));
+        }
+        body: long = self.parseBlock();
+        if (!self.eatWord("else")) {
+            self.err(format("expected `else` after the body of a `recover`, found {}\nnote: the `else` block is where a `raise` under the body resumes\nhelp: write `recover {{ ... }} else {{ ... }}`", describeTok(self.cur)));
+        }
+        handler: long = self.parseBlock();
+        self.ast.whiles.push(WhileNode { cond: NO_NODE, body: body, step: handler });
+        return self.ast.addStmt(StmtKind.Recover, self.ast.whiles.len() - 1);
+    }
+
     parseReturn &self -> long {
         v: NodeId = NO_NODE;
         if (!self.check(Tok.Semicolon)) { v = self.parseExpr(); }
@@ -1662,7 +1858,7 @@ methods Parser {
     parseJump &self k:StmtKind what:str -> long {
         self.eat(Tok.Semicolon);
         if (self.loopDepth == 0) {
-            self.err(format("`{}` is only valid inside a `while` or `loop`", what));
+            self.err(format("`{}` outside of a loop", what));
         }
         return self.ast.addStmt(k, 0);
     }
@@ -1701,24 +1897,45 @@ methods Parser {
         if (self.check(Tok.LessThan) && self.fnDepth == 0) {
             return self.parseGenericFunction(name.text);
         }
-        // `name args -> type { }` or `name -> type { }`: a function definition.
-        if (self.check(Tok.Arrow) || self.check(Tok.Id)) { return self.parseFunctionDef(name.text); }
+        // `name args -> type { }` or `name -> type { }`: a function definition. Not `x as T`,
+        // which no parameter list can start with: a cast, the start of an expression.
+        castNext: bool = self.fnDepth > 0 && self.word("as") && !self.namedHere();
+        if (self.check(Tok.Arrow) || (self.check(Tok.Id) && !castNext)) { return self.parseFunctionDef(name.text); }
 
-        return self.finishAssignOrExpr(self.parseNamedFrom(name));
+        lhs: NodeId = self.parseNamedFrom(name);
+        // `a + b = 3`: an operator after the name's chain. Read to the expression's end, so a
+        // store to it is refused as one; anything else is the error it always was, a statement
+        // cannot go on past the name.
+        if (self.fnDepth > 0 && self.peekBinOp() != Op.Literal) {
+            opAt: long = self.curPos;
+            op: Token = self.cur;
+            full: NodeId = self.continueExpr(lhs);
+            if (self.check(Tok.Equals) || self.compoundOp() != Op.Literal) { return self.finishAssignOrExpr(full); }
+            self.errAt(opAt, format("expected a statement, found {}", describeTok(op)));
+        }
+        return self.finishAssignOrExpr(lhs);
     }
 
     // An assignment to the place just parsed, or a bare expression statement.
     finishAssignOrExpr &self lhs:NodeId -> long {
+        // Where the statement, and so the target, begins.
+        at: long = gPos;
         // `self.leaf, pos = ...`: a destructure whose first target is a place, not a bare name.
-        if (self.check(Tok.Comma) && self.isPlace(lhs)) { return self.parseDestructureInto(lhs, NO_SYM); }
+        // Nothing else may stand before a comma at the start of a statement.
+        if (self.check(Tok.Comma)) {
+            if (self.isPlace(lhs)) { return self.parseDestructureInto(lhs, NO_SYM); }
+            self.refuseNonPlace(lhs, at, stringOf("a destructure assigns to places: a local, a field, an element or `*p`"));
+        }
         cop: Op = self.compoundOp();
         if (cop != Op.Literal) {
+            self.refuseNonPlace(lhs, at, format("`{}=` stores into its left side, which has to be a place: a local, a field, an element or `*p`", opName(cop)));
             self.advance();
             rhs: NodeId = self.parseExpr();
             self.expect(Tok.Semicolon);
             return self.compoundAssign(lhs, cop, rhs);
         }
         if (self.check(Tok.Equals)) {
+            self.refuseNonPlace(lhs, at, stringOf("a store needs a place: a local, a field, an element or `*p`"));
             self.advance();
             rhs: NodeId = self.parseExpr();
             self.expect(Tok.Semicolon);
@@ -1732,9 +1949,8 @@ methods Parser {
         }
         self.eat(Tok.Semicolon);
         // `f(args);`: the result is discarded, so the call carries no type. `calleeReturn`'s
-        // guess is for a call whose value is used; keeping it here would claim a statement yields
-        // something, which is also what the C++ parser declines to do (a bare call is a statement
-        // kind of its own there, with no result type at all).
+        // guess is for a call whose value is used, and keeping it here would claim a statement
+        // yields something.
         e: Expr = self.ast.expr(lhs);
         if (e.op == Op.FunctionCall) {
             e.kind = Lit.Void;
@@ -1744,7 +1960,7 @@ methods Parser {
         return self.ast.addStmt(StmtKind.Expr, self.ast.exprStmts.len() - 1);
     }
 
-    // `name: T;`  `name: T = v;`  `name: [T; N];`  `name: [T];` , the colon is already consumed.
+    // `name: T;`, `name: T = v;`, `name: [T; N];` or `name: [T];`. The colon is already consumed.
     //
     // `[T; N]` is an array: storage. `[T]` is a slice: a {ptr, len} view of storage someone else
     // owns. What follows the element type is what tells them apart.
@@ -1841,8 +2057,10 @@ methods Parser {
         ret: TypeRef = self.parseRetType();
         if (self.retNever) { attrs = attrs | FN_NEVER; }
         // Recorded before the body, so a recursive call inside it already knows what it yields.
-        // Keyed by the qualified name, which is what the reference records and therefore what a
-        // bare call site fails to find: the placeholder it falls back to is part of the shape.
+        // It is keyed by the qualified name, as the earlier compiler keyed it, so a bare call site
+        // does not find it and falls back to the placeholder. That keeps the tree the same shape
+        // the earlier compiler built.
+        if (!self.fnReturns.has(nameOf(q))) { self.fnReturnsAdded.push(q); }
         regFnReturn(&self.fnReturns, q, ret.base, pkg);
         // `name a:T -> R;`, declared, not defined: the body is in another object and the linker
         // will find it. A body of -1 is what says so, and every pass that walks one already asks
@@ -1856,7 +2074,7 @@ methods Parser {
         } else if (self.check(Tok.Semicolon)) {
             self.advance();
             if (self.vis != Vis.Pub) {
-                self.err(format("'{}' has no body, so it names something in another object — declare it `pub`",
+                self.err(format("function `{}` has no body\nnote: a declaration without a body names a function defined in another object\nhelp: declare it `pub`",
                                 nameOf(name)));
             }
         } else {
@@ -1881,9 +2099,8 @@ methods Parser {
         first: long = self.ast.addParams(params);
         self.ast.fns.push(FnNode { name: q,
                                    returnKind: ret.base, returnStruct: ret.name,
-                                   // What was written. This was `Vis.Local` outright, so the
-                                   // field said the same thing for `pub`, `pkg` and `local`
-                                   // alike -- which is half of why nothing ever enforced it.
+                                   // The visibility as written (`pub`, `pkg` or `local`),
+                                   // which is what the visibility checks read.
                                    visibility: self.vis,
                                    file: file, pkg: pkg,
                                    isUnsafe: false, isTemplate: false, inferReturn: false,
@@ -1906,13 +2123,13 @@ methods Parser {
     }
 
     // `builtin name params -> T;`: a declaration whose body the compiler provides. The primitive
-    // is the one its declaration names -- the library's declaration is the contract, visible
-    // where it stands, and calls reach it by ordinary name resolution like any function's -- and
-    // the signature is held to what the compiler provides, so a wrong one is refused here
-    // rather than miscompiled.
+    // is the one its declaration names. The library's declaration is the contract, visible where
+    // it stands, and calls reach it by ordinary name resolution like any function's. The
+    // signature is held to what the compiler provides, so a wrong one is refused here rather
+    // than miscompiled.
     builtinKind &self n:str params:Vec<long> ret:TypeRef attrs:long -> long {
         if (self.fnDepth > 0 || self.typeVars.len() > 0) {
-            self.err(format("`builtin {}`: a builtin is declared at the top level, and is not generic", n));
+            self.err(format("`builtin {}` must be declared at the top level and cannot be generic", n));
         }
         k: long = 0;
         want: str = "";
@@ -1935,11 +2152,46 @@ methods Parser {
             k = BI_EXIT;
             want = "builtin exit status:long -> never";
             ok = np == 1 && self.paramIs(params.get(0), Lit.Long, false) && (attrs & FN_NEVER) != 0;
+        } else if (atomicBuiltinOf(n) != 0) {
+            k = atomicBuiltinOf(n);
+            // The word is a `long`, or an `int` for the `32` forms: every operand and the result
+            // are of that type, and the address points at one.
+            w: Lit = Lit.Long;
+            if (k >= BI_ATOMIC_LOAD + BI_ATOMIC_32) { w = Lit.Int; }
+            ws: str = typeName(w);
+            op: long = atomicOpOf(k);
+            values: long = 1;
+            if (op == BI_ATOMIC_LOAD) { values = 0; }
+            if (op == BI_ATOMIC_CAS) { values = 2; }
+            gives: bool = op != BI_ATOMIC_STORE && op != BI_ATOMIC_STORE_SC;
+            ok = np == values + 1 && self.paramIsPtr(params.get(0), ws);
+            for j in 1..np { if (ok && !self.paramIs(params.get(j), w, false)) { ok = false; } }
+            if (gives) { ok = ok && ret.base == w; } else { ok = ok && ret.base == Lit.Void; }
+            s: String;
+            s.pushStr("unsafe builtin ");
+            s.pushStr(n);
+            s.pushStr(" p:*");
+            s.pushStr(ws);
+            if (op == BI_ATOMIC_CAS) { s.pushStr(" expected:"); s.pushStr(ws); s.pushStr(" desired:"); s.pushStr(ws); }
+            else if (values == 1) { s.pushStr(" v:"); s.pushStr(ws); }
+            s.pushStr(" -> ");
+            if (gives) { s.pushStr(ws); } else { s.pushStr("void"); }
+            want = keepString(s);
+        } else if (n == "memcpy") {
+            k = BI_MEMCPY;
+            want = "unsafe builtin memcpy dst:long src:long n:long -> void";
+            ok = np == 3 && self.paramIs(params.get(0), Lit.Long, false) && self.paramIs(params.get(1), Lit.Long, false)
+                 && self.paramIs(params.get(2), Lit.Long, false) && ret.base == Lit.Void;
         } else {
-            self.err(format("the compiler provides no builtin '{}' -- it provides syscall, atCompileTime, parseExpr and exit", n));
+            self.err(format("the compiler provides no builtin `{}`\nnote: the builtins are `syscall`, `atCompileTime`, `parseExpr`, `exit`, `memcpy`, and the atomics `atomicLoad`, `atomicStore`, `atomicStoreSeqCst`, `atomicSwap`, `atomicCas` and `atomicAdd` (each with a `32` form)", n));
         }
-        if (!ok) { self.err(format("`builtin {}` is declared `{}`", n, want)); }
+        if (!ok) { self.err(format("wrong signature for `builtin {}`\nhelp: declare it as `{}`", n, want)); }
         return k;
+    }
+    // A parameter `*T`, `T` the scalar spelled `scalar`.
+    paramIsPtr &self at:long scalar:str -> bool {
+        d: VarDeclNode = self.ast.decls.get(at);
+        return !d.isVariadic && !d.isArray && d.kind == Lit.Ptr && d.structName != NO_SYM && nameOf(d.structName) == scalar;
     }
     paramIs &self at:long k:Lit variadic:bool -> bool {
         d: VarDeclNode = self.ast.decls.get(at);
@@ -1984,7 +2236,7 @@ methods Parser {
             variadic: bool = self.eat(Tok.Ellipsis);
             // `other: Self` in a trait signature names the implementing type, the same word the
             // return position already keeps as itself. It is not a type this file declares, and
-            // resolving it qualified it with whichever module the trait was written in.
+            // resolving it would qualify it with whichever module the trait was written in.
             t: TypeRef = TypeRef { base: Lit.Struct, name: intern("Self") };
             if (traitSig && self.word("Self")) { self.advance(); }
             else { t = self.parseTypeRef(); }
@@ -2008,8 +2260,7 @@ methods Parser {
             //
             // A type parameter is exempt, and has to be: `count<T, I: Iter<T>> inout it:I` says
             // exactly what it means, and what `I` turns out to be is not known until an instance
-            // is stamped. The C++ parser gets that exemption for free by giving a template's
-            // parameter list a loop of its own, which never reaches this check.
+            // is stamped.
             checkable: bool = !traitSig && kind != Lit.TypeVar;
             // `inout x:long`: a lend of the caller's scalar (`INOUT_SCALAR`).
             if (conv == Conv.Inout && !variadic && (isInteger(kind) || isFloat(kind) || kind == Lit.Bool
@@ -2020,11 +2271,12 @@ methods Parser {
             if (checkable && conv == Conv.Inout && !isInoutScalarName(sname)) {
                 borrowable: bool = kind == Lit.Slice && !variadic;
                 if ((kind != Lit.Struct && !borrowable) || variadic) {
-                    self.err(stringOf("`inout` needs a struct or slice parameter (scalars already pass by value)"));
+                    self.err(format("`inout` cannot apply to parameter `{}`\nnote: `inout` lends a struct, a slice or a scalar, and never a variadic parameter",
+                                    nameOf(pname.text)));
                 }
             }
             if (checkable && (conv == Conv.Read || conv == Conv.Sink) && kind != Lit.Struct) {
-                self.err(stringOf("`read`/`sink` annotations apply to struct parameters (scalars already pass by value)"));
+                self.err(stringOf("`read` and `sink` apply only to struct parameters\nnote: anything else is already passed by value"));
             }
             if (conv == Conv.Inout && kind == Lit.Struct) { kind = Lit.Ref; }
 
@@ -2048,6 +2300,7 @@ methods Parser {
         self.hasPeeked = false;
         self.curMod = mod;
         opsModule(mod);
+        gReg.journal = true;
         self.advance();
     }
 
@@ -2060,58 +2313,231 @@ methods Parser {
 
     parseModule &self -> void {
         while (!self.check(Tok.FileEnd)) {
-            // Each declaration's local names are numbered from zero, so its tree is the same
-            // whatever was read before it.
-            self.uniq = 0;
-            self.matchSeq = 0;
-            self.forSeq = 0;
-            // `@init`, `@fini`, `@panic` before a function: what the program's startup, shutdown
-            // and a failed `assert!` run (`parseAttrs`, held to the function by `applyAttrs`).
-            attrs: long = self.parseAttrs();
-            self.vis = self.parseVisibility();
-            // `builtin name params -> T;`: the compiler provides the body.
-            if (self.word("builtin") && !self.namedHere() && self.peekNext().kind == Tok.Id) {
-                self.advance();
-                self.fnAttrs = FN_BUILTIN_DECL;
-            }
-            if (attrs != 0) {
-                st: long = self.parseStatement();
-                self.applyAttrs(st, attrs);
-                self.notePage(st, self.curMod, false);
-                for k in 0..self.pending.len() { self.notePage(self.pending.get(k), self.curMod, false); }
-                self.pending.clear();
-                continue;
-            }
-            // `var NAME: T = value;` -- a global that may be written, and may initialize at
-            // startup. Without it a global is a constant the compiler computes. Read here, in
-            // the same slot as the visibility, and consumed by `parseGlobal`.
-            if (self.word("var") && !self.namedHere()) { self.advance(); self.varDecl = true; }
-            // `macro name params -> T { }`: a function the compiler runs, called as `name!(...)`.
-            // Its name is registered now, so a call parses as one; the declaration itself is
-            // read at the end of the page, when every module's types are known (`MacroSnap`).
-            if (self.word("macro") && !self.namedHere()) {
-                self.advance();
-                mname: Token = self.expect(Tok.Id);
-                regNoteMacro(self.qualify(nameOf(mname.text)));
-                self.pendingMacros.push(MacroSnap { name: mname.text, pos: self.lx.pos, line: self.lx.fileLine,
-                                                    col: self.lx.charNumber, file: self.lx.currentFile,
-                                                    pkg: self.lx.currentPackage, cur: self.cur,
-                                                    peeked: self.peeked, hasPeeked: self.hasPeeked, vis: self.vis,
-                                                    curPos: self.curPos, peekPos: self.peekPos,
-                                                    src: self.lx.src, mod: self.curMod, loaded: -1 });
-                self.skipMacroDecl();
-                continue;
-            }
-            self.notePage(self.parseStatement(), self.curMod, false);
-            if (self.varDecl) { self.err(stringOf("`var` applies to a global declaration -- `var NAME: T = value;`")); }
-            if (self.fnAttrs != 0) { self.err(stringOf("`builtin` applies to a function declaration -- `builtin name params -> T;`")); }
-            for k in 0..self.pending.len() { self.notePage(self.pending.get(k), self.curMod, false); }
-            self.pending.clear();
+            if (canRecover()) { self.parseDeclRecovering(); } else { self.parseDecl(); }
         }
         self.checkImplTraits();
     }
 
-    // `@init @fini @panic`, each at most once, before a top-level function.
+    // One top-level declaration, onto the page.
+    parseDecl &self -> void {
+        // Each declaration's local names are numbered from zero, so its tree is the same
+        // whatever was read before it.
+        self.uniq = 0;
+        self.matchSeq = 0;
+        self.forSeq = 0;
+        self.declName = NO_SYM;
+        self.usesAbandoned = false;
+        // `@init`, `@fini`, `@panic` before a function: what the program's startup, shutdown
+        // and a failed `assert!` run (`parseAttrs`, held to the function by `applyAttrs`).
+        attrs: long = self.parseAttrs();
+        self.vis = self.parseVisibility();
+        // `builtin name params -> T;`: the compiler provides the body.
+        if (self.word("builtin") && !self.namedHere() && self.peekNext().kind == Tok.Id) {
+            self.advance();
+            self.fnAttrs = FN_BUILTIN_DECL;
+        }
+        if (attrs != 0) {
+            st: long = self.parseStatement();
+            self.applyAttrs(st, attrs);
+            self.notePage(st, self.curMod, false);
+            for k in 0..self.pending.len() { self.notePage(self.pending.get(k), self.curMod, false); }
+            self.pending.clear();
+            return;
+        }
+        // `var NAME: T = value;` declares a global that may be written, and may initialize
+        // at startup. Without it a global is a constant the compiler computes. Read here, in
+        // the same slot as the visibility, and consumed by `parseGlobal`.
+        if (self.word("var") && !self.namedHere()) { self.advance(); self.varDecl = true; }
+        // `macro name params -> T { }`: a function the compiler runs, called as `name!(...)`.
+        // Its name is registered now, so a call parses as one; the declaration itself is
+        // read at the end of the page, when every module's types are known (`MacroSnap`).
+        if (self.word("macro") && !self.namedHere()) {
+            self.advance();
+            mname: Token = self.expect(Tok.Id);
+            regNoteMacro(self.qualify(nameOf(mname.text)));
+            self.pendingMacros.push(MacroSnap { name: mname.text, pos: self.lx.pos, line: self.lx.fileLine,
+                                                col: self.lx.charNumber, file: self.lx.currentFile,
+                                                pkg: self.lx.currentPackage, cur: self.cur,
+                                                peeked: self.peeked, hasPeeked: self.hasPeeked, vis: self.vis,
+                                                curPos: self.curPos, peekPos: self.peekPos,
+                                                src: self.lx.src, mod: self.curMod, loaded: -1 });
+            self.skipMacroDecl();
+            return;
+        }
+        self.notePage(self.parseStatement(), self.curMod, false);
+        if (self.varDecl) { self.err(stringOf("`var` applies only to a global declaration\nhelp: write `var NAME: T = value;`")); }
+        if (self.fnAttrs != 0) { self.err(stringOf("`builtin` applies only to a function declaration\nhelp: write `builtin name params -> T;`")); }
+        for k in 0..self.pending.len() { self.notePage(self.pending.get(k), self.curMod, false); }
+        self.pending.clear();
+    }
+
+    // A declaration read under a `recover`. An error in it is reported where it was found and
+    // raises here (`failAt`, `fail`); the declaration is then taken back out of every table it
+    // had reached (`rewindTo`), the rest of its text is skipped (`skipToNextDecl`), and the
+    // module goes on with the next one, so one run reports an error in each declaration that has
+    // one. The compile stops once the whole page is read (`stopIfErrors` in the driver), so no
+    // later phase sees a program with a declaration missing.
+    //
+    // The raise and this `recover` are one subsystem: every frame between them is the parser's or
+    // the lexer's, none holds a lock, and what they leave half built is this declaration's, which
+    // the rewind takes back. Their own locals leak, which only an error pays for.
+    parseDeclRecovering &self -> void {
+        m: ParseMark = self.markHere();
+        failed: bool = false;
+        unsafe {
+            recover { self.parseDecl(); } else { failed = true; }
+        }
+        if (failed) {
+            self.rewindTo(m);
+            self.skipToNextDecl(m.startPos);
+        }
+    }
+
+    markHere &self -> ParseMark {
+        file: str = nameOf(self.lx.currentFile);
+        seq: long = -1;
+        had: Option<long> = self.closureSeq.find(file);
+        match had { Some(n) { seq = n; } None { } }
+        return ParseMark { ast: self.ast.mark(), reg: gReg.mark(), ops: opsMark(), startPos: self.curPos,
+                           gPos: gPos, pendingMacros: self.pendingMacros.len(),
+                           tplBounds: self.tplBounds.len(), scopes: self.scopes.len(),
+                           scopeStart: self.scopeStart.len(), implChecks: self.implChecks.len(),
+                           pendingInits: self.pendingInits.len(), closureBound: self.closureBound.len(),
+                           closureName: self.closureName.len(), captures: self.captures.len(),
+                           closureFile: file, closureSeq: seq, fnReturnsAdded: self.fnReturnsAdded.len(),
+                           pending: self.pending.len(), typeVars: self.typeVars.len(),
+                           lenVars: self.lenVars.len(), tplParams: self.tplParams.len(),
+                           selfParams: self.selfParams.len(), selfInfo: self.selfInfo.len(),
+                           pageIds: self.pageIds.len(), tryHole: self.tryHole.len(),
+                           toOrder: self.toOrder.len(), contPre: self.contPre.len(),
+                           inImpl: self.inImpl, uniq: self.uniq, matchSeq: self.matchSeq,
+                           forSeq: self.forSeq, loopDepth: self.loopDepth, fnDepth: self.fnDepth,
+                           implMangled: self.implMangled, noCast: self.noCast, inPointee: self.inPointee,
+                           quoteDepth: self.quoteDepth, unsafeDepth: self.unsafeDepth, vis: self.vis,
+                           varDecl: self.varDecl, boundFirst: self.boundFirst, boundCount: self.boundCount,
+                           selfTpl: self.selfTpl, lenArgOk: self.lenArgOk, typeVarUses: self.typeVarUses,
+                           plainBody: self.plainBody, blanketVar: self.blanketVar, blanketAs: self.blanketAs,
+                           retTy: self.retTy, retOk: self.retOk, toMark: self.toMark, toImpure: self.toImpure,
+                           toCond: self.toCond, toLhs: self.toLhs, contIf: self.contIf,
+                           retNever: self.retNever, fnAttrs: self.fnAttrs, lastStmt: self.lastStmt };
+    }
+
+    // Everything a declaration added, taken back, and the state it began in put back. The lexer
+    // is not: the skip goes on from where the error left it.
+    rewindTo &self m:ParseMark -> void {
+        // Cut short while reading compiler-written text: the module's own cursor comes back.
+        if (self.synthSaved.len() > 0) {
+            c: Cursor = self.synthSaved.get(0);
+            self.lx = c.lx;
+            self.cur = c.cur;
+            self.peeked = c.peeked;
+            self.hasPeeked = c.hasPeeked;
+            self.curPos = c.curPos;
+            self.peekPos = c.peekPos;
+            self.synthSaved.clear();
+        }
+        self.ast.rewindTo(m.ast);
+        gReg.rewindTo(m.reg);
+        opsRewind(m.ops);
+        for k in m.fnReturnsAdded..self.fnReturnsAdded.len() { self.fnReturns.remove(nameOf(self.fnReturnsAdded.get(k))); }
+        self.fnReturnsAdded.truncate(m.fnReturnsAdded);
+        if (m.closureSeq < 0) { self.closureSeq.remove(m.closureFile); } else { self.closureSeq.put(m.closureFile, m.closureSeq); }
+        self.pendingMacros.truncate(m.pendingMacros);
+        self.tplBounds.truncate(m.tplBounds);
+        self.scopes.truncate(m.scopes);
+        self.scopeStart.truncate(m.scopeStart);
+        self.implChecks.truncate(m.implChecks);
+        self.pendingInits.truncate(m.pendingInits);
+        self.closureBound.truncate(m.closureBound);
+        self.closureName.truncate(m.closureName);
+        self.captures.truncate(m.captures);
+        self.pending.truncate(m.pending);
+        self.typeVars.truncate(m.typeVars);
+        self.lenVars.truncate(m.lenVars);
+        self.tplParams.truncate(m.tplParams);
+        self.selfParams.truncate(m.selfParams);
+        self.selfInfo.truncate(m.selfInfo);
+        self.pageIds.truncate(m.pageIds);
+        self.pageMod.truncate(m.pageIds);
+        self.pageDeferred.truncate(m.pageIds);
+        self.tryHole.truncate(m.tryHole);
+        self.tryOperand.truncate(m.tryHole);
+        self.tryName.truncate(m.tryHole);
+        self.toOrder.truncate(m.toOrder);
+        self.contPre.truncate(m.contPre);
+        self.inImpl = m.inImpl;
+        self.uniq = m.uniq;
+        self.matchSeq = m.matchSeq;
+        self.forSeq = m.forSeq;
+        self.loopDepth = m.loopDepth;
+        self.fnDepth = m.fnDepth;
+        self.implMangled = m.implMangled;
+        self.noCast = m.noCast;
+        self.inPointee = m.inPointee;
+        self.quoteDepth = m.quoteDepth;
+        self.unsafeDepth = m.unsafeDepth;
+        self.vis = m.vis;
+        self.varDecl = m.varDecl;
+        self.boundFirst = m.boundFirst;
+        self.boundCount = m.boundCount;
+        self.selfTpl = m.selfTpl;
+        self.lenArgOk = m.lenArgOk;
+        self.typeVarUses = m.typeVarUses;
+        self.plainBody = m.plainBody;
+        self.blanketVar = m.blanketVar;
+        self.blanketAs = m.blanketAs;
+        self.retTy = m.retTy;
+        self.retOk = m.retOk;
+        self.toMark = m.toMark;
+        self.toImpure = m.toImpure;
+        self.toCond = m.toCond;
+        self.toLhs = m.toLhs;
+        self.contIf = m.contIf;
+        self.retNever = m.retNever;
+        self.fnAttrs = m.fnAttrs;
+        self.lastStmt = m.lastStmt;
+        gPos = m.gPos;
+        if (self.declName != NO_SYM) { self.abandoned.push(self.declName); }
+        self.declName = NO_SYM;
+        self.usesAbandoned = false;
+    }
+
+    // Past the rest of a declaration an error cut short, to the next token that can begin one:
+    // an identifier or an `@` in the first column of its line, which is where a top-level
+    // declaration is written and where nothing inside one is. Braces are not counted: a missing
+    // `}` is as likely an error as any, and a count from a declaration that lost one would swallow
+    // the rest of the file. The token the declaration began with never qualifies, so the skip
+    // always moves. Nothing on the way is reported: a lexer error met there raises quietly
+    // (`gQuiet`), and the skip goes on from past it.
+    skipToNextDecl &self startPos:long -> void {
+        gQuiet = gQuiet + 1;
+        going: bool = true;
+        while (going) {
+            unsafe {
+                recover {
+                    while (!self.check(Tok.FileEnd) && !(self.curPos != startPos && self.atDeclStart())) { self.advance(); }
+                    going = false;
+                } else { }
+            }
+        }
+        gQuiet = gQuiet - 1;
+    }
+    atDeclStart &self -> bool {
+        return (self.check(Tok.Id) || self.check(Tok.AtSign)) && posCol(self.curPos) == 1;
+    }
+
+    // Whether `n` is the type a declaration taken back was declaring. Its error has been reported;
+    // a use of the name is not reported again as missing.
+    abandonedName &self n:Sym -> bool {
+        if (self.abandoned.len() == 0) { return false; }
+        bare: str = lastComponentOf(nameOf(n));
+        for k in 0..self.abandoned.len() {
+            if (nameOf(self.abandoned.get(k)) == bare) { return true; }
+        }
+        return false;
+    }
+
+    // `@init @fini @panic @recover`, each at most once, before a top-level function.
     parseAttrs &self -> long {
         attrs: long = 0;
         while (self.check(Tok.AtSign)) {
@@ -2122,8 +2548,9 @@ methods Parser {
             if (n == "init") { bit = FN_INIT; }
             else if (n == "fini") { bit = FN_FINI; }
             else if (n == "panic") { bit = FN_PANIC; }
-            else { self.err(format("`@{}` is no attribute -- a function may be marked `@init`, `@fini` or `@panic`", n)); }
-            if ((attrs & bit) != 0) { self.err(format("`@{}` twice", n)); }
+            else if (n == "recover") { bit = FN_RECOVER; }
+            else { self.err(format("unknown attribute `@{}`\nnote: a function may be marked `@init`, `@fini`, `@panic` or `@recover`", n)); }
+            if ((attrs & bit) != 0) { self.err(format("duplicate attribute `@{}`", n)); }
             attrs = attrs | bit;
         }
         return attrs;
@@ -2133,15 +2560,15 @@ methods Parser {
     applyAttrs &self st:long attrs:long -> void {
         s: Stmt = self.ast.stmts.get(st);
         if (s.kind != StmtKind.FunctionDef) {
-            self.err(stringOf("an attribute (`@init`, `@fini`, `@panic`) marks a function definition"));
+            self.err(stringOf("an attribute (`@init`, `@fini`, `@panic` or `@recover`) can only mark a function definition"));
         }
         f: FnNode = self.ast.fns.get(s.at);
         n: str = lastComponentOf(nameOf(f.name));
         if ((attrs & (FN_INIT | FN_FINI)) != 0) {
             if (f.argCount != 0 || f.returnKind != Lit.Void || isNeverFn(f) || f.body < 0 || f.isTemplate) {
-                self.err(format("'{}' is a startup or shutdown hook, which is `{} -> void {{ ... }}`: no parameters, no result, a body, not generic", n, n));
+                self.err(format("wrong signature for startup or shutdown hook `{}`\nnote: a hook takes no parameters, returns nothing, has a body and is not generic\nhelp: declare it as `{} -> void {{ ... }}`", n, n));
             }
-            if ((attrs & FN_INIT) != 0 && (attrs & FN_FINI) != 0) { self.err(format("'{}' is `@init` and `@fini` at once", n)); }
+            if ((attrs & FN_INIT) != 0 && (attrs & FN_FINI) != 0) { self.err(format("`{}` cannot be both `@init` and `@fini`", n)); }
         }
         if ((attrs & FN_PANIC) != 0) {
             ok: bool = f.argCount == 1 && isNeverFn(f) && !f.isTemplate;
@@ -2149,7 +2576,17 @@ methods Parser {
                 p: VarDeclNode = self.ast.paramAt(f, 0);
                 ok = p.kind == Lit.Str && !p.isVariadic;
             }
-            if (!ok) { self.err(format("'{}' is the `@panic` function, which is `{} msg:str -> never`", n, n)); }
+            if (!ok) { self.err(format("wrong signature for the `@panic` function `{}`\nhelp: declare it as `{} msg:str -> never`", n, n)); }
+        }
+        // The `@recover` function links a record and answers the one it replaced. Code the
+        // compiler writes calls it, so its shape is fixed.
+        if ((attrs & FN_RECOVER) != 0) {
+            ok: bool = f.argCount == 1 && f.returnKind == Lit.Long && !isNeverFn(f) && !f.isTemplate && f.body >= 0;
+            if (ok) {
+                p: VarDeclNode = self.ast.paramAt(f, 0);
+                ok = p.kind == Lit.Long && !p.isVariadic;
+            }
+            if (!ok) { self.err(format("wrong signature for the `@recover` function `{}`\nhelp: declare it as `{} rec:long -> long {{ ... }}`", n, n)); }
         }
         f.attrs = f.attrs | attrs;
         self.ast.fns.set(s.at, f);
@@ -2173,6 +2610,7 @@ methods Parser {
     finishPage &self -> long {
         self.parseDeferredMacros();
         opsEnd();
+        gReg.journal = false;
         return self.ast.addBlock(self.pageIds);
     }
 
@@ -2180,7 +2618,7 @@ methods Parser {
     skipMacroDecl &self -> void {
         depth: long = 0;
         while (true) {
-            if (self.check(Tok.FileEnd)) { self.err(stringOf("a macro declaration without its body")); }
+            if (self.check(Tok.FileEnd)) { self.err(stringOf("unexpected end of file in a macro declaration\nnote: a macro needs a body")); }
             if (self.check(Tok.LeftCurly)) { depth = depth + 1; }
             if (self.check(Tok.RightCurly)) {
                 depth = depth - 1;
@@ -2208,18 +2646,33 @@ methods Parser {
             self.curMod = m.mod;
             opsModule(m.mod);
             gPos = m.curPos;
-            fst: long = self.parseFunctionDef(m.name);
-            self.ast.stmtPos.set(fst, m.curPos);
-            // A macro is a function the compiler runs while checking. Its body has to be here to
-            // be run; a symbol in another object is of no use to the evaluator.
-            if (self.ast.fns.get(self.ast.stmts.get(fst).at).body < 0) {
-                self.err(format("'{}' is a macro, which the compiler runs while it checks — its body has to be here, not in another object",
-                                nameOf(m.name)));
-            }
-            self.notePage(fst, m.mod, true);
+            if (canRecover()) { self.deferredMacroRecovering(m); } else { self.deferredMacro(m); }
         }
         gPos = 0;
         self.pendingMacros.clear();
+    }
+    // One of them under a `recover`, as a declaration is (`parseDeclRecovering`). The next one is
+    // read from its own place, so nothing needs skipping.
+    deferredMacroRecovering &self m:MacroSnap -> void {
+        mk: ParseMark = self.markHere();
+        failed: bool = false;
+        unsafe {
+            recover { self.deferredMacro(m); } else { failed = true; }
+        }
+        if (failed) { self.rewindTo(mk); }
+    }
+    deferredMacro &self m:MacroSnap -> void {
+        self.declName = NO_SYM;
+        self.usesAbandoned = false;
+        fst: long = self.parseFunctionDef(m.name);
+        self.ast.stmtPos.set(fst, m.curPos);
+        // A macro is a function the compiler runs while checking. Its body has to be here to be
+        // run; a symbol in another object is of no use to the evaluator.
+        if (self.ast.fns.get(self.ast.stmts.get(fst).at).body < 0) {
+            self.err(format("macro `{}` has no body\nnote: the compiler runs a macro while it checks, so its body has to be here, not in another object",
+                            nameOf(m.name)));
+        }
+        self.notePage(fst, m.mod, true);
     }
 }
 
@@ -2230,6 +2683,7 @@ methods Parser {
     // statement left behind is only a marker, so the top-level list stays uniform.
     parseStructDecl &self -> long {
         name: Token = self.expect(Tok.Id);
+        self.declName = name.text;
         if (self.check(Tok.LessThan)) { return self.parseGenericStruct(name.text); }
         self.requireTypeNameFree(nameOf(name.text));
         q: Sym = self.qualify(nameOf(name.text));
@@ -2260,7 +2714,7 @@ methods Parser {
             } else {
                 t: TypeRef = self.parseTypeRef();
                 if (t.base == Lit.Void) {
-                    self.err(format("Struct field '{}' cannot be void", nameOf(fname.text)));
+                    self.err(format("struct field `{}` cannot be `void`", nameOf(fname.text)));
                 }
                 want: FieldDef = FieldDef { name: fname.text, kind: t.base, structName: t.name,
                                             offset: 0, isArray: false, count: 0 };
@@ -2281,15 +2735,13 @@ methods Parser {
     rejectDuplicateField &self fields:Vec<FieldDef> name:Sym owner:Sym -> void {
         for i in 0..fields.len() {
             if (fields.get(i).name == name) {
-                self.err(format("Duplicate field '{}' in struct {}",
+                self.err(format("duplicate field `{}` in struct `{}`",
                                 nameOf(name), nameOf(owner)));
             }
         }
     }
 
-    // `E.V` or `E.V(a, b)` as the tagged union it is: `{ $tag: <n>, $V$0: a, $V$1: b }`. The
-    // payload fields are named after the variant, so two variants never share a field and the
-    // layout can overlap them safely.
+    // Is `q` a generic sum type, a template declared with `enum`?
     isGenericSum &self q:str -> bool {
         at: long = gReg.findTemplate(q);
         if (at < 0) { return false; }
@@ -2298,32 +2750,35 @@ methods Parser {
 
     // Does the sum type (declared, or a template) have a variant of this name?
     sumHasVariant &self owner:Sym variant:Sym -> bool {
-        at: long = gReg.findEnum(nameOf(owner));
+        at: long = gReg.findEnumSym(owner);
         if (at >= 0) { return gReg.findVariant(gReg.enumDef(at), nameOf(variant)) >= 0; }
-        tat: long = gReg.findTemplate(nameOf(owner));
+        tat: long = gReg.findTemplateSym(owner);
         if (tat < 0) { return false; }
         return gReg.findGVariant(gReg.templateDef(tat), nameOf(variant)) >= 0;
     }
 
+    // `E.V` or `E.V(a, b)` as the tagged union it is: `{ $tag: <n>, $V$0: a, $V$1: b }`. The
+    // payload fields are named after the variant, so two variants never share a field and the
+    // layout can overlap them safely.
     parseVariant &self owner:Sym variant:Sym -> NodeId {
         tag: long = 0;
         arity: long = 0;
         backing: Lit = Lit.Int;              // what a generic sum type's tag is stamped as
-        at: long = gReg.findEnum(nameOf(owner));
+        at: long = gReg.findEnumSym(owner);
         if (at >= 0) {
             d: EnumDef = gReg.enumDef(at);
             backing = d.backing;
             vi: long = gReg.findVariant(d, nameOf(variant));
-            if (vi < 0) { self.err(format("enum {} has no variant '{}'", nameOf(owner), nameOf(variant))); }
+            if (vi < 0) { self.err(format("no variant `{}` in enum `{}`", nameOf(variant), nameOf(owner))); }
             vd: VariantDef = gReg.variantAt(d, vi);
             tag = vd.value;
             arity = vd.payloadCount;
         } else {
             // A generic sum type. Its variants are known from the template; which instance this
             // is, is not: the checker settles that from the type the value is being used as.
-            t: GTemplate = gReg.templateDef(gReg.findTemplate(nameOf(owner)));
+            t: GTemplate = gReg.templateDef(gReg.findTemplateSym(owner));
             vi: long = gReg.findGVariant(t, nameOf(variant));
-            if (vi < 0) { self.err(format("enum {} has no variant '{}'", nameOf(owner), nameOf(variant))); }
+            if (vi < 0) { self.err(format("no variant `{}` in enum `{}`", nameOf(variant), nameOf(owner))); }
             gv: GVariant = gReg.gVariantAt(t, vi);
             tag = gv.value;
             arity = gv.payloadCount;
@@ -2331,28 +2786,28 @@ methods Parser {
 
         args: Vec<NodeId>;
         // Read against the arity as it goes, so running out is reported where the value should
-        // have been. Parsing the whole list and comparing counts afterwards said the same thing
-        // one token late, pointing at the `)` rather than at what was missing.
+        // have been. Comparing counts after the whole list would say the same thing one token
+        // late, pointing at the `)` rather than at what was missing.
         if (arity == 0) {
             if (self.check(Tok.LeftParen)) {
-                self.err(format("variant '{}' carries no payload", nameOf(variant)));
+                self.err(format("variant `{}` carries no payload", nameOf(variant)));
             }
         } else {
             if (!self.check(Tok.LeftParen)) {
-                self.err(format("variant '{}' carries {} value(s) — write {}(...)",
-                                nameOf(variant), arity, nameOf(variant)));
+                self.err(format("variant `{}` carries {}\nhelp: write `{}(...)`",
+                                nameOf(variant), plural(arity, "value"), nameOf(variant)));
             }
             self.advance();
             for a in 0..arity {
                 if (self.check(Tok.RightParen)) {
-                    self.err(format("variant '{}' carries {} value(s) but only {} were given",
+                    self.err(format("too few values for variant `{}`: expected {}, found {}",
                                     nameOf(variant), arity, a));
                 }
                 if (a > 0) { self.expect(Tok.Comma); }
                 args.push(self.parseExpr());
             }
             if (!self.check(Tok.RightParen)) {
-                self.err(format("variant '{}' carries only {} value(s)", nameOf(variant), arity));
+                self.err(format("variant `{}` carries only {}", nameOf(variant), plural(arity, "value")));
             }
             self.expect(Tok.RightParen);
         }
@@ -2375,10 +2830,10 @@ methods Parser {
     // literal carries E as its companion name, which nothing that types an integer reads; a
     // `...any` run does, to box `println("{}", E.V)` through E's `Display` (`Checker.checkAnyArg`).
     enumConst &self owner:Sym variant:Sym -> NodeId {
-        d: EnumDef = gReg.enumDef(gReg.findEnum(nameOf(owner)));
+        d: EnumDef = gReg.enumDef(gReg.findEnumSym(owner));
         vi: long = gReg.findVariant(d, nameOf(variant));
         if (vi < 0) {
-            self.err(format("enum {} has no variant '{}'", nameOf(owner), nameOf(variant)));
+            self.err(format("no variant `{}` in enum `{}`", nameOf(variant), nameOf(owner)));
         }
         return self.ast.leafOf(Op.Literal, Payload.Num(gReg.variantAt(d, vi).value), d.backing, owner);
     }
@@ -2401,7 +2856,7 @@ methods Parser {
                 rest = self.parseExpr();
                 self.eat(Tok.Comma);
                 if (!self.check(Tok.RightCurly)) {
-                    self.err(stringOf("`..` takes the remaining fields, so nothing can follow it"));
+                    self.err(stringOf("nothing can follow `..` in a struct literal\nnote: `..` takes all the remaining fields"));
                 }
                 break;
             }
@@ -2450,14 +2905,10 @@ methods Parser {
             itStruct = t.name;
             overIter = true;
         }
-        if (!self.eatWord("in")) { self.err(stringOf("Expected `in` after the loop variable")); }
+        if (!self.eatWord("in")) { self.err(format("expected `in`, found {}", describeTok(self.cur))); }
 
-        // `for x: T in it { body }` is exactly the loop you would have written by hand:
-        //
-        //     while (it.hasNext()) { x: T = it.next(); body }
-        //
-        // and nothing more. There is no step: an iterator advances itself inside `next()`, so a
-        // `continue` re-tests `hasNext` and is already right.
+        // `for x: T in it { body }` is the `while (it.hasNext())` loop you would have written by
+        // hand (`iterLoop` builds it).
         if (overIter) {
             // The iterator is read twice a turn (`hasNext`, then `next`) so it has to be a
             // place, not an expression re-evaluated each turn: that would build it again rather
@@ -2476,14 +2927,14 @@ methods Parser {
                 src: Token = self.advance();
                 b: Binding = self.bindingOf(src.text);
                 if (b.renamed == NO_SYM) {
-                    self.err(format("'{}' is not a variable", nameOf(src.text)));
+                    self.err(format("`{}` is not a local variable", nameOf(src.text)));
                 }
                 srcName = b.renamed; srcKind = b.kind; srcStruct = b.structName;
             } else {
                 srcExpr: NodeId = self.parseExpr();
                 ti: long = gReg.findTrait("Iter");
                 if (ti < 0) {
-                    self.err(stringOf("`for x: T in <expr>` needs stdlib::iter's Iter<T>"));
+                    self.err(stringOf("`for x: T in <expr>` needs the trait `Iter<T>`\nhelp: the standard library has it in `stdlib::iter`: `#include <stdlib::iter>`"));
                 }
                 targs: Vec<TypeRef>;
                 targs.push(TypeRef { base: itKind, name: itStruct });
@@ -2636,7 +3087,7 @@ methods Parser {
     parseForEach &self it:Token lend:bool src:NodeId -> long {
         pt: PlaceTy = self.placeTy(src);
         if (!pt.ok) {
-            self.err(stringOf("`for x in ...` walks a variable or a field of one, whose type says what it holds -- bind anything else to a local first, or write the element type: `for x: T in it`"));
+            self.err(stringOf("cannot tell what this `for x in ...` walks\nnote: `for x in xs` walks a variable or a field of one, whose type says what it holds\nhelp: bind the value to a local first, or write the element type: `for x: T in it`"));
         }
         shape: long = FOR_NONE;
         elem: TypeRef = typeRefOf(Lit.Void);
@@ -2661,24 +3112,24 @@ methods Parser {
             // An instance of a template nothing declares yet (`Vec<long>` in a file that does not
             // include `stdlib::vec`): the type is what is wrong, as `match` says.
             if (pt.name != NO_SYM) {
-                ri: long = gReg.findRequest(nameOf(pt.name));
-                if (ri >= 0 && gReg.findTemplate(nameOf(gReg.requestAt(ri).base)) < 0) {
+                ri: long = gReg.findRequestSym(pt.name);
+                if (ri >= 0 && gReg.findTemplateSym(gReg.requestAt(ri).base) < 0) {
                     tb: str = lastComponentOf(nameOf(gReg.requestAt(ri).base));
-                    self.err(format("Unknown type '{}'{}", tb, stdlibHint(tb)));
+                    self.err(format("cannot find type `{}` in this scope{}", tb, stdlibHint(tb)));
                 }
             }
-            self.err(format("cannot walk a {} with `for x in` -- it takes a slice, an array, a type implementing `AsSlice` (a Vec), or a variable holding an iterator",
+            self.err(format("cannot walk a `{}` with `for x in`\nnote: `for x in` walks a slice, an array, a type implementing `AsSlice` (such as `Vec`), or a variable holding an iterator",
                             typeMangleName(pt.kind, pt.name)));
         }
         if (shape == FOR_ITER) {
             if (lend) {
-                self.err(stringOf("`for x in &it`: an iterator is walked by its own `hasNext`/`next` and has nothing to lend -- drop the `&`"));
+                self.err(stringOf("cannot lend an iterator with `for x in &it`\nnote: an iterator is walked by its own `hasNext` and `next`, and has nothing to lend\nhelp: drop the `&`"));
             }
             srcName: Sym = NO_SYM;
             se: Expr = self.ast.expr(src);
             if (se.op == Op.Lvalue) { match se.payload { Name(n) { srcName = n; } _ { } } }
             if (srcName == NO_SYM) {
-                self.err(stringOf("`for x in` walks an iterator held in a variable -- bind it to a local first"));
+                self.err(stringOf("`for x in` needs an iterator held in a variable\nhelp: bind it to a local first"));
             }
             return self.iterLoop(it, elem.base, elem.name, srcName, se.kind, se.structName,
                                  NO_STMT, NO_STMT);
@@ -2687,8 +3138,8 @@ methods Parser {
         // write a copy. Said here when the type is already concrete; a template's element is
         // held to it once it is stamped.
         if (lend && elem.base != Lit.TypeVar && (elem.base != Lit.Struct || namedScalar(elem.base, elem.name))) {
-            self.err(format("`for x in &xs` lends each element, which needs struct elements -- a {} is copied, so write `xs[i] = ...` to change one",
-                            typeMangleName(elem.base, elem.name)));
+            self.err(format("`for x in &xs` needs struct elements, found `{}`\nnote: a `{}` is copied, so writing through `x` would change only the copy\nhelp: write `xs[i] = ...` to change an element",
+                            typeMangleName(elem.base, elem.name), typeMangleName(elem.base, elem.name)));
         }
 
         seq: long = self.forSeq;
@@ -2801,8 +3252,8 @@ methods Parser {
     }
 
     // The type of a place, as far as the parser knows types: a local's or a global's declared
-    // type, a captured variable's, and a field's through the registry -- a struct's, or a
-    // template's under the arguments its instance was requested with. `ok` is false for anything
+    // type, a captured variable's, and a field's through the registry (a struct's, or a
+    // template's under the arguments its instance was requested with). `ok` is false for anything
     // else (a call, an index), whose type only the checker knows.
     placeTy &self id:NodeId -> PlaceTy {
         no: PlaceTy = PlaceTy { kind: Lit.Void, name: NO_SYM, isArray: false, ok: false };
@@ -2905,7 +3356,7 @@ methods Parser {
 
     fieldTy &self owner:Sym f:Sym -> PlaceTy {
         no: PlaceTy = PlaceTy { kind: Lit.Void, name: NO_SYM, isArray: false, ok: false };
-        si: long = gReg.findStruct(nameOf(owner));
+        si: long = gReg.findStructSym(owner);
         if (si >= 0) {
             d: StructDef = gReg.structDef(si);
             k: long = gReg.findFieldSym(d, f);
@@ -2914,11 +3365,11 @@ methods Parser {
             return PlaceTy { kind: fdef.kind, name: fdef.structName, isArray: fdef.isArray, ok: true };
         }
         // A template, named as itself inside its own methods, or an instance of one.
-        ti: long = gReg.findTemplate(nameOf(owner));
+        ti: long = gReg.findTemplateSym(owner);
         r: long = NOT_FOUND;
         if (ti < 0) {
-            r = gReg.findRequest(nameOf(owner));
-            if (r >= 0) { ti = gReg.findTemplate(nameOf(gReg.requestAt(r).base)); }
+            r = gReg.findRequestSym(owner);
+            if (r >= 0) { ti = gReg.findTemplateSym(gReg.requestAt(r).base); }
         }
         if (ti < 0) { return no; }
         t: GTemplate = gReg.templateDef(ti);
@@ -2948,7 +3399,7 @@ methods Parser {
             return TypeRef { base: ty.base, name: intern(typeMangleName(inner.base, inner.name)) };
         }
         if (ty.base == Lit.Struct && ty.name != NO_SYM) {
-            q: long = gReg.findRequest(nameOf(ty.name));
+            q: long = gReg.findRequestSym(ty.name);
             if (q < 0) {
                 // A parameter spelled as a type name (`T` as the pointee of a mangled `ptr_T`).
                 if (gReg.gParamIndex(t, ty.name) >= 0) {
@@ -2979,13 +3430,13 @@ methods Parser {
     // directly or through the template it is an instance of. Void when it implements none.
     traitElemOf &self n:Sym trait:str -> TypeRef {
         if (n == NO_SYM) { return typeRefOf(Lit.Void); }
-        r: long = gReg.findRequest(nameOf(n));
+        r: long = gReg.findRequestSym(n);
         for i in 0..gReg.implCount() {
             im: TraitImplDef = gReg.implAt(i);
             if (lastComponentOf(nameOf(im.trait.name)) != trait || im.trait.argCount != 1) { continue; }
             if (im.structName == n) { return borrowedElem(gReg.traitArgAt(im.trait, 0)); }
             if (r >= 0 && im.structName == gReg.requestAt(r).base) {
-                ti: long = gReg.findTemplate(nameOf(im.structName));
+                ti: long = gReg.findTemplateSym(im.structName);
                 if (ti < 0) { continue; }
                 return borrowedElem(self.substTy(gReg.traitArgAt(im.trait, 0), gReg.templateDef(ti),
                                                  gReg.requestAt(r), 0));
@@ -3086,13 +3537,15 @@ methods Parser {
     // wrote a payload, not by a second keyword.
     parseEnumDecl &self -> long {
         name: Token = self.expect(Tok.Id);
+        self.declName = name.text;
         if (self.check(Tok.LessThan)) { return self.parseGenericEnum(name.text); }
         self.requireTypeNameFree(nameOf(name.text));
         q: Sym = self.qualify(nameOf(name.text));
 
-        // A sum type may hold itself behind an indirection too -- `Pair(Box<Tree>, Box<Tree>)` is
+        // A sum type may hold itself behind an indirection too: `Pair(Box<Tree>, Box<Tree>)` is
         // what a syntax tree is. The placeholder is a struct entry, because that is what a sum
-        // type resolves through; retracted at the `}` if the enum turns out to be a backed one.
+        // type resolves through. It is retracted at the `}` if the enum turns out to be a backed
+        // one.
         at: long = regBeginStruct(q, self.lx.currentPackage);
         backing: Lit = Lit.Int;
         if (self.eat(Tok.Colon)) { backing = self.parseTypeRef().base; }
@@ -3133,8 +3586,8 @@ methods Parser {
                     shown: String;
                     if (neg) { shown.push('-'); }
                     shown.pushString(format("{}", lit.num as u64));
-                    self.err(format("{}.{} = {} does not fit the enum's {}", nameOf(name.text), nameOf(vname.text),
-                                    shown, typeName(backing)));
+                    self.err(format("literal `{}` out of range for `{}`\nnote: the value of `{}.{}` must fit the enum's backing type",
+                                    shown, typeName(backing), nameOf(name.text), nameOf(vname.text)));
                 }
             }
             next = value + 1;
@@ -3171,18 +3624,18 @@ methods Parser {
     // ─── match ───────────────────────────────────────────────────────────────
 
     // `match x { Ok(v) { } Err(_) { } }`: an arm is a variant, the names it binds that variant's
-    // payload to, and a block -- no arrow, since every other construct here writes a block straight
-    // after what introduces it.
+    // payload to, and a block. There is no arrow, since every other construct here writes a block
+    // straight after what introduces it.
     //
     // The subject is any expression. A local or a global is matched where it is. Any other place
-    // the parser can type (`h.s`, `a.b.c`) is copied into a hidden local of that type first, and
-    // the match reads that: `$matchN: T; $matchN = h.s;` -- a move, as `x = h.s` is, unless the
-    // match borrows (`match &h.s`, `$bmatchN`, which the checker makes a borrow of the place). An
-    // expression whose type only the checker knows -- a call, a method's borrow, an element -- is
-    // held the same way in a local of the type its value turns out to have (`<infer>`), and its
-    // arms are read by name (`?Some`) and held to that type by the checker (`resolveMatch`). The
-    // hidden locals and the match are one block, so a temporary is released after the match.
-    // `match &f()` holds the value in `$mownN` and matches a borrow of it: nothing moves out.
+    // the parser can type (`h.s`, `a.b.c`) is first copied into a hidden local of that type, and
+    // the match reads that: `$matchN: T; $matchN = h.s;`. That is a move, as `x = h.s` is, unless
+    // the match borrows (`match &h.s`, `$bmatchN`, which the checker makes a borrow of the place).
+    // An expression whose type only the checker knows (a call, a method's borrow, an element) is
+    // held the same way, in a local of whatever type its value turns out to have (`<infer>`). Its
+    // arms are then read by name (`?Some`) and held to that type by the checker (`resolveMatch`).
+    // The hidden locals and the match are one block, so a temporary is released after the match.
+    // `match &f()` holds the value in `$mownN` and matches a borrow of it, so nothing moves out.
     parseMatch &self -> long {
         borrowedMatch: bool = self.eat(Tok.Ampersand);
         subj: NodeId = self.parseExpr();
@@ -3198,9 +3651,9 @@ methods Parser {
         subjKind: Lit = pt.kind;
         subjName: Sym = pt.name;
         if (isName && !self.isLocalName(bound)) {
-            gi: long = gReg.findGlobal(nameOf(self.qualify(nameOf(bound))));
+            gi: long = gReg.findGlobalSym(self.qualify(nameOf(bound)));
             if (gi >= 0) { bound = gReg.globalDef(gi).name; }
-            else if (!pt.ok) { self.err(format("'{}' is not a variable", nameOf(bound))); }
+            else if (!pt.ok) { self.err(format("cannot find value `{}` in this scope", nameOf(bound))); }
         }
         pre: Vec<long>;
         if (!isName || borrowedMatch) {
@@ -3240,12 +3693,12 @@ methods Parser {
             if (si.enumAt < 0 && si.tmplAt < 0) {
                 // An instance of a template nothing declares (`Result<long, long>` with no
                 // include): the type is what is wrong, not the match.
-                ri: long = gReg.findRequest(nameOf(subjName));
-                if (ri >= 0 && gReg.findTemplate(nameOf(gReg.requestAt(ri).base)) < 0) {
+                ri: long = gReg.findRequestSym(subjName);
+                if (ri >= 0 && gReg.findTemplateSym(gReg.requestAt(ri).base) < 0) {
                     tb: str = lastComponentOf(nameOf(gReg.requestAt(ri).base));
-                    self.err(format("Unknown type '{}'{}", tb, stdlibHint(tb)));
+                    self.err(format("cannot find type `{}` in this scope{}", tb, stdlibHint(tb)));
                 }
-                self.err(format("'{}' is not a sum type — `match` reads an enum whose variants carry data",
+                self.err(format("`{}` is not an enum\nnote: `match` reads the variants of an enum",
                                 what));
             }
         }
@@ -3263,11 +3716,11 @@ methods Parser {
                 if (!deferred) {
                     vi = self.sumVariantIndex(si, nameOf(variant));
                     if (vi < 0) {
-                        self.err(format("enum {} has no variant '{}'", nameOf(subjName), nameOf(variant)));
+                        self.err(format("no variant `{}` in enum `{}`", nameOf(variant), nameOf(subjName)));
                     }
                 }
                 if (self.symSeen(covered, variant)) {
-                    self.err(format("variant '{}' is matched twice", nameOf(variant)));
+                    self.err(format("duplicate match arm for variant `{}`", nameOf(variant)));
                 }
                 covered.push(variant);
             }
@@ -3291,27 +3744,27 @@ methods Parser {
                 }
             } else if (arity > 0) {
                 if (!self.check(Tok.LeftParen)) {
-                    self.err(format("variant '{}' carries {} value(s) — name them, as {}(...)",
-                                    nameOf(variant), arity, nameOf(variant)));
+                    self.err(format("variant `{}` carries {}\nhelp: name what it carries: `{}(...)`",
+                                    nameOf(variant), plural(arity, "value"), nameOf(variant)));
                 }
                 self.advance();
                 for r in 0..arity {
                     if (self.check(Tok.RightParen)) {
-                        self.err(format("variant '{}' carries {} value(s) but only {} were named",
+                        self.err(format("too few names for variant `{}`: expected {}, found {}",
                                         nameOf(variant), arity, r));
                     }
                     if (r > 0) { self.expect(Tok.Comma); }
                     raw.push(self.expect(Tok.Id).text);
                 }
                 if (!self.check(Tok.RightParen)) {
-                    self.err(format("variant '{}' carries only {} value(s)", nameOf(variant), arity));
+                    self.err(format("variant `{}` carries only {}", nameOf(variant), plural(arity, "value")));
                 }
                 self.expect(Tok.RightParen);
             } else if (self.check(Tok.LeftParen)) {
                 if (vi >= 0) {
-                    self.err(format("variant '{}' carries no payload", nameOf(variant)));
+                    self.err(format("variant `{}` carries no payload", nameOf(variant)));
                 }
-                self.err(stringOf("`_` binds nothing — it stands for every remaining variant"));
+                self.err(stringOf("`_` binds nothing\nnote: `_` stands for every remaining variant, so it takes no names"));
             }
 
             // Each arm is its own scope, so its bindings live and die with it and two arms may
@@ -3325,7 +3778,7 @@ methods Parser {
                 nm: Sym = raw.get(k);
                 if (nameOf(nm) == "_") { binds.push(nm); k = k + 1; continue; }
                 if (self.symSeen(binds, nm)) {
-                    self.err(format("'{}' is bound twice in one arm", nameOf(nm)));
+                    self.err(format("`{}` is bound more than once in the same arm", nameOf(nm)));
                 }
                 // The binding becomes an ordinary local at the head of the arm: `v: T;` then
                 // `v = subject.$V$k;`: declared and assigned exactly as the programmer would
@@ -3398,7 +3851,7 @@ methods Parser {
         self.expect(Tok.RightCurly);
 
         if (arms.len() == 0) {
-            self.err(format("match on {} has no arms", what));
+            self.err(stringOf("this `match` has no arms"));
         } else {
             last: ArmNode = arms.get(arms.len() - 1);
             last.test = NO_NODE;
@@ -3410,8 +3863,8 @@ methods Parser {
             for v in 0..self.sumVariantCount(si) {
                 want: Sym = self.sumVariantName(si, v);
                 if (!self.symSeen(covered, want)) {
-                    self.err(format("match on {} does not cover {} — every variant must be handled, or add a `_` arm",
-                                    nameOf(subjName), nameOf(want)));
+                    self.err(format("`match` does not cover variant `{}` of `{}`\nhelp: handle every variant, or add a `_` arm",
+                                    nameOf(want), nameOf(subjName)));
                 }
             }
         }
@@ -3480,25 +3933,25 @@ methods Parser {
 
     // ─── `?` ─────────────────────────────────────────────────────────────────
     //
-    // `f()?` in a function whose return type implements the core trait `Try<T, R>` (the standard
-    // library's Result and Option do): when `f()` breaks (`isBreak`), return the function's own
-    // type made from its failure (`fromResidual(residual())`); otherwise it is the value that goes
-    // on (`output`). The failure is handed on as it is: no conversion, so `f()`'s `R` must be the
-    // function's.
+    // `f()?` works in a function whose return type implements the core trait `Try<T, R>`, as the
+    // standard library's Result and Option do. When `f()` breaks (`isBreak`), the function
+    // returns its own type made from the failure (`fromResidual(residual())`); otherwise `f()?`
+    // is the value that goes on (`output`). The failure is handed on as it is, with no
+    // conversion, so `f()`'s `R` must be the function's.
     //
-    // Written out here, per statement, into what a person would write by hand (`wrapTry`): the
-    // operand is held in a local of its own type, tested, and the statement goes in the `else`
-    // with the `?` replaced by the output's local, so the ownership pass releases the locals in
-    // scope on the early return as on any other, the evaluator runs it, and the optimizer sees
-    // plain code (four small methods it inlines into the tag test a `match` would make). The
-    // operand runs before the rest of the statement, so nothing with an effect may come ahead of
-    // it (`tryOrder`).
+    // It is written out here, per statement, into what a person would write by hand (`wrapTry`).
+    // The operand is held in a local of its own type and tested, and the statement goes in the
+    // `else` with the `?` replaced by the output's local. Because of that, the ownership pass
+    // releases the locals in scope on the early return as on any other, the evaluator can run
+    // it, and the optimizer sees plain code (four small methods it inlines into the tag test a
+    // `match` would make). The operand runs before the rest of the statement, so nothing with
+    // an effect may come ahead of it (`tryOrder`).
 
     // `operand?`: noted, and replaced by the local its Ok value will be read through.
     tryHoleFor &self operand:NodeId -> NodeId {
         if (self.quoteDepth > 0) { self.err(stringOf("`?` is not supported inside a `quote`")); }
         if (!self.retOk) {
-            self.err(stringOf("`?` returns early, so it needs a function body to return from -- it is not supported in a closure"));
+            self.err(stringOf("`?` needs a function to return from\nnote: `?` returns early, which is not supported in a closure or outside a function body"));
         }
         self.holdTryReturn();
         seq: long = self.uniq;
@@ -3516,16 +3969,16 @@ methods Parser {
     // implementation may be declared below.
     holdTryReturn &self -> void {
         if (self.retTy.base == Lit.Struct && self.retTy.name != NO_SYM) { return; }
-        self.err(format("`?` returns early with the failure, so the function must return a type implementing `Try` (a Result or an Option) -- this one returns {}",
+        self.err(format("`?` cannot be used in a function that returns `{}`\nnote: `?` returns the failure early, so the function must return a type implementing `Try`, such as `Result` or `Option`",
                         spellTypeName(typeMangleName(self.retTy.base, self.retTy.name))));
     }
     // The type a `?`'s early return names: the return type's template when it is generic (the
     // return's destination says the instance, as `Option.fromFlag` does), else the type.
     tryOwner &self -> Sym {
         if (self.retTy.base != Lit.Struct || self.retTy.name == NO_SYM) { return NO_SYM; }
-        r: long = gReg.findRequest(nameOf(self.retTy.name));
+        r: long = gReg.findRequestSym(self.retTy.name);
         if (r >= 0) { return gReg.requestAt(r).base; }
-        if (gReg.findTemplate(nameOf(self.retTy.name)) >= 0) { return self.retTy.name; }
+        if (gReg.findTemplateSym(self.retTy.name) >= 0) { return self.retTy.name; }
         return NO_SYM;
     }
 
@@ -3536,7 +3989,7 @@ methods Parser {
         pending: bool = self.pendingInits.len() > 0;
         if (pending) {
             if (self.pendingInits.len() > 1) {
-                self.err(stringOf("`?` in an array literal: bind the element to a local first"));
+                self.err(stringOf("`?` is not supported in an array literal\nhelp: bind the element to a local first"));
             }
             target = self.pendingInits.get(0);
         }
@@ -3547,7 +4000,7 @@ methods Parser {
         self.toLhs = 0;
         self.toOrder.clear();
         if (st.kind == StmtKind.Destructure) {
-            self.err(stringOf("`?` in a destructure that declares names: bind the tuple first, `t: (A, B) = f()?;`"));
+            self.err(stringOf("`?` is not supported in a destructure that declares names\nhelp: bind the tuple first: `t: (A, B) = f()?;`"));
         }
         if (st.kind == StmtKind.Expr || st.kind == StmtKind.Call) { self.tryOrder(self.ast.exprStmts.get(st.at).value); }
         else if (st.kind == StmtKind.Return) { self.tryOrder(self.ast.returns.get(st.at).value); }
@@ -3564,7 +4017,7 @@ methods Parser {
             }
         }
         if (self.toOrder.len() != self.tryHole.len() - mark) {
-            self.err(stringOf("`?` cannot stand here: in a loop's condition or header, or an `else if`'s, it would run once, ahead of the loop or the chain -- give it a statement of its own"));
+            self.err(stringOf("`?` cannot be used here\nnote: in a loop's condition or header, or in an `else if` condition, it would run only once, ahead of the loop or the chain\nhelp: give it a statement of its own"));
         }
         inner: long = target;
         k: long = self.toOrder.len();
@@ -3588,13 +4041,13 @@ methods Parser {
         for k in self.toMark..self.tryHole.len() {
             if (self.tryHole.get(k) != id) { continue; }
             if (self.toLhs > 0) {
-                self.err(stringOf("`?` in an assignment's target: bind it to a local first"));
+                self.err(stringOf("`?` is not supported in an assignment's target\nhelp: bind it to a local first"));
             }
             if (self.toCond > 0) {
-                self.err(stringOf("`?` in the right operand of `&&` or `||` would run whether or not the left decides the answer -- give it a statement of its own"));
+                self.err(stringOf("`?` cannot be used in the right operand of `&&` or `||`\nnote: it would run whether or not the left operand decides the answer\nhelp: give it a statement of its own"));
             }
             if (self.toImpure) {
-                self.err(stringOf("`?` runs its operand ahead of the rest of the statement, and here a call or a store comes before it -- bind that part to a local first"));
+                self.err(stringOf("`?` cannot come after a call or a store in the same statement\nnote: `?` runs its operand ahead of the rest of the statement\nhelp: bind the earlier part to a local first"));
             }
             self.tryOrder(self.tryOperand.get(k));
             self.toImpure = false;            // what it leaves in the statement is a local
@@ -3725,9 +4178,6 @@ methods Parser {
     // read both use it. So an operator a type implements (`Add`, `Sub`...) is what `+=` means for
     // it, and a float's rules are the float's.
     compoundAssign &self lhs:NodeId op:Op rhs:NodeId -> long {
-        if (!self.isPlace(lhs)) {
-            self.err(format("`{}=` assigns to a place: a local, a field, an element or `*p`", opName(op)));
-        }
         pre: Vec<long>;
         self.pushScope();
         once: NodeId = self.placeOnce(lhs, &pre);
@@ -3782,7 +4232,7 @@ methods Parser {
             _ { }
         }
         if (!self.isPure(id)) {
-            self.err(stringOf("a compound assignment's place is reached through a call, which it would make twice -- index it (`v[i] += 1`), or bind what the call gives first"));
+            self.err(stringOf("cannot use a compound assignment on a place reached through a call\nnote: the call would be made twice\nhelp: index it (`v[i] += 1`), or bind what the call returns first"));
         }
         return id;
     }
@@ -3847,23 +4297,23 @@ methods Parser {
             return SumInfo { owner: owner, enumAt: NOT_FOUND, tmplAt: NOT_FOUND,
                              reqAt: NOT_FOUND, backing: Lit.Int };
         }
-        e: long = gReg.findEnum(nameOf(owner));
+        e: long = gReg.findEnumSym(owner);
         if (e >= 0) {
             return SumInfo { owner: owner, enumAt: e, tmplAt: NOT_FOUND, reqAt: NOT_FOUND,
                              backing: gReg.enumDef(e).backing };
         }
-        t: long = gReg.findTemplate(nameOf(owner));
+        t: long = gReg.findTemplateSym(owner);
         if (t >= 0) {
             return SumInfo { owner: owner, enumAt: NOT_FOUND, tmplAt: t, reqAt: NOT_FOUND,
                              backing: Lit.Int };
         }
-        // An instance. The request says which template and with what; where even that is absent (
-        // a generic use inside a template is a pattern, so it is never requested) the name still
+        // An instance. The request says which template and with what. Where even that is absent
+        // (a generic use inside a template is a pattern, so it is never requested), the name still
         // spells its template, which is what `Option_T` -> `Option` recovers.
-        r: long = gReg.findRequest(nameOf(owner));
+        r: long = gReg.findRequestSym(owner);
         if (r >= 0) {
             bs: Sym = gReg.requestAt(r).base;
-            return SumInfo { owner: bs, enumAt: NOT_FOUND, tmplAt: gReg.findTemplate(nameOf(bs)),
+            return SumInfo { owner: bs, enumAt: NOT_FOUND, tmplAt: gReg.findTemplateSym(bs),
                              reqAt: r, backing: Lit.Int };
         }
         ti: long = gReg.templateOfInstance(nameOf(owner));
@@ -3905,7 +4355,7 @@ methods Parser {
     sumPayloadType &self si:SumInfo variant:Sym i:long -> TypeRef {
         want: Sym = enumPayloadField(nameOf(variant), i);
         if (si.enumAt >= 0) {
-            at: long = gReg.findStruct(nameOf(si.owner));
+            at: long = gReg.findStructSym(si.owner);
             if (at < 0) { return typeRefOf(Lit.Long); }
             d: StructDef = gReg.structDef(at);
             fi: long = gReg.findFieldSym(d, want);
@@ -3968,7 +4418,7 @@ methods Parser {
                 sname = elem.name;
             } else {
                 self.expect(Tok.RightSquare);
-                self.err(stringOf("a global cannot be a slice — it would be a view of nothing"));
+                self.err(stringOf("a global cannot be a slice\nnote: it would be a view of nothing\nhelp: declare an array: `NAME: [T; N]`"));
             }
         } else {
             t: TypeRef = self.parseTypeRef();
@@ -3992,14 +4442,14 @@ methods Parser {
         // Named, and its file and package taken, BEFORE the `;` is consumed: consuming it reads
         // the next token, and when this global is the last thing in its file that token is the
         // next file's, whose `#file` marker has already moved the lexer on. Qualified after it,
-        // a file's last global belonged to whichever module happened to follow it.
+        // a file's last global would belong to whichever module happened to follow it.
         q: Sym = self.qualify(nameOf(name));
         file: Sym = self.lx.currentFile;
         pkg: Sym = self.lx.currentPackage;
         // A global shares the expression namespace with nothing else, but it does share the name
         // with types: `Foo` as a value and `Foo` as a type read the same.
-        if (gReg.findGlobal(nameOf(q)) >= 0) {
-            self.err(format("'{}' is already declared", nameOf(name)));
+        if (gReg.findGlobalSym(q) >= 0) {
+            self.err(format("redefinition of `{}`", nameOf(name)));
         }
         self.requireTypeNameFree(nameOf(name));
         self.expect(Tok.Semicolon);
@@ -4021,11 +4471,11 @@ methods Parser {
         e: Expr = self.ast.expr(init);
         match e.payload { Lit(l) { ln = self.ast.lits.get(l); } _ { } }
         if (!isArray) {
-            self.err(stringOf("`[a, b, ...]` is an array literal, and this declares no array: `xs: [T; N] = [...]`"));
+            self.err(stringOf("an array literal can only initialize an array\nhelp: declare an array: `xs: [T; N] = [...]`"));
             return ln;
         }
         if (count >= 0 && ln.initCount != count) {
-            self.err(format("an array of {} element(s) is given {} -- an array literal names every element",
+            self.err(format("wrong number of elements in array literal: expected {}, found {}\nnote: an array literal names every element",
                             count, ln.initCount));
         }
         return ln;
@@ -4033,37 +4483,37 @@ methods Parser {
 
     // ─── methods ─────────────────────────────────────────────────────────────
 
-    // Every `methods X for T` this module wrote names a trait: one that names nothing used to
-    // declare a trait of its own in passing (`methods X for Drop` in a file that included nothing,
-    // `Add` in a module that does not include `core`), and the implementation then did nothing.
+    // Every `methods X for T` this module wrote must name a trait. Without this check, one that
+    // names nothing would declare a trait of its own in passing (`methods X for Drop` in a file
+    // that included nothing, `Add` in a module that does not include `core`), and the
+    // implementation would quietly do nothing.
     checkImplTraits &self -> void {
         for c in self.implChecks {
+            if (self.abandonedName(c.trait)) { continue; }
             if (c.isType) {
-                // `Result<long, long>` with no `Result` anywhere: it used to stand as a struct
-                // nobody declared, and the first thing to notice was whatever read it as one
-                // (`'rr' is not a sum type`).
-                if (gReg.findTemplate(nameOf(c.trait)) >= 0 || gReg.declares(nameOf(c.trait))) { continue; }
+                // `Result<long, long>` with no `Result` anywhere. Left alone it would stand as a
+                // struct nobody declared, and the first thing to notice would be whatever read it
+                // as one (a `match` saying it is not an enum).
+                if (gReg.findTemplateSym(c.trait) >= 0 || gReg.declares(nameOf(c.trait))) { continue; }
                 tb: str = lastComponentOf(nameOf(c.trait));
                 failAtStr(nameOf(c.file), c.line, c.col,
-                          format("Unknown type '{}'{}", tb, stdlibHint(tb)));
+                          format("cannot find type `{}` in this scope{}", tb, stdlibHint(tb)));
                 continue;
             }
-            if (c.trait == NO_SYM || gReg.findTrait(nameOf(c.trait)) >= 0) { continue; }
+            if (c.trait == NO_SYM || gReg.findTraitSym(c.trait) >= 0) { continue; }
             bare: str = lastComponentOf(nameOf(c.trait));
             why: String;
             if (gReg.findTrait(bare) >= 0) {
-                why = format("'{}' is declared `pub` below its implementation for {} -- declare it above",
+                why = format("trait `{}` is declared below its implementation for `{}`\nnote: a `pub` trait must be declared above its implementations\nhelp: move the trait's declaration above this `methods` block",
                              bare, keepString(spellTypeName(nameOf(c.owner))));
             } else {
-                why = format("'{}' is not a trait: `methods {} for {}` names nothing declared{}",
-                             bare, keepString(spellTypeName(nameOf(c.owner))), bare, stdlibHint(bare));
+                why = format("cannot find trait `{}` in this scope{}", bare, stdlibHint(bare));
             }
             failAtStr(nameOf(c.file), c.line, c.col, why);
         }
         self.implChecks.clear();
     }
 
-    // `methods T { ... }` and `methods T for Trait { ... }`.
     // `methods T { ... }` and `methods T for Trait { ... }`.
     //
     // Each method becomes an ordinary top-level function named `T_method`, with the receiver as
@@ -4076,36 +4526,35 @@ methods Parser {
     }
 
     // `methods<T: Integer> T for Hash { ... }`: one implementation for each scalar the category
-    // holds, as if written out once per type. The block is read once per type, from the same
-    // text, with `T` standing for that type (`blanketVar`), so each reading is exactly the
-    // hand-written `methods long for Hash { ... }`, checked and named as one. The categories are
-    // the compiler's own, so the set is closed and the expansion is all there is to it: no generic
-    // body survives, and a hand-written implementation for one of the types is the duplicate it
-    // would be beside the written-out ones.
+    // holds, as if written out once per type. Without `for`, the methods are inherent ones, each
+    // type's own. The block is read once per type, from the same text, with `T` standing for
+    // that type (`blanketVar`), so each reading is exactly the hand-written
+    // `methods long for Hash { ... }`, checked and named as one. The categories are the
+    // compiler's own, so the set is closed and the expansion is all there is to it. No generic
+    // body survives, and a hand-written implementation for one of the types is a duplicate, just
+    // as it would be beside implementations written out by hand.
     parseBlanketMethods &self -> long {
         self.expect(Tok.LessThan);
         tv: Token = self.expect(Tok.Id);
         if (!self.eat(Tok.Colon)) {
-            self.err(format("a blanket implementation names its scalars: `methods<{}: Integer> {} for Trait` (Integer, Signed, Unsigned or Float)",
+            self.err(format("a blanket implementation must name its category of scalars\nhelp: write `methods<{}: Integer> {} for Trait`; the categories are `Integer`, `Signed`, `Unsigned` and `Float`",
                             nameOf(tv.text), nameOf(tv.text)));
         }
         cat: Token = self.expect(Tok.Id);
         kinds: Vec<Lit> = blanketScalars(nameOf(cat.text));
         if (kinds.len() == 0) {
-            self.err(format("'{}' is not a category of scalars -- a blanket implementation is over Integer, Signed, Unsigned or Float",
+            self.err(format("`{}` is not a category of scalars\nnote: a blanket implementation is over `Integer`, `Signed`, `Unsigned` or `Float`",
                             nameOf(cat.text)));
         }
         self.closeAngle();
         own: Token = self.expect(Tok.Id);
         if (own.text != tv.text) {
-            self.err(format("`methods<{}: {}> {}`: the implementation is for {} itself",
+            self.err(format("the blanket implementation `methods<{}: {}> {}` must be for `{}` itself",
                             nameOf(tv.text), nameOf(cat.text), nameOf(own.text), nameOf(tv.text)));
         }
-        if (!self.word("for")) {
-            self.err(format("a blanket implementation implements a trait: `methods<{}: {}> {} for Trait {{ ... }}`",
-                            nameOf(tv.text), nameOf(cat.text), nameOf(tv.text)));
-        }
-        // Each reading starts here, at `for`.
+        // Each reading starts here: at `for` when the block implements a trait, at its `{` when its
+        // methods are inherent (`methods<T: Integer> T { twice &self -> T {...} }`, every integer
+        // type's own `twice`). Each reading is an ordinary `methods long ...` block.
         savedLx: Lexer = self.lx;
         savedCur: Token = self.cur;
         savedPeeked: Token = self.peeked;
@@ -4138,7 +4587,7 @@ methods Parser {
         owner: Sym = tname.text;
         if (namesScalar(nameOf(tname.text))) {
             if (!isImplableScalar(scalarNamed(nameOf(tname.text)))) {
-                self.err(format("'methods {}' — '{}' is a shape, not a type with values to implement for",
+                self.err(format("cannot write `methods {}`\nnote: `{}` is a shape, not a type with values to implement methods for",
                                 nameOf(tname.text), nameOf(tname.text)));
             }
         } else {
@@ -4163,7 +4612,7 @@ methods Parser {
                                              col: self.lx.charNumber, file: self.lx.currentFile,
                                              isType: false });
             if (gReg.implementsTrait(owner, tr)) {
-                self.err(format("{} already implements {} -- a type implements a trait once",
+                self.err(format("`{}` already implements `{}`\nnote: a type implements a trait only once",
                                 nameOf(owner), gReg.traitMangled(tr)));
             }
         }
@@ -4199,8 +4648,7 @@ methods Parser {
 
         self.implMangled = NO_SYM;
         if (tr.name != NO_SYM) { regAddImpl(owner, tr, implFns, carried); }
-        // An empty block still stands as one statement, a marker naming its owner (it used to point
-        // at whichever name happened to be first in `structDecls`).
+        // An empty block still stands as one statement: a marker naming its owner.
         if (first == NO_STMT) {
             self.ast.structDecls.push(owner);
             first = self.ast.addStmt(StmtKind.StructDecl, self.ast.structDecls.len() - 1);
@@ -4213,11 +4661,11 @@ methods Parser {
     // `N: long` (it may say so), a default belongs on the declaration, and a parameter the header
     // leaves out is still this instance's own wherever the template is named inside the block.
     methodsHeaderKinds &self owner:Sym names:Vec<Sym> -> void {
-        tat: long = gReg.findTemplate(nameOf(owner));
+        tat: long = gReg.findTemplateSym(owner);
         for k in 0..names.len() {
             info: GParamInfo = self.tplParams.get(k);
             if (info.deflt.base != Lit.Void) {
-                self.err(format("a default for '{}' belongs on {}'s declaration, not on a methods block",
+                self.err(format("a default for `{}` belongs on the declaration of `{}`, not on a `methods` block",
                                 nameOf(names.get(k)), nameOf(owner)));
             }
             isLen: bool = false;
@@ -4227,7 +4675,7 @@ methods Parser {
                 isLen = at >= 0 && gReg.gParamIsLen(t, at);
             }
             if (info.isLen && !isLen) {
-                self.err(format("'{}' is not a length parameter of {}", nameOf(names.get(k)), nameOf(owner)));
+                self.err(format("`{}` is not a length parameter of `{}`", nameOf(names.get(k)), nameOf(owner)));
             }
             if (isLen && !info.isLen) { self.lenVars.push(names.get(k)); }
         }
@@ -4242,7 +4690,7 @@ methods Parser {
         // `E.x(...)` reads `x` as a variant when E has one, so a method of that name could only
         // be reached half the time: refused where it is declared.
         if (self.sumHasVariant(owner, mname.text)) {
-            self.err(format("enum {} has a variant '{}', so it cannot also have a method of that name",
+            self.err(format("enum `{}` has a variant `{}`, so it cannot also have a method of that name",
                             nameOf(owner), nameOf(mname.text)));
         }
         // Named before the body moves the lexer on.
@@ -4262,7 +4710,7 @@ methods Parser {
         lensBefore: long = self.lenVars.len();
         if (self.check(Tok.LessThan)) {
             if (self.inImpl) {
-                self.err(format("'{}' implements a trait method, and a trait method with type parameters of its own is not supported -- declare it in a plain `methods` block",
+                self.err(format("trait method `{}` cannot have type parameters of its own\nhelp: declare it in a plain `methods` block",
                                 nameOf(mname.text)));
             }
             ownParams = self.parseParamNamesInto(&ownBs);
@@ -4270,7 +4718,7 @@ methods Parser {
             for k1 in 0..ownParams.len() {
                 for j1 in 0..varsBefore {
                     if (self.typeVars.get(j1) == ownParams.get(k1)) {
-                        self.err(format("'{}' is already a type parameter of the methods block", nameOf(ownParams.get(k1))));
+                        self.err(format("`{}` is already a type parameter of the `methods` block", nameOf(ownParams.get(k1))));
                     }
                 }
             }
@@ -4280,7 +4728,7 @@ methods Parser {
         params: Vec<long>;
         lent: bool = self.eat(Tok.Ampersand);
         if (lent || self.word("self")) {
-            if (!self.eatWord("self")) { self.err(stringOf("Expected `self` after `&` in a method receiver")); }
+            if (!self.eatWord("self")) { self.err(format("expected `self`, found {}", describeTok(self.cur))); }
             // `&self` lends the receiver; a bare `self` takes it, which is how a method that
             // consumes its value (`unwrap`, `pop`) says so.
             kind: Lit = Lit.Struct;
@@ -4304,13 +4752,15 @@ methods Parser {
         self.fnDepth = self.fnDepth + 1;      // inside a body a declaration is a local, not a global
         was: Sym = gReg.deferIn;
         wasPlain: bool = self.plainBody;
-        self.plainBody = !gReg.isGeneric(nameOf(owner)) && self.typeVars.len() == 0;
-        if (!gReg.isGeneric(nameOf(owner)) && self.typeVars.len() == 0 && isUpstreamPkg(pkg)) { gReg.deferIn = file; }
+        self.plainBody = !gReg.isGenericSym(owner) && self.typeVars.len() == 0;
+        if (!gReg.isGenericSym(owner) && self.typeVars.len() == 0 && isUpstreamPkg(pkg)) { gReg.deferIn = file; }
         wasRet: TypeRef = self.retTy;
         wasRetOk: bool = self.retOk;
         self.retTy = ret;
         self.retOk = true;
+        if (isUnsafe) { self.unsafeDepth = self.unsafeDepth + 1; }
         body: long = self.parseBlock();
+        if (isUnsafe) { self.unsafeDepth = self.unsafeDepth - 1; }
         self.retTy = wasRet;
         self.retOk = wasRetOk;
         gReg.deferIn = was;
@@ -4324,7 +4774,7 @@ methods Parser {
         // function's do, and on its template either way: an instance's copy takes them from there.
         fb: long = self.boundFirst;
         fc: long = self.boundCount;
-        ownerGeneric: bool = gReg.isGeneric(nameOf(owner));
+        ownerGeneric: bool = gReg.isGenericSym(owner);
         if (ownParams.len() > 0 && !ownerGeneric) { fb = regAddBounds(ownBs); fc = ownBs.len(); }
         self.ast.fns.push(FnNode { name: q,
                                    returnKind: ret.base, returnStruct: ret.name,
@@ -4337,7 +4787,7 @@ methods Parser {
         st: long = self.ast.addStmt(StmtKind.FunctionDef, self.ast.fns.len() - 1);
         if (ownParams.len() > 0) {
             if (body < 0) {
-                self.err(format("'{}' is generic, so it has no symbol to link against — a declaration without a body cannot take type parameters",
+                self.err(format("generic method `{}` has no body\nnote: a generic method has no symbol to link against, so a declaration without a body cannot take type parameters",
                                 nameOf(mname.text)));
             }
             heldBs: Vec<MethodBound>;
@@ -4362,6 +4812,7 @@ methods Parser {
     // with `methods T for Name { }`.
     parseTraitDecl &self -> long {
         name: Token = self.expect(Tok.Id);
+        self.declName = name.text;
         // A `pub` (or `pkg`) trait's name is flat: one program-wide name, which a repeat that says
         // the same thing re-declares. A trait declared without either belongs to its file, as a
         // struct does (`geo::Shape`), so two files may each have their own and a program's
@@ -4372,7 +4823,7 @@ methods Parser {
         owned: bool = self.vis == Vis.Local && !isCoreTraitName(nameOf(name.text));
         if (owned) { q = self.qualify(nameOf(name.text)); }
         // Only a fresh trait has to claim the name; a repeat already owns it.
-        already: long = gReg.findTrait(nameOf(q));
+        already: long = gReg.findTraitSym(q);
         if (already < 0) {
             // A file's own trait may share its spelling with a `pub` one it can see, and shadows
             // it here as a file's own struct would.
@@ -4385,8 +4836,8 @@ methods Parser {
         params: Vec<TypeRef> = self.parseTypeParams();
         // In scope for the signatures that follow: `-> R` has to come back as the type variable
         // R, not as a type named `core::R` that nobody declared. Stamping substitutes by that
-        // name, and a qualified one never matched, so `Fn(long) -> long` kept `R` as its return
-        // and every call through one was lowered as if it returned a struct.
+        // name, and a qualified one would never match: `Fn(long) -> long` would keep `R` as its
+        // return, and every call through one would be lowered as if it returned a struct.
         for k in 0..params.len() { self.typeVars.push(params.get(k).name); }
         // `trait Encode derive deriveEncode { ... }`: a type with no `methods X for Encode` gets
         // one written by that macro, the first time the program needs it (see the checker's
@@ -4398,7 +4849,7 @@ methods Parser {
             self.advance();
             deriveBy = self.expect(Tok.Id).text;
             if (params.len() > 0) {
-                self.err(format("trait '{}' takes type arguments, and only a trait without them can name a derive macro",
+                self.err(format("generic trait `{}` cannot name a derive macro\nnote: only a trait without type parameters can name one",
                                 nameOf(name.text)));
             }
         }
@@ -4416,9 +4867,10 @@ methods Parser {
             self.popScope();
             self.expect(Tok.Arrow);
             // `-> Self` names the implementing type, which a trait cannot know. Kept as that
-            // one word rather than resolved: resolving it qualifies it with whichever module
+            // one word rather than resolved: resolving it would qualify it with whichever module
             // the trait was written in, so `core`'s `Clone` and a test file's identical
-            // re-declaration of it stopped comparing equal and the repeat read as a conflict.
+            // re-declaration of it would stop comparing equal, and the repeat would read as a
+            // conflict.
             ret: TypeRef = TypeRef { base: Lit.Struct, name: intern("Self") };
             if (self.word("Self")) { self.advance(); }
             else { ret = self.parseTypeRef(); }
@@ -4439,7 +4891,7 @@ methods Parser {
         if (deriveBy != NO_SYM) {
             had: Sym = gReg.deriveMacroOf(q);
             if (already >= 0 && had != NO_SYM && had != deriveBy) {
-                self.err(format("trait '{}' is already declared deriving with '{}'", nameOf(name.text), nameOf(had)));
+                self.err(format("trait `{}` is already declared with derive macro `{}`", nameOf(name.text), nameOf(had)));
             }
             if (had == NO_SYM) { regNoteDerive(q, deriveBy, tfile); }
         }
@@ -4448,7 +4900,7 @@ methods Parser {
         // instead of including <core> work; a repeat that says something else is refused.
         if (already >= 0) {
             if (!gReg.sameTrait(gReg.traitDef(already), sigs, params.len())) {
-                self.err(format("trait '{}' is already declared with different methods",
+                self.err(format("trait `{}` is already declared with different methods",
                                 nameOf(name.text)));
             }
         } else {
@@ -4472,7 +4924,7 @@ methods Parser {
             if (self.eat(Tok.Colon)) {
                 b: Token = self.expect(Tok.Id);            // the first bound
                 if (namesScalar(nameOf(b.text))) {
-                    self.err(format("a trait takes only type parameters, and '{}: {}' would be a length",
+                    self.err(format("a trait takes only type parameters\nnote: `{}: {}` would declare a length parameter",
                                     nameOf(pname.text), nameOf(b.text)));
                 }
                 while (self.eat(Tok.Plus)) { self.expect(Tok.Id); }
@@ -4488,6 +4940,7 @@ methods Parser {
     // `type Name = Existing;`. One name for another, resolved once and interchangeable after.
     parseTypeAlias &self -> long {
         name: Token = self.expect(Tok.Id);
+        self.declName = name.text;
         self.requireTypeNameFree(nameOf(name.text));
         self.expect(Tok.Equals);
         if (self.word("distinct") && self.peekNext().kind != Tok.Semicolon) {
@@ -4509,7 +4962,7 @@ methods Parser {
         if (self.vis == Vis.Pub) {
             clash: Sym = gReg.otherPubAlias(nameOf(name.text), q);
             if (clash != NO_SYM) {
-                self.err(format("type name '{}' is already a type alias, published by '{}' — drop the `pub` to make this file's own",
+                self.err(format("the type name `{}` is already taken by the `pub` type alias `{}`\nhelp: drop the `pub` to make this alias this file's own",
                                 nameOf(name.text), nameOf(clash)));
             }
         }
@@ -4532,7 +4985,7 @@ methods Parser {
         backing: Lit = base.base;
         if (base.base == Lit.Struct && namedScalar(base.base, base.name)) { backing = namedScalarBacking(base.name); }
         else if (!(isInteger(base.base) || base.base == Lit.Char || base.base == Lit.Bool)) {
-            self.err(format("a distinct type is made over an integer, a `char` or a `bool` (or a type that is one), and '{}' is not one -- an aggregate's distinct type is not supported yet: wrap it in a struct",
+            self.err(format("cannot make a distinct type over `{}`\nnote: the base must be an integer, a `char` or a `bool`, or a type that is one\nnote: a distinct type over an aggregate is not supported yet\nhelp: wrap it in a struct",
                             typeMangleName(base.base, base.name)));
         }
         q: Sym = self.qualify(nameOf(name.text));
@@ -4543,14 +4996,14 @@ methods Parser {
             loop {
                 t: Token = self.expect(Tok.Id);
                 if (distinctImpl(nameOf(t.text), "T", "long").len == 0) {
-                    self.err(format("`with` takes the base's operators by their traits -- Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor, Shl, Shr, Not, Eq, Ord or Hash -- and '{}' is not one of them",
+                    self.err(format("a distinct type cannot take `{}` with `with`\nnote: `with` takes the base's operators by their traits: `Add`, `Sub`, `Mul`, `Div`, `Rem`, `BitAnd`, `BitOr`, `BitXor`, `Shl`, `Shr`, `Not`, `Eq`, `Ord` or `Hash`",
                                     nameOf(t.text)));
                 }
-                if (self.symSeen(traits, t.text)) { self.err(format("'{}' is named twice", nameOf(t.text))); }
+                if (self.symSeen(traits, t.text)) { self.err(format("duplicate trait `{}` in `with`", nameOf(t.text))); }
                 traits.push(t.text);
                 if (!self.eat(Tok.Comma)) { break; }
             }
-            if (self.fnDepth > 0) { self.err(stringOf("a distinct type with operators is declared at the top level")); }
+            if (self.fnDepth > 0) { self.err(stringOf("a distinct type with operators must be declared at the top level")); }
         }
         self.expect(Tok.Semicolon);
         none: Vec<VariantDef>;
@@ -4572,13 +5025,12 @@ methods Parser {
 
     // Top-level declarations written by the compiler, read where the declaration that asked for
     // them stands (its file, package and line), and put on the page after it (`pending`).
+    //
+    // The module's own cursor is kept in the parser rather than here, so that an error in the
+    // text can put it back (`rewindTo`): this frame is gone by then.
     parseSynthetic &self text:str -> void {
-        savedLx: Lexer = self.lx;
-        savedCur: Token = self.cur;
-        savedPeeked: Token = self.peeked;
-        savedHas: bool = self.hasPeeked;
-        savedCurPos: long = self.curPos;
-        savedPeekPos: long = self.peekPos;
+        self.synthSaved.push(Cursor { lx: self.lx, cur: self.cur, peeked: self.peeked, hasPeeked: self.hasPeeked,
+                                      curPos: self.curPos, peekPos: self.peekPos });
         l: Lexer = self.lx;
         l.src = text;
         l.pos = 0;
@@ -4587,12 +5039,13 @@ methods Parser {
         self.hasPeeked = false;
         self.advance();
         while (!self.check(Tok.FileEnd)) { self.pending.push(self.parseStatement()); }
-        self.lx = savedLx;
-        self.cur = savedCur;
-        self.peeked = savedPeeked;
-        self.hasPeeked = savedHas;
-        self.curPos = savedCurPos;
-        self.peekPos = savedPeekPos;
+        c: Cursor = self.synthSaved.pop();
+        self.lx = c.lx;
+        self.cur = c.cur;
+        self.peeked = c.peeked;
+        self.hasPeeked = c.hasPeeked;
+        self.curPos = c.curPos;
+        self.peekPos = c.peekPos;
     }
 
     // ─── with ────────────────────────────────────────────────────────────────
@@ -4620,7 +5073,7 @@ methods Parser {
         // `asm -> never { ... }`: the block does not come back.
         noReturn: bool = false;
         if (self.eat(Tok.Arrow)) {
-            if (!self.eatWord("never")) { self.err(stringOf("`asm -> never { ... }` is the only result an `asm` block declares")); }
+            if (!self.eatWord("never")) { self.err(format("expected `never`, found {}\nnote: `asm -> never {{ ... }}` is the only result an `asm` block declares", describeTok(self.cur))); }
             noReturn = true;
         }
         self.expect(Tok.LeftCurly);
@@ -4646,7 +5099,7 @@ methods Parser {
                 pieces.push(AsmPiece { kind: AsmKind.Out, reg: reg.text, name: bound,
                                        value: NO_NODE, text: NO_SYM });
             } else {
-                self.err(stringOf("Expected `in`, `out`, or a literal line inside an `asm` block"));
+                self.err(format("expected `in`, `out` or a string literal in an `asm` block, found {}", describeTok(self.cur)));
             }
         }
         self.expect(Tok.RightCurly);
@@ -4664,7 +5117,9 @@ methods Parser {
     // trusted region and whose callers must themselves be inside one.
     parseUnsafe &self -> long {
         if (self.check(Tok.LeftCurly)) {
+            self.unsafeDepth = self.unsafeDepth + 1;
             b: long = self.parseBlock();
+            self.unsafeDepth = self.unsafeDepth - 1;
             self.ast.blockStmts.push(BlockStmtNode { body: b });
             return self.ast.addStmt(StmtKind.Unsafe, self.ast.blockStmts.len() - 1);
         }
@@ -4673,11 +5128,13 @@ methods Parser {
             self.advance();
             self.fnAttrs = FN_BUILTIN_DECL;
         }
+        self.unsafeDepth = self.unsafeDepth + 1;
         st: long = self.parseStatement();
+        self.unsafeDepth = self.unsafeDepth - 1;
         // Mark the definition it produced. Anything else after `unsafe` is a mistake.
         s: Stmt = self.ast.stmts.get(st);
         if (s.kind != StmtKind.FunctionDef) {
-            self.err(stringOf("'unsafe' must be followed by a function definition or a '{' block"));
+            self.err(stringOf("`unsafe` must be followed by a function definition or a `{ ... }` block"));
         }
         f: FnNode = self.ast.fns.get(s.at);
         f.isUnsafe = true;
@@ -4700,9 +5157,9 @@ methods Parser {
     // of `BufWriter<Write>`: a trait object is not `Default`.
     //
     // A parameter is a type unless it says otherwise. `N: long` makes it a length: it stands where
-    // an array's length does (`[u8; N]`) and, in a body, for its value. Marked rather than inferred
-    // from how it is used, because a use can be anywhere -- only in a function's return type, or
-    // only in a field below -- and the parser has to know what `N` is the moment it meets it.
+    // an array's length does (`[u8; N]`) and, in a body, for its value. It is marked rather than
+    // inferred from how it is used, because a use can be anywhere (only in a function's return
+    // type, or only in a field below) and the parser has to know what `N` is the moment it meets it.
     // `= default` gives what a use that leaves it out means (`<W, N: long = 4096>`, `<T, A = Heap>`).
     // What the header said of each is left in `tplParams` for the caller that records it.
     parseParamNamesInto &self inout bs:Vec<MethodBound> -> Vec<Sym> {
@@ -4717,9 +5174,9 @@ methods Parser {
             // In scope from the moment it is named, because its own bound may mention it and a
             // later parameter's certainly may: `count<T, I: Iter<T>>` reads `T` inside I's bound,
             // and a `T` not yet bound resolves as the name of a struct nobody declared. This is
-            // the only place they are bound: every caller used to bind the returned list again,
-            // which was invisible while the scope was only ever asked whether it holds a name and
-            // wrong the moment it was read as the ordered list a closure template needs.
+            // the only place they are bound. A caller must not bind the returned list again: the
+            // scope is also read as the ordered list a closure template needs, and a second copy
+            // would show up in it.
             self.typeVars.push(pname.text);
             info: GParamInfo = GParamInfo { isLen: false, deflt: typeRefOf(Lit.Void) };
             if (self.eat(Tok.Colon)) {
@@ -4727,10 +5184,10 @@ methods Parser {
                 if (self.check(Tok.Id) && namesScalar(nameOf(self.cur.text))) {
                     sc: Token = self.advance();
                     if (nameOf(sc.text) != "long") {
-                        self.err(format("a length parameter is a `long` — write `{}: long`", nameOf(pname.text)));
+                        self.err(format("a length parameter must be a `long`\nhelp: write `{}: long`", nameOf(pname.text)));
                     }
                     if (self.check(Tok.Plus)) {
-                        self.err(format("'{}' is a length, which takes no trait bound", nameOf(pname.text)));
+                        self.err(format("length parameter `{}` cannot take a trait bound", nameOf(pname.text)));
                     }
                     info = GParamInfo { isLen: true, deflt: info.deflt };
                     self.lenVars.push(pname.text);
@@ -4753,14 +5210,14 @@ methods Parser {
                     d = self.parseTypeRef();
                 }
                 if (self.typeVarUses != uses) {
-                    self.err(format("the default for '{}' names a parameter of the template — a default is a fixed type or length",
+                    self.err(format("the default for `{}` cannot name a parameter of the template\nnote: a default is a fixed type or length",
                                     nameOf(pname.text)));
                 }
                 info = GParamInfo { isLen: info.isLen, deflt: d };
                 defaulted = true;
             } else if (defaulted) {
                 // A use gives its arguments in order, so only a trailing run can be left out.
-                self.err(format("'{}' follows a parameter with a default, so it needs a default too",
+                self.err(format("`{}` needs a default, because it follows a parameter with one",
                                 nameOf(pname.text)));
             }
             self.tplParams.push(info);
@@ -4797,7 +5254,7 @@ methods Parser {
         if (base != NO_SYM && base == self.selfTpl) {
             return TplRef { known: true, own: true, first: 0, count: self.selfParams.len() };
         }
-        at: long = gReg.findTemplate(nameOf(base));
+        at: long = gReg.findTemplateSym(base);
         if (at < 0) { return TplRef { known: false, own: false, first: 0, count: 0 }; }
         t: GTemplate = gReg.templateDef(at);
         return TplRef { known: true, own: false, first: t.firstParam, count: t.paramCount };
@@ -4846,7 +5303,7 @@ methods Parser {
         if (self.check(Tok.Id) && self.isTypeVar(self.cur.text) && self.peekNext().kind == Tok.RightSquare) {
             n: Token = self.advance();
             if (!self.isLenVar(n.text)) {
-                self.err(format("'{}' is a type parameter, not a length — a length parameter is declared `{}: long`",
+                self.err(format("`{}` is a type parameter, not a length\nhelp: declare a length parameter as `{}: long`",
                                 nameOf(n.text), nameOf(n.text)));
             }
             self.typeVarUses = self.typeVarUses + 1;
@@ -4868,19 +5325,19 @@ methods Parser {
             written: str = nameOf(name.text);
             if (self.check(Tok.ColonColon)) { written = nameOf(self.qualifiedFrom(name)); }
             if (self.isTypeVar(name.text)) {
-                self.err(format("'{}' is a template parameter, and a default has to be a fixed length", written));
+                self.err(format("a default cannot name template parameter `{}`\nnote: a default has to be a fixed length", written));
             }
             g: long = self.globalNamed(written, self.currentModule());
             if (g < 0) {
-                self.err(format("'{}' is not a constant — a length is an integer literal, a constant global, or a length parameter",
+                self.err(format("`{}` is not a constant\nnote: a length is an integer literal, a constant global, or a length parameter",
                                 written));
             }
             v = self.constGlobalValueIn(g, written, 0);
         } else {
-            self.err(format("Expected a length, but found {}", tokName(self.cur.kind)));
+            self.err(format("expected a length, found {}", describeTok(self.cur)));
         }
         if (neg) { v = -v; }
-        if (v < 0) { self.err(format("a length cannot be negative, and this one is {}", v)); }
+        if (v < 0) { self.err(format("a length cannot be negative, but this one is `{}`", v)); }
         return v;
     }
 
@@ -4888,7 +5345,7 @@ methods Parser {
     parseLengthValue &self -> long {
         e: NodeId = self.parseExpr();
         v: long = self.foldConst(e, self.currentModule(), 0);
-        if (v < 0) { self.err(format("a length cannot be negative, and this one is {}", v)); }
+        if (v < 0) { self.err(format("a length cannot be negative, but this one is `{}`", v)); }
         return v;
     }
 
@@ -4906,19 +5363,19 @@ methods Parser {
             match p {
                 Name(n) {
                     if (self.isLenVar(n)) {
-                        self.err(format("'{}' is a length parameter: it stands alone as a length (`[T; {}]`), not inside an expression",
+                        self.err(format("length parameter `{}` cannot be used inside an expression\nnote: it stands alone as a length, as in `[T; {}]`",
                                         nameOf(n), nameOf(n)));
                     }
                     if (self.isTypeVar(n)) {
-                        self.err(format("'{}' is a type parameter, not a length", nameOf(n)));
+                        self.err(format("`{}` is a type parameter, not a length", nameOf(n)));
                     }
                     if (depth == 0 && self.bindingOf(n).renamed != NO_SYM) {
-                        self.err(format("'{}' is a variable, and a length has to be a compile-time constant",
+                        self.err(format("`{}` is a variable, not a constant\nnote: a length has to be a compile-time constant",
                                         nameOf(n)));
                     }
                     g: long = self.globalNamed(nameOf(n), here);
                     if (g < 0) {
-                        self.err(format("'{}' is not a constant — a length is an integer literal, a constant global, or a length parameter",
+                        self.err(format("`{}` is not a constant\nnote: a length is an integer literal, a constant global, or a length parameter",
                                         nameOf(n)));
                     }
                     return self.constGlobalValueIn(g, nameOf(n), depth);
@@ -4952,7 +5409,7 @@ methods Parser {
                 return l % r;
             }
         }
-        self.err(stringOf("a length has to be a compile-time constant: an integer literal, a constant global, arithmetic over those, or a length parameter"));
+        self.err(stringOf("a length has to be a compile-time constant\nnote: a constant is an integer literal, a constant global, arithmetic over those, or a length parameter"));
         return 0;
     }
 
@@ -4962,7 +5419,7 @@ methods Parser {
     // (two is ambiguous, as for a type). Only its type is read here; the checker resolves the use.
     globalNamed &self spelled:str here:str -> long {
         if (lastComponentOf(spelled).len != spelled.len) { return gReg.findGlobal(spelled); }
-        own: long = gReg.findGlobal(nameOf(qualifiedName(here, spelled)));
+        own: long = gReg.findGlobalSym(qualifiedName(here, spelled));
         if (own >= 0) { return own; }
         found: long = NOT_FOUND;
         for i in 0..gReg.globalCount() {
@@ -4971,7 +5428,7 @@ methods Parser {
                 m: str = strSlice(q, 0, q.len - spelled.len - 2);
                 if (gImports.isEmpty() || gImports.canReach(here, m)) {
                     if (found >= 0) {
-                        self.err(format("'{}' is ambiguous: both {} and {} declare it — write which, `{}`",
+                        self.err(format("`{}` is ambiguous\nnote: it could be `{}` or `{}`\nhelp: write which one, as `{}`",
                                         spelled, nameOf(gReg.globalDef(found).name), q,
                                         nameOf(gReg.globalDef(found).name)));
                     }
@@ -4986,27 +5443,27 @@ methods Parser {
     // initialized by a constant expression.
     constGlobalValue &self g:long spelled:str -> long {
         v: long = self.constGlobalValueIn(g, spelled, 0);
-        if (v < 0) { self.err(format("a length cannot be negative, and '{}' is {}", spelled, v)); }
+        if (v < 0) { self.err(format("a length cannot be negative, but `{}` is `{}`", spelled, v)); }
         return v;
     }
     constGlobalValueIn &self g:long spelled:str depth:long -> long {
         d: GlobalDef = gReg.globalDef(g);
         if (d.isVar) {
-            self.err(format("'{}' is a `var`, so its value is not fixed — a length has to be a constant", spelled));
+            self.err(format("`{}` is a `var`, so its value is not fixed\nnote: a length has to be a constant", spelled));
         }
         if (d.isArray || !isInteger(d.kind)) {
-            self.err(format("'{}' is not an integer, so it cannot be a length", spelled));
+            self.err(format("`{}` is not an integer, so it cannot be a length", spelled));
         }
         if (depth == 0) {
             if (d.visibility == Vis.Local && d.file != self.lx.currentFile) {
-                self.err(format("'{}' is local to {}", spelled, nameOf(d.file)));
+                self.err(format("`{}` is private to `{}`\nhelp: declare it `pkg` or `pub` to use it from another file", spelled, nameOf(d.file)));
             }
             if (d.visibility == Vis.Pkg && d.pkg != self.lx.currentPackage) {
-                self.err(format("'{}' is visible only inside its own package", spelled));
+                self.err(format("`{}` is private to package `{}`\nhelp: declare it `pub` to use it from another package", spelled, nameOf(d.pkg)));
             }
         }
         if (d.init == NO_NODE) {
-            self.err(format("'{}' has no initializer, so it has no value to be a length", spelled));
+            self.err(format("`{}` has no initializer, so it has no value to use as a length", spelled));
         }
         q: str = nameOf(d.name);
         m: str = strSlice(q, 0, q.len - lastComponentOf(q).len);
@@ -5037,7 +5494,7 @@ methods Parser {
     // length is mangled as its value, so two spellings of one value name one instance. Trailing
     // parameters may be left out: one with a default takes it, and inside the template's own
     // declaration and methods blocks a parameter left out means this instance's own (`Buf<T>`
-    // there is `Buf<T, N>`, the type being written, as it always was before `N` existed).
+    // there is `Buf<T, N>`, the type being written).
     parseGenericArgs &self base:Sym -> TypeRef {
         self.expect(Tok.LessThan);
         args: Vec<TypeRef>;
@@ -5071,7 +5528,7 @@ methods Parser {
         if (r.known) {
             spelled: str = lastComponentOf(nameOf(base));
             if (args.len() > r.count) {
-                self.err(format("{} takes {} parameter(s), and this gives it {}", spelled, r.count, args.len()));
+                self.err(format("wrong number of type arguments to `{}`: expected at most {}, found {}", spelled, r.count, args.len()));
             }
             k: long = 0;
             while (k < args.len()) {
@@ -5079,11 +5536,11 @@ methods Parser {
                 isLen: bool = a.base == Lit.Len || (a.base == Lit.TypeVar && self.isLenVar(a.name));
                 want: bool = self.tplInfo(r, k).isLen;
                 if (want && !isLen) {
-                    self.err(format("'{}' is a length parameter of {}, and '{}' is a type — give it a length: an integer or a constant",
+                    self.err(format("expected a length for parameter `{}` of `{}`, found type `{}`\nhelp: give it a length: an integer or a constant",
                                     nameOf(self.tplName(r, k)), spelled, typeMangleName(a.base, a.name)));
                 }
                 if (!want && isLen) {
-                    self.err(format("'{}' is a type parameter of {}, and '{}' is a length",
+                    self.err(format("expected a type for parameter `{}` of `{}`, found length `{}`",
                                     nameOf(self.tplName(r, k)), spelled, typeMangleName(a.base, a.name)));
                 }
                 k = k + 1;
@@ -5096,7 +5553,7 @@ methods Parser {
                 } else if (d.base != Lit.Void) {
                     args.push(d);
                 } else {
-                    self.err(format("{} takes {} parameter(s), and this gives it {} — '{}' has no default",
+                    self.err(format("wrong number of type arguments to `{}`: expected {}, found {}\nnote: parameter `{}` has no default",
                                     spelled, r.count, k, nameOf(self.tplName(r, k))));
                 }
             }
@@ -5240,8 +5697,8 @@ methods Parser {
         args: Vec<TypeRef>;
         while (!self.check(Tok.RightParen) && !self.check(Tok.FileEnd)) {
             // A callable may say how it takes an argument (`Fn(sink U, &T)`) exactly as a fn
-            // type may. It is part of the contract, not a type of its own: read as one it became
-            // an extra argument, and the sugar asked for `Fn3` where it meant `Fn2`.
+            // type may. It is part of the contract, not a type of its own: read as one, it would
+            // become an extra argument, and the sugar would ask for `Fn3` where it meant `Fn2`.
             if (!self.eatWord("sink")) { self.eatWord("read"); }
             args.push(self.parseTypeRef());
             self.eat(Tok.Comma);
@@ -5261,7 +5718,7 @@ methods Parser {
         if (self.word("Fn")) {
             self.advance();
             if (self.check(Tok.LeftParen)) { return self.parseFnTrait(); }
-            self.err(stringOf("`Fn` names a callable and needs its signature — `Fn(A) -> R`"));
+            self.err(stringOf("`Fn` needs a signature\nhelp: write `Fn(A) -> R`"));
         }
         name: Token = self.expect(Tok.Id);
         q: Sym = self.qualifiedFrom(name);
@@ -5310,11 +5767,11 @@ methods Parser {
         f: FnNode = self.ast.fns.get(at);
         // A generic has no symbol until its type is known: `first<T>` is a pattern, and what gets
         // emitted is `first_long`, stamped where the call is. So there is nothing for a linker to
-        // find, and a declaration without a body cannot be one. This is the boundary every
-        // language with monomorphized generics has -- Rust ships mir in an rlib, C++ puts the
-        // template in the header -- and here it means the definition crosses as source.
+        // find, and a declaration without a body cannot be one. Every language with monomorphized
+        // generics has this boundary (Rust ships MIR in an rlib, C++ puts the template in the
+        // header), and here it means the definition crosses as source.
         if (f.body < 0) {
-            self.err(format("'{}' is generic, so it has no symbol to link against — a declaration without a body cannot take type parameters; include the definition instead",
+            self.err(format("generic function `{}` has no body\nnote: a generic function has no symbol to link against, so a declaration without a body cannot take type parameters\nhelp: include the definition instead",
                             nameOf(bare)));
         }
         f.isTemplate = true;
@@ -5322,7 +5779,7 @@ methods Parser {
         // Recorded as a template with no fields: what monomorphization needs from a function is
         // its parameter names and its body, and the body is already the statement above.
         empty: Vec<GField>;
-        // Its own bounds, not whatever header was read last (the template used to carry those).
+        // Its own bounds, not whatever header was read last.
         fnode: FnNode = self.ast.fns.get(self.ast.stmts.get(st).at);
         held: Vec<MethodBound>;
         held.extend(self.tplBounds);
@@ -5335,10 +5792,6 @@ methods Parser {
 }
 
 methods Parser {
-    // ─── macros ──────────────────────────────────────────────────────────────
-
-    // `@name(args)`: a call into the hand-written runtime rather than into compiled code. It is a
-    // statement, not an expression, which is why it has a node of its own.
     // ─── qualified names ─────────────────────────────────────────────────────
 
     // `mod::Name`, spelled out. A name is always reachable through the module that declared it,
@@ -5439,6 +5892,7 @@ methods Parser {
     //
     //     { $dstN_0, $dstN_1 = value; leaf = $dstN_0; pos = $dstN_1; }
     parseDestructureInto &self first:NodeId firstName:Sym -> long {
+        why: String = stringOf("a destructure assigns to places: a local, a field, an element or `*p`");
         targets: Vec<NodeId>;
         targets.push(first);            // NO_NODE: `_`, an element released at the block's end
         while (self.eat(Tok.Comma)) {
@@ -5452,10 +5906,9 @@ methods Parser {
                 && (self.peekNext().kind == Tok.Comma || self.peekNext().kind == Tok.Equals)) {
                 self.refuseMixedDestructure(firstName, self.cur.text);
             }
+            tAt: long = self.curPos;
             t: NodeId = self.parseExpr();
-            if (!self.isPlace(t)) {
-                self.err(stringOf("a destructure assigns to places: a local, a field, an element or `*p`"));
-            }
+            self.refuseNonPlace(t, tAt, why);
             targets.push(t);
         }
         self.expect(Tok.Equals);
@@ -5485,20 +5938,57 @@ methods Parser {
     }
 
     // Something a store can go to.
-    isPlace &self e:NodeId -> bool {
-        op: Op = self.ast.expr(e).op;
-        return op == Op.Lvalue || op == Op.FieldAccess || op == Op.ArrayIndex || op == Op.Deref;
+    isPlace &self e:NodeId -> bool { return isPlaceOp(self.ast.expr(e).op); }
+
+    // A store to something that is not a place goes to a value made for the statement and thrown
+    // away with it, so it can never mean what it says: `(a, b) = (b, a)` builds a new tuple and
+    // swaps nothing, `f() = 3` writes the call's result, `S { x: 1 } = s` a fresh struct. Each is
+    // refused at the target, `at`, with `why` (what the statement needs) as the note. A place in
+    // parentheses, `(x) = 1`, is still that place. In a quote, `@x` is code still to be made, and
+    // is taken as written.
+    refuseNonPlace &self lhs:NodeId at:long why:String -> void {
+        if (self.isPlace(lhs)) { return; }
+        e: Expr = self.ast.expr(lhs);
+        if (e.op == Op.Splice && self.quoteDepth > 0) { return; }
+        msg: String = format("cannot assign to {}", nonPlaceText(self.ast, lhs));
+        if (e.op == Op.TupleLit) {
+            // The destructure the parentheses stand in the way of, spelled with the user's own
+            // names when every element is one.
+            names: String;
+            plain: bool = true;
+            match e.payload {
+                Lit(ix) {
+                    ln: LitNode = self.ast.lits.get(ix);
+                    for k in 0..ln.initCount {
+                        el: Expr = self.ast.expr(self.ast.inits.get(ln.firstInit + k).value);
+                        match el.payload {
+                            Name(n) { if (el.op == Op.Lvalue) { if (k > 0) { names.pushStr(", "); } names.pushStr(sourceName(n)); } else { plain = false; } }
+                            _ { plain = false; }
+                        }
+                    }
+                }
+                _ { plain = false; }
+            }
+            if (!plain || names.length() == 0) { names = stringOf("a, b"); }
+            help: String = format("\nnote: the parentheses make a new tuple, and a store into it would be lost\nhelp: to assign each element, write `{} = ...` without the parentheses", names);
+            msg.pushString(help);
+        } else {
+            msg.pushStr("\nnote: ");
+            unsafe { msg.pushStr(why.view()); }
+        }
+        if (at == 0 || posFile(at) == NO_SYM) { self.err(msg); return; }
+        self.errAt(at, msg);
     }
 
     // `local` is a local here and `fresh` is not (`local` is NO_SYM when the other targets are
     // places rather than bare names).
     refuseMixedDestructure &self local:Sym fresh:Sym -> void {
         if (local != NO_SYM) {
-            self.err(format("'{}' is a local here and '{}' is not: a destructure either declares every name or assigns to places that all exist -- declare '{}' first, or give '{}' a new name",
+            self.err(format("cannot mix new names and existing locals in a destructure\nnote: `{}` is a local here and `{}` is not\nhelp: declare `{}` first, or give `{}` a new name",
                             nameOf(local), nameOf(fresh), nameOf(fresh), nameOf(local)));
             return;
         }
-        self.err(format("'{}' is not a local here: a destructure either declares every name or assigns to places that all exist -- declare '{}' first",
+        self.err(format("cannot mix new names and places in a destructure\nnote: `{}` is not a local here\nhelp: declare `{}` first",
                         nameOf(fresh), nameOf(fresh)));
     }
 }
@@ -5508,9 +5998,9 @@ methods Parser {
     parseQuote &self -> NodeId {
         self.expect(Tok.LeftCurly);
         node: Sym = self.resolveHere("Node");
-        if (gReg.findEnum(nameOf(node)) < 0 || gReg.findEnum(nameOf(self.resolveHere("BinOp"))) < 0
-            || gReg.findEnum(nameOf(self.resolveHere("UnOp"))) < 0) {
-            self.err(stringOf("`quote` needs stdlib::ast -- #include <stdlib::ast>"));
+        if (gReg.findEnumSym(node) < 0 || gReg.findEnumSym(self.resolveHere("BinOp")) < 0
+            || gReg.findEnumSym(self.resolveHere("UnOp")) < 0) {
+            self.err(stringOf("`quote` needs `stdlib::ast`\nhelp: add `#include <stdlib::ast>`"));
         }
         q: Quoter = self.quoter();
         self.quoteDepth = self.quoteDepth + 1;
@@ -5551,10 +6041,10 @@ methods Parser {
         if (self.check(Tok.Id) && self.peekNext().kind == Tok.Colon) { return true; }
         return (self.word("if") || self.word("while") || self.word("return") || self.word("break")
                 || self.word("continue") || self.word("loop") || self.word("for") || self.word("match")
-                || self.word("unsafe")) && !self.namedHere();
+                || self.word("unsafe") || self.word("recover")) && !self.namedHere();
     }
     // The tokens up to the `]` that closes the one just read, spelled back out as source text with
-    // one space between them -- the lexer keeps no raw text, and the spelling of every kind is
+    // one space between them. The lexer keeps no raw text, but the spelling of every kind is
     // known. Held as a string literal, so `\` and `"` are escaped for the literal to resolve back.
     rawUntilClose &self -> Sym {
         out: String;
@@ -5569,7 +6059,7 @@ methods Parser {
             if (out.len > 0) { out.push(' '); }
             self.respell(t, &out);
         }
-        self.err(stringOf("`![` without its `]`"));
+        self.err(stringOf("unclosed `![`\nnote: the file ends before its `]`"));
         return NO_SYM;
     }
     respell &self t:Token inout out:String -> void {
@@ -5586,7 +6076,7 @@ methods Parser {
         if (t.kind == Tok.U64Literal) { out.pushString(format("{}", t.num as u64)); return; }
         if (t.kind == Tok.FloatLiteral) { out.pushStr(nameOf(t.text)); return; }
         if (t.kind == Tok.CharLiteral) {
-            // Back to a character literal, escaping what a literal escapes -- and each backslash
+            // Back to a character literal, escaping what a literal escapes, and each backslash
             // once more, since this text is itself the body of a string literal.
             out.push(39 as char);
             c: long = t.num;
@@ -5628,8 +6118,8 @@ methods Parser {
     // `quote { methods T for Trait { ... } }`, as the `MethodsDecl` Node that builds it. Nothing
     // is declared: read the ordinary way, the block would register its functions and its impl
     // here, in the macro's own module, when it is only data until a derive splices it. Every
-    // name in it -- the type, the trait, a method, a parameter's type -- may be `@(e)`, a `str`
-    // the macro computes. Entry: `methods` has been consumed.
+    // name in it (the type, the trait, a method, a parameter's type) may be `@(e)`, a `str` the
+    // macro computes. Entry: `methods` has been consumed.
     parseQuotedMethods &self q:Quoter -> NodeId {
         owner: NodeId = self.parseQuotedType(q);
         trait: NodeId = q.qStr(&self.ast, intern(""));
@@ -5657,7 +6147,7 @@ methods Parser {
         params: Vec<NodeId>;
         lent: bool = self.eat(Tok.Ampersand);
         if (lent || self.word("self")) {
-            if (!self.eatWord("self")) { self.err(stringOf("Expected `self` after `&` in a method receiver")); }
+            if (!self.eatWord("self")) { self.err(format("expected `self`, found {}", describeTok(self.cur))); }
             spelled: str = "Self";
             if (lent) { spelled = "ref_Self"; }
             self.declareLocal(intern("self"), Lit.Struct, NO_SYM);
@@ -5805,12 +6295,10 @@ methods Parser {
 
     // `assert!(cond);` -> `if (!(cond)) { panic("assertion failed: <cond as written>"); }`
     //
-    // The first macro, and the reason it is built into the parser: no macro can run yet -- that
-    // is the evaluator, docs/comptime.md step 2 -- so the compiler is the one holding the tree
-    // and doing the rewrite. What it proves is the shape everything after it takes: the tree is
-    // captured unevaluated (a macro sees `a == b`, not a bool), turned back into text for the
-    // message, and spliced into ordinary code that the checker and the ownership pass then read
-    // exactly as if a person had written the `if`. Entry: `assert` has been consumed.
+    // The built-in `assert!`, used unless the program declares a macro of that name. The
+    // condition is captured unevaluated (it is `a == b`, not a bool), turned back into text for
+    // the message, and spliced into ordinary code that the checker and the ownership pass then
+    // read exactly as if a person had written the `if`. Entry: `assert` has been consumed.
     parseAssert &self -> long {
         self.expect(Tok.Exclamation);
         self.expect(Tok.LeftParen);
@@ -5846,4 +6334,21 @@ methods Parser {
         self.ast.ifs.push(IfNode { cond: notCond, body: body, elseIf: -1 });
         return self.ast.addStmt(StmtKind.If, self.ast.ifs.len() - 1);
     }
+}
+
+// Which atomic primitive a `builtin` declaration's name selects (`BI_ATOMIC_*`), or 0: the six
+// operations on an eight-byte word, and each again with `32` on a four-byte one.
+local atomicBuiltinOf n:str -> long {
+    base: str = n;
+    wide: long = 0;
+    if (n.len > 2 && strEndsWith(n, "32")) { base = strSlice(n, 0, n.len - 2); wide = BI_ATOMIC_32; }
+    k: long = 0;
+    if (base == "atomicLoad") { k = BI_ATOMIC_LOAD; }
+    else if (base == "atomicStore") { k = BI_ATOMIC_STORE; }
+    else if (base == "atomicStoreSeqCst") { k = BI_ATOMIC_STORE_SC; }
+    else if (base == "atomicSwap") { k = BI_ATOMIC_SWAP; }
+    else if (base == "atomicCas") { k = BI_ATOMIC_CAS; }
+    else if (base == "atomicAdd") { k = BI_ATOMIC_ADD; }
+    if (k == 0) { return 0; }
+    return k + wide;
 }

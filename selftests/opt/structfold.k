@@ -5,6 +5,9 @@
 // ir-lacks: structfold::f call
 // ir-has: structfold::eqv const 1
 // ir-lacks: structfold::eqv jz
+// ir-lacks: structfold::eqv jcc
+// (The `&&` writes its result on two paths, each `const 1` once both sides fold: the branch on it
+// is decided by every definition being the same constant, `decideSameConsts`.)
 struct V2 { x: long, y: long }
 methods V2 for Add<V2> { add &self o:V2 -> V2 { return V2 { x: self.x + o.x, y: self.y + o.y }; } }
 methods V2 for Eq<V2> { eq &self o:V2 -> bool { return self.x == o.x && self.y == o.y; } }

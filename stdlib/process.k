@@ -10,15 +10,15 @@
 // taken as written. The child inherits this process's standard streams and working directory,
 // and its environment unless `spawnProcessEnv` is handed one.
 //
-// Starting a child is `clone(CLONE_VM | CLONE_VFORK)` straight into `execve`, which is what
-// `posix_spawn` does: the child borrows this process's memory for the few instructions between
-// the two calls rather than copying its page tables, so the cost does not grow with the size of
-// the parent, which for a compiler is large. The child runs no compiled code at all, only the
-// handful of instructions in `startChild`, on the parent's stack and with nothing pushed, and the
-// parent is held by the kernel until the child has replaced itself. An `execve` that fails is
-// reported back through a word of the shared memory, so a missing or unrunnable program is an
-// error from `spawnProcess` with its errno, not a child that exits 127 for a reason nobody can see.
-#include <{sys, core, mem, heap, file, option, result, string, vec, chars, path}>
+// A child is started with `clone(CLONE_VM | CLONE_VFORK)` followed directly by `execve`, as
+// `posix_spawn` does. For the few instructions between the two calls the child shares this
+// process's memory instead of copying its page tables, so the cost does not grow with the size
+// of the parent, which for a compiler is large. The child runs no compiled code, only the few
+// instructions in `startChild`, on the parent's stack without pushing anything, and the kernel
+// holds the parent until the child has exec'd. A failed `execve` is reported back through a word
+// of shared memory, so a missing or unrunnable program comes back from `spawnProcess` as an
+// errno instead of a child that silently exits 127.
+#include <{sys, core, mem, heap, file, option, result, string, vec, chars, path, io, sync}>
 
 // ─── the raw calls ───────────────────────────────────────────────────────────
 
@@ -40,7 +40,7 @@ local unsafe startChild path:long argv:long envp:long ctl:long -> long {
         in rbx ctl;
         "mov rdi, 0x4111"           // CLONE_VM | CLONE_VFORK | SIGCHLD
         "xor rsi, rsi"              // same stack: the child pushes nothing
-        "mov rax, 56"               // clone
+        "mov eax, 56"               // clone
         "syscall"
         "test rax, rax"
         "jnz .spawnParent"
@@ -48,39 +48,39 @@ local unsafe startChild path:long argv:long envp:long ctl:long -> long {
         "test rdi, rdi"
         "js .noIn"
         "xor rsi, rsi"
-        "mov rax, 33"
+        "mov eax, 33"
         "syscall"
         ".noIn:"
         "mov rdi, [rbx + 16]"       // ... dup2(ctl[2], 1) ...
         "test rdi, rdi"
         "js .noOut"
         "mov rsi, 1"
-        "mov rax, 33"
+        "mov eax, 33"
         "syscall"
         ".noOut:"
         "mov rdi, [rbx + 24]"       // ... dup2(ctl[3], 2)
         "test rdi, rdi"
         "js .noErr"
         "mov rsi, 2"
-        "mov rax, 33"
+        "mov eax, 33"
         "syscall"
         ".noErr:"
         "mov rdi, [rbx + 32]"       // chdir(ctl[4])
         "test rdi, rdi"
         "jz .noDir"
-        "mov rax, 80"
+        "mov eax, 80"
         "syscall"
         "test rax, rax"
         "js .childFailed"
         ".noDir:"
         "mov rdi, r8"               // execve(path, argv, envp)
         "mov rsi, r10"
-        "mov rax, 59"
+        "mov eax, 59"
         "syscall"
         ".childFailed:"
         "mov [rbx], rax"            // only reached on failure: -errno
         "mov rdi, 127"
-        "mov rax, 60"               // _exit
+        "mov eax, 60"               // _exit
         "syscall"
         ".spawnParent:"
         out pid rax;
@@ -228,8 +228,8 @@ local drainPipes inout c:Child inout out:String inout err:String -> long {
     return 0;
 }
 
-// Block until any child of this process finishes, and say which. What lets a caller keep several
-// running and act on whichever is done first.
+// Block until any child of this process finishes, and say which. Use it to run several children
+// and handle whichever finishes first.
 pub waitAnyProcess -> Result<(long, ExitStatus), long> {
     raw: [long; 1];
     r: long = waitFor(-1, &raw[..]);
@@ -362,7 +362,7 @@ pub spawnProcess program:str args:Vec<str> -> Result<Child, long> {
 }
 
 // The same, with the child's environment given outright as `NAME=value` strings. PATH lookup
-// still reads THIS process's PATH: the program is found here, then run there.
+// still reads this process's PATH: the program is found here, then run there.
 pub spawnProcessEnv program:str args:Vec<str> env:Vec<str> -> Result<Child, long> {
     fds: [long; 3];
     for k in 0..3 { fds[k] = -1; }
@@ -374,6 +374,7 @@ pub spawnProcessEnv program:str args:Vec<str> env:Vec<str> -> Result<Child, long
 // The pid, or a negative errno. `fds`: what the child gets as 0, 1, 2 (-1 to inherit); `dir`: a
 // directory to start in ("" for this one's).
 local launch program:str args:Vec<str> env:Vec<str> fds:[long] dir:str -> long {
+    flush();                                // what this process printed goes before the child's
     found: Option<String> = findProgram(program);
     path: String;
     match found {
@@ -448,19 +449,24 @@ local unsafe putCString at:long s:str -> long {
 
 // ─── the environment and PATH ────────────────────────────────────────────────
 
-// The text of /proc/self/environ, read the first time anything asks and kept for the life of the
-// process, which is what lets the views below be handed out: nothing writes it again. Read from
-// there rather than carried from the entry point, since the startup code hands `main` its
-// arguments only, and the environment a process starts with is exactly what that file holds.
-var gEnvironText: String;
-var gEnvironRead: bool = false;
+// The text of /proc/self/environ, read on first use and kept for the life of the process. It is
+// never written again, so the views below can safely point into it. It comes from that file
+// because the startup code passes `main` only its arguments, and the file holds the environment
+// the process started with. The first use can come from several threads at once, so the read
+// is made under a lock: one thread fills the text, and the rest wait for it and then share it.
+struct Environ { text: String, read: bool }
+var gEnviron: Mutex<Environ> = Mutex { sl: SpinLock.new(), data: Environ { text: String.new(), read: false } };
 
 local environText -> str {
-    if (!gEnvironRead) {
-        readWhole("/proc/self/environ", &gEnvironText);
-        gEnvironRead = true;
+    view: str = "";
+    with gEnviron {
+        if (!gEnviron.data.read) {
+            readWhole("/proc/self/environ", &gEnviron.data.text);
+            gEnviron.data.read = true;
+        }
+        unsafe { view = gEnviron.data.text.view(); }
     }
-    unsafe { return gEnvironText.view(); }
+    return view;
 }
 
 // This process's environment as `NAME=value` strings: views into the text above.
@@ -529,7 +535,7 @@ local readWhole path:str inout out:String -> void {
                 n: long = 0;
                 unsafe { n = f.readInto((out.buf as long) + out.len, out.cap - out.len); }
                 if (n <= 0) { break; }
-                out.len = out.len + n;
+                out.len += n;
                 if (out.len < out.cap) { break; }
             }
         }

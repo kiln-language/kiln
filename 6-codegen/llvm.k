@@ -1,36 +1,37 @@
 // The IR as textual LLVM IR, for `--emit=llvm`.
 //
-// A second consumer of `IRProgram`, beside `asm.k`. The native back end stays the one the seed is
-// built with, so `bootstrap/kilnc` is still remade with nothing but NASM and ld; this is for
-// handing a program to LLVM when its optimizer is worth more than the seconds it costs.
+// This is a second consumer of `IRProgram`, beside `asm.k`. The native back end stays the one the
+// seed is built with, so `bootstrap/kilnc` can still be remade with nothing but NASM and ld; this
+// one hands a program to LLVM for when its optimizer is worth more than the seconds it costs.
 //
-// Two properties of the IR make the translation short, and both were there for other reasons:
-// every scalar temp already holds a canonical 64-bit word, so everything is `i64` and no narrower;
-// and the IR is not SSA, it is loads and stores against named slots, so each temp and each slot
+// Two properties of the IR keep the translation short, and both exist for other reasons. Every
+// scalar temp already holds a canonical 64-bit word, so everything is `i64` and nothing narrower.
+// And the IR is not SSA but loads and stores against named slots, so each temp and each slot
 // becomes an `alloca` and LLVM's `mem2reg` builds the SSA. Nothing here places a phi, which is
-// usually the expensive half of writing one of these.
+// usually the expensive half of writing a back end like this one.
 //
 // Pointers are written `ptr`, not `i64*`: LLVM 15 made pointers opaque and 17 removed the typed
 // form, so the older spelling is rejected outright by anything current.
 //
-// The optimizer and the inliner are skipped for this path: LLVM does that work, and skipping them
-// means `Jcc` and promoted temps never reach here.
+// The optimizer and the inliner are skipped on this path, since LLVM does that work, so promoted
+// temps never reach here. A `Jcc` still can, because the lowerer makes those too.
 #include <ir>
 #include <lower>        // the `@init`/`@fini` hooks `_start` calls
 #include <asm>          // regNameSized / regIndexOf: the register naming is asm.k's
-#include <parse::{types, registry}>
+#include <parse::{ast, types, registry}>
 #include <support::compiler>
 #include <stdlib::{fmt, map, option, string, vec}>
 
-// What is not translated yet. Refused by name rather than emitted wrongly: a back end that quietly
-// produces the wrong instruction is the one bug class this compiler has spent the most time on.
+// What is not translated yet. It is refused by name rather than emitted wrongly: a back end that
+// quietly produces the wrong instruction is the one kind of bug this compiler has spent the most
+// time on.
 local unsupported what:str -> void {
-    failStr(format("--emit=llvm: {} is not translated yet", what));
+    failStr(format("`--emit=llvm` cannot translate {} yet\nhelp: build without `--emit=llvm` to use the native back end, which handles it", what));
 }
 
-// The LLVM predicate a comparison opcode means, over an unsigned type or a signed one: the
-// native back end picks `ja`/`jg` by the same test (`typeInfo(kind).unsignedNum`), and a `u64`
-// past 2^63 compared signed came out negative.
+// The LLVM predicate a comparison opcode means, over an unsigned type or a signed one. The
+// native back end picks `ja` or `jg` by the same test (`typeInfo(kind).unsignedNum`), and a `u64`
+// past 2^63 compared as signed reads as negative.
 local llvmPred op:IROp uns:bool -> str {
     if (op == IROp.CmpEq) { return "eq"; }
     if (op == IROp.CmpNe) { return "ne"; }
@@ -44,7 +45,7 @@ local llvmPred op:IROp uns:bool -> str {
     if (op == IROp.CmpGt) { return "sgt"; }
     if (op == IROp.CmpLe) { return "sle"; }
     if (op == IROp.CmpGe) { return "sge"; }
-    unsupported("a comparison this back end does not know");
+    unsupported("this comparison");
     return "eq";
 }
 
@@ -142,14 +143,21 @@ pub struct LlvmEmitter {
     // Set once the current block has a terminator, so a fallthrough into the next label gets the
     // explicit `br` LLVM requires and nothing is emitted after a `ret`.
     closed: bool,
-    slots: HashMap<str, bool>
+    slots: HashMap<str, bool>,
+    // The `file:line` texts a failed bounds check reports, each emitted once as `@bndloc.N`.
+    locs: Vec<Sym>,
+    locAt: HashMap<long, long>,
+    needBounds: bool,
+    // The function being written, for what an `asm` block's output needs to know of its slot.
+    fnFirst: long, fnCount: long
 }
 
 methods LlvmEmitter for Default {
     new -> LlvmEmitter {
         s: String;
         m: HashMap<str, bool>;
-        return LlvmEmitter { out: s, nextVal: 0, nextLbl: 0, closed: false, slots: m };
+        return LlvmEmitter { out: s, nextVal: 0, nextLbl: 0, closed: false, slots: m,
+                             locs: vec![], locAt: map![], needBounds: false, fnFirst: 0, fnCount: 0 };
     }
 }
 
@@ -167,6 +175,20 @@ methods LlvmEmitter {
     line &self s:str -> void { self.out.pushStr(s); self.out.push('\n'); }
     put  &self s:str -> void { self.out.pushStr(s); }
     putString &self s:String -> void { unsafe { self.out.pushStr(s.view()); } }
+    putNum &self v:long -> void { self.out.pushLong(v); }
+    // A word cut to its low `w` bytes, as the `i8`..`i32` an access of that width takes.
+    narrowTo &self v:String w:long -> String {
+        if (w >= 8) { return v; }
+        n: String = self.fresh();
+        self.put("  ");
+        self.putString(n);
+        self.put(" = trunc i64 ");
+        self.putString(v);
+        self.put(" to ");
+        self.putString(intBits(w));
+        self.line("");
+        return n;
+    }
 
     fresh &self -> String {
         v: String;
@@ -216,9 +238,17 @@ methods LlvmEmitter {
     }
     appendTo &self inout dst:String src:String -> void { unsafe { dst.pushStr(src.view()); } }
 
+    locIndex &self s:Sym -> long {
+        hit: Option<long> = self.locAt.find(s as long);
+        match hit { Some(i) { return i; } None { } }
+        self.locAt.put(s as long, self.locs.len());
+        self.locs.push(s);
+        return self.locs.len() - 1;
+    }
+
     // Read a temp into a fresh value.
     readTemp &self t:Temp -> String {
-        // `NO_TEMP` is the absence of an operand, not temp number -1. It reached here from an
+        // `NO_TEMP` is the absence of an operand, not temp number -1. It can arrive here from an
         // instruction whose `b` is unused, and `%t-1` is not a name LLVM will take.
         if (t == NO_TEMP) {
             z: String;
@@ -268,7 +298,33 @@ methods LlvmEmitter {
         self.put(", ");
         self.putString(y);
         self.line("");
-        self.writeTemp(in.dst, r);
+        self.writeTemp(in.dst, self.canonical(r, in.kind));
+    }
+
+    // `x` as the canonical word of type `k`: an operation narrower than a word wraps at its own
+    // width (`u8 + u8`, `int * int`), as the native back end's `canonicalize` and the evaluator
+    // compute it. Nothing for a word.
+    canonical &self x:String k:Lit -> String {
+        w: long = widthOfKind(k);
+        if (w >= 8 || isFloat(k)) { return x; }
+        bits: String = intBits(w);
+        n: String = self.fresh();
+        self.put("  ");
+        self.putString(n);
+        self.put(" = trunc i64 ");
+        self.putString(x);
+        self.put(" to ");
+        self.putString(intBits(w));
+        self.line("");
+        r: String = self.fresh();
+        self.put("  ");
+        self.putString(r);
+        if (isUnsignedInt(k)) { self.put(" = zext "); } else { self.put(" = sext "); }
+        self.putString(bits);
+        self.put(" ");
+        self.putString(n);
+        self.line(" to i64");
+        return r;
     }
 
     // ─── floats ──────────────────────────────────────────────────────────────
@@ -623,8 +679,8 @@ local asmBinds p:IRProgram in:Instr reg:str -> bool {
     return false;
 }
 
-// The sub-register a `{reg}` placeholder means: the width of the value an `in` bound to it. The
-// same rule as `Emitter::sizedReg`, which only an input decides.
+// The sub-register a `{reg}` placeholder means: the one as wide as the value an `in` bound to it.
+// The same rule as `Emitter::sizedReg`, where only an input decides.
 local sizedRegOf p:IRProgram in:Instr want:str line:str -> str {
     for k in 0..in.pieceCount {
         at: long = in.firstPiece + k;
@@ -632,19 +688,39 @@ local sizedRegOf p:IRProgram in:Instr want:str line:str -> str {
             return regNameSized(regIndexOf(want), p.asmSizes.get(at));
         }
     }
-    failStr(format("asm: no in/out binds the register {} used as a placeholder in: {}", want, line));
+    failStr(format("placeholder `{{{}}}` in an `asm` block names a register no `in` binds\nnote: the line is `{}`\nhelp: bind it with `in {} <value>`, or write the register without braces", want, line, want));
     return want;
 }
 
-// NASM and LLVM's Intel dialect disagree on two spellings, and both appear in this standard
-// library: `[rel sym]` is RIP-relative, which LLVM writes `[rip + sym]`, and `[fs:reg]` is a
-// segment override, which LLVM writes with the segment outside the brackets as `fs:[reg]`.
-// `heap.k` needs the first and `thread.k` the second.
+// NASM and LLVM's Intel dialect disagree on four spellings: `[rel sym]` is RIP-relative, which
+// LLVM writes `[rip + sym]`; `[fs:reg]` is a segment override, which LLVM writes with the segment
+// outside the brackets as `fs:[reg]`; a memory operand's size is `dword [x]` in NASM and
+// `dword ptr [x]` in LLVM, which reads the bare keyword as a symbol and refuses the line; and a
+// `;` starts a comment in NASM, which LLVM's parser does not take, so the comment is dropped (not
+// inside a quote, where it is a character).
 local rewriteRel s:str -> String {
     out: String;
     i: long = 0;
+    quote: long = 0;
     while (i < s.len) {
-        if (i + 4 < s.len && charAt(s, i) == '[' && charAt(s, i + 1) == 'r'
+        c: long = charAt(s, i);
+        if (quote != 0) {
+            if (c == quote || c == '\n') { quote = 0; }
+            out.push(c as char);
+            i = i + 1;
+            continue;
+        }
+        if (c == '\'' || c == '"') { quote = c; out.push(c as char); i = i + 1; continue; }
+        if (c == ';') {
+            while (i < s.len && charAt(s, i) != '\n') { i = i + 1; }
+            continue;
+        }
+        sized: long = sizeKeywordAt(s, i);
+        if (sized > 0) {
+            out.pushStr(strSlice(s, i, sized));
+            out.pushStr(" ptr");
+            i = i + sized;
+        } else if (i + 4 < s.len && charAt(s, i) == '[' && charAt(s, i + 1) == 'r'
             && charAt(s, i + 2) == 'e' && charAt(s, i + 3) == 'l' && charAt(s, i + 4) == ' ') {
             out.pushStr("[rip + ");
             i = i + 5;
@@ -661,6 +737,26 @@ local rewriteRel s:str -> String {
         }
     }
     return out;
+}
+
+// The length of a NASM size keyword (`byte`, `word`, `dword`, `qword`, `tword`, `oword`) that
+// starts a word at `i` and is followed by a memory operand without `ptr`, or 0.
+local sizeKeywordAt s:str i:long -> long {
+    if (i > 0 && (isIdentPart(charAt(s, i - 1)) || charAt(s, i - 1) == '.')) { return 0; }
+    n: long = 0;
+    if (strStartsWith(strSlice(s, i, s.len - i), "byte")) { n = 4; }
+    else if (strStartsWith(strSlice(s, i, s.len - i), "word")) { n = 4; }
+    else {
+        c: long = 0;
+        if (i < s.len) { c = charAt(s, i); }
+        if ((c == 'd' || c == 'q' || c == 't' || c == 'o') && strStartsWith(strSlice(s, i + 1, s.len - i - 1), "word")) { n = 5; }
+    }
+    if (n == 0) { return 0; }
+    j: long = i + n;
+    if (j < s.len && charAt(s, j) != ' ' && charAt(s, j) != '[') { return 0; }
+    while (j < s.len && charAt(s, j) == ' ') { j = j + 1; }
+    if (j < s.len && charAt(s, j) == '[') { return n; }
+    return 0;
 }
 
 local bodyView inout s:String -> str {
@@ -751,14 +847,15 @@ local emitData inout e:LlvmEmitter inout p:IRProgram -> void {
         e.line(" }>");
     }
 
-    // The images. One that is a BLOCK is a heap block the compiler built: the allocator finds a
+    // The images. One marked as a block is a heap block the compiler built. The allocator finds a
     // region's header by masking a pointer down to a 64 KiB boundary, and that header says the
-    // region is static so freeing a block inside it is a no-op. Emitted as a bare global instead,
-    // `free` reads whatever happened to precede it and the program dies at drop time, after
-    // printing everything correctly, which is what made this look like an output bug.
+    // region is static, so freeing a block inside it does nothing. Emitted as a bare global
+    // instead, `free` would read whatever happened to precede it, and the program would die at
+    // drop time after printing everything correctly.
     //
     // The native emitter packs several blocks into one region to save the padding. Here each gets
-    // its own, which is a great deal of address space and no file size, since the padding is zero.
+    // its own, which costs a great deal of address space but no file size, since the padding is
+    // zero.
     for i in 0..p.imageFirst.len() {
         ty: String;
         val: String;
@@ -785,11 +882,11 @@ local emitData inout e:LlvmEmitter inout p:IRProgram -> void {
         }
     }
 
-    // The heap's central block. `heap.k` reaches it from an `asm` block by name, so it is the
-    // back end that has to put it there, as the native emitter does.
-    // External linkage, and pinned with `llvm.used`. An `asm` block reaches this by NAME, and a
-    // textual reference is invisible to LLVM: made `internal` it gets localised and the assembler
-    // is left with an undefined symbol, made unused it gets dropped.
+    // The heap's central block. `heap.k` reaches it by name from an `asm` block, so the back end
+    // has to define it, as the native emitter does. It has external linkage and is pinned with
+    // `llvm.used`, because a reference from inside assembly text is invisible to LLVM: made
+    // `internal`, it would be localised and leave the assembler an undefined symbol, and if
+    // nothing marked it used, it would be dropped.
     e.line("@__heapCentral = global [1024 x i8] zeroinitializer");
     e.line("@llvm.used = appending global [1 x ptr] [ptr @__heapCentral], section \"llvm.metadata\"");
 
@@ -852,8 +949,8 @@ local emitVtables inout e:LlvmEmitter -> void {
     while (i < gReg.implCount()) {
         im: TraitImplDef = gReg.implAt(i);
         // A template implements nothing: only the stamped instances have addresses.
-        if (gReg.isGeneric(nameOf(im.structName))) { i = i + 1; continue; }
-        at: long = gReg.findTrait(nameOf(im.trait.name));
+        if (gReg.isGenericSym(im.structName)) { i = i + 1; continue; }
+        at: long = gReg.findTraitSym(im.trait.name);
         if (at < 0) { i = i + 1; continue; }
         label: str = implVtableName(im);
         if (done.has(label)) { i = i + 1; continue; }
@@ -885,31 +982,30 @@ pub emitLlvm inout p:IRProgram inout out:String -> void {
     e.line("; generated by kilnc --emit=llvm");
     e.line("target triple = \"x86_64-unknown-linux-gnu\"");
     e.line("declare void @llvm.memcpy.inline.p0.p0.i64(ptr, ptr, i64, i1)");
+    e.line("declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)");
     e.line("declare void @llvm.memset.inline.p0.i64(ptr, i8, i64, i1)");
-    e.line("declare void @llvm.trap()");
     e.line("");
-    // Our own entry point, because this runtime owns `fs:` and glibc's TLS lives there too:
-    // linked against libc a program ran correctly, returned the right value, and then died in
+    // Our own entry point, because this runtime owns `fs:` and glibc keeps its TLS there too:
+    // linked against libc, a program ran correctly, returned the right value, and then died in
     // `__call_tls_dtors` on the way out.
     //
-    // `Emitter::emitStart` is what this follows, and the piece a first attempt left out is the
-    // first line of it: `$globalInit` runs the initializers the evaluator could not fold, and
-    // without it a program dies before printing anything, because that is where the io buffers
-    // are built. `main args: ...str` is not handled yet: the argv slice the native stub marshals
-    // has no counterpart here.
+    // This follows `Emitter::emitStart`. The call not to lose is `$globalInit`, which runs the
+    // initializers the evaluator could not fold; without it a program dies before printing
+    // anything, because that is where the io buffers are built.
     startName: Sym = NO_SYM;
     hasInit: bool = false;
+    wantsArgs: bool = false;
     for si in 0..p.funcs.len() {
         fnm: str = nameOf(p.funcs.get(si).name);
-        if (p.funcs.get(si).isMain) { startName = p.funcs.get(si).name; }
+        if (p.funcs.get(si).isMain) { startName = p.funcs.get(si).name; wantsArgs = p.funcs.get(si).wantsArgs; }
         if (fnm == "$globalInit") { hasInit = true; }
     }
     if (startName != NO_SYM) {
         // Written as module-level assembly, not as a function. The kernel enters `_start` with the
-        // stack 16-byte aligned and NO return address on it, which is not the ABI entry a compiled
-        // function is built for: LLVM lays the frame out eight bytes off, and at -O0 nothing
-        // notices while at -O1 the first aligned spill faults. `Emitter` writes this by hand for
-        // the same reason, and so does this, aligning the stack before it calls anything.
+        // stack 16-byte aligned and no return address on it, which is not the entry a compiled
+        // function is built for: LLVM lays the frame out eight bytes off, and while nothing
+        // notices at -O0, at -O1 the first aligned spill faults. `Emitter` writes `_start` by hand
+        // for the same reason, and this does too, aligning the stack before it calls anything.
         //
         // An LLVM string takes `\XX` hex escapes and nothing else, so a quote inside the assembly
         // is `\\22`; and module-level assembly substitutes no operands, so `$` stands for itself.
@@ -919,6 +1015,7 @@ pub emitLlvm inout p:IRProgram inout out:String -> void {
         // The `@init` hooks, before any startup initializer, as `Emitter.emitStart` runs them.
         for k in 0..gInitHooks.len() { llvmCall(&e, gInitHooks.get(k)); }
         if (hasInit) { e.line("module asm \"  callq \\22$globalInit\\22\""); }
+        if (wantsArgs) { emitArgvSlice(&e); }
         e.put("module asm \"  callq \\22");
         e.put(nameOf(startName));
         e.line("\\22\"");
@@ -950,7 +1047,249 @@ pub emitLlvm inout p:IRProgram inout out:String -> void {
     for f in 0..p.funcs.len() {
         emitFunc(&e, p, p.funcs.get(f));
     }
+    if (e.needBounds) { emitBoundsFail(&e); }
+    emitMemFunctions(&e);
     out.pushString(e.out);
+}
+
+// `memcpy`, `memmove`, `memset` and `memcmp`, which LLVM may call from any module (a zeroed
+// struct, a loop it recognizes as a fill) and which nothing else provides in a freestanding
+// program. Weak, so a C library linked in wins; `no-builtins`, so LLVM does not turn these loops
+// back into calls to themselves.
+local emitMemFunctions inout e:LlvmEmitter -> void {
+    e.line("define weak ptr @memset(ptr %d, i32 %c, i64 %n) #0 {");
+    e.line("entry:");
+    e.line("  %b = trunc i32 %c to i8");
+    e.line("  br label %head");
+    e.line("head:");
+    e.line("  %i = phi i64 [ 0, %entry ], [ %i1, %body ]");
+    e.line("  %done = icmp eq i64 %i, %n");
+    e.line("  br i1 %done, label %out, label %body");
+    e.line("body:");
+    e.line("  %p = getelementptr i8, ptr %d, i64 %i");
+    e.line("  store i8 %b, ptr %p");
+    e.line("  %i1 = add i64 %i, 1");
+    e.line("  br label %head");
+    e.line("out:");
+    e.line("  ret ptr %d");
+    e.line("}");
+    e.line("define weak ptr @memcpy(ptr %d, ptr %s, i64 %n) #0 {");
+    e.line("entry:");
+    e.line("  br label %head");
+    e.line("head:");
+    e.line("  %i = phi i64 [ 0, %entry ], [ %i1, %body ]");
+    e.line("  %done = icmp eq i64 %i, %n");
+    e.line("  br i1 %done, label %out, label %body");
+    e.line("body:");
+    e.line("  %sp = getelementptr i8, ptr %s, i64 %i");
+    e.line("  %v = load i8, ptr %sp");
+    e.line("  %dp = getelementptr i8, ptr %d, i64 %i");
+    e.line("  store i8 %v, ptr %dp");
+    e.line("  %i1 = add i64 %i, 1");
+    e.line("  br label %head");
+    e.line("out:");
+    e.line("  ret ptr %d");
+    e.line("}");
+    // Forward when the destination is below the source, else from the end.
+    e.line("define weak ptr @memmove(ptr %d, ptr %s, i64 %n) #0 {");
+    e.line("entry:");
+    e.line("  %below = icmp ult ptr %d, %s");
+    e.line("  br i1 %below, label %fhead, label %bhead");
+    e.line("fhead:");
+    e.line("  %i = phi i64 [ 0, %entry ], [ %i1, %fbody ]");
+    e.line("  %fdone = icmp eq i64 %i, %n");
+    e.line("  br i1 %fdone, label %out, label %fbody");
+    e.line("fbody:");
+    e.line("  %fs = getelementptr i8, ptr %s, i64 %i");
+    e.line("  %fv = load i8, ptr %fs");
+    e.line("  %fd = getelementptr i8, ptr %d, i64 %i");
+    e.line("  store i8 %fv, ptr %fd");
+    e.line("  %i1 = add i64 %i, 1");
+    e.line("  br label %fhead");
+    e.line("bhead:");
+    e.line("  %j = phi i64 [ %n, %entry ], [ %j1, %bbody ]");
+    e.line("  %bdone = icmp eq i64 %j, 0");
+    e.line("  br i1 %bdone, label %out, label %bbody");
+    e.line("bbody:");
+    e.line("  %j1 = sub i64 %j, 1");
+    e.line("  %bs = getelementptr i8, ptr %s, i64 %j1");
+    e.line("  %bv = load i8, ptr %bs");
+    e.line("  %bd = getelementptr i8, ptr %d, i64 %j1");
+    e.line("  store i8 %bv, ptr %bd");
+    e.line("  br label %bhead");
+    e.line("out:");
+    e.line("  ret ptr %d");
+    e.line("}");
+    e.line("define weak i32 @memcmp(ptr %a, ptr %b, i64 %n) #0 {");
+    e.line("entry:");
+    e.line("  br label %head");
+    e.line("head:");
+    e.line("  %i = phi i64 [ 0, %entry ], [ %i1, %same ]");
+    e.line("  %done = icmp eq i64 %i, %n");
+    e.line("  br i1 %done, label %equal, label %body");
+    e.line("body:");
+    e.line("  %ap = getelementptr i8, ptr %a, i64 %i");
+    e.line("  %av = load i8, ptr %ap");
+    e.line("  %bp = getelementptr i8, ptr %b, i64 %i");
+    e.line("  %bv = load i8, ptr %bp");
+    e.line("  %eq = icmp eq i8 %av, %bv");
+    e.line("  br i1 %eq, label %same, label %differ");
+    e.line("same:");
+    e.line("  %i1 = add i64 %i, 1");
+    e.line("  br label %head");
+    e.line("differ:");
+    e.line("  %ax = zext i8 %av to i32");
+    e.line("  %bx = zext i8 %bv to i32");
+    e.line("  %r = sub i32 %ax, %bx");
+    e.line("  ret i32 %r");
+    e.line("equal:");
+    e.line("  ret i32 0");
+    e.line("}");
+    e.line("attributes #0 = { noinline \"no-builtins\" }");
+}
+
+// A byte string constant, `@name = private unnamed_addr constant [n x i8] c"..."`.
+local byteConst inout e:LlvmEmitter name:str text:str -> void {
+    b: String;
+    for i in 0..text.len { pushByte(&b, charAt(text, i)); }
+    s: String;
+    s.pushStr(name);
+    s.pushStr(" = private unnamed_addr constant [");
+    s.pushLong(text.len);
+    s.pushStr(" x i8] c\"");
+    e.putString(s);
+    e.putString(b);
+    e.line("\"");
+}
+
+// What a failed bounds check runs: the native report (`Emitter.emitFailReport`) in the same words,
+// taken from `boundsText`, written to fd 2 with no allocation and no buffered sink, then exit 134.
+// The checks call `@__kiln_bounds_fail(index, length, where, whereLength, kind)`, where `kind` is
+// the check's `BOUNDS_*` kind and picks the report's head and middle.
+local emitBoundsFail inout e:LlvmEmitter -> void {
+    byteConst(&e, "@bnd.head", boundsText("__methBndHead"));
+    byteConst(&e, "@bnd.mid", boundsText("__methBndMid"));
+    byteConst(&e, "@bnd.rhead", boundsText("__methRngHead"));
+    byteConst(&e, "@bnd.shead", boundsText("__methStartHead"));
+    byteConst(&e, "@bnd.omid", boundsText("__methOrdMid"));
+    byteConst(&e, "@bnd.at", boundsText("__methBndAt"));
+    byteConst(&e, "@bnd.nl", "\n");
+    for i in 0..e.locs.len() {
+        n: String;
+        n.pushStr("@bndloc.");
+        n.pushLong(i);
+        byteConst(&e, bodyView(&n), nameOf(e.locs.get(i)));
+    }
+    e.line("define internal void @__kiln_bnd_put(ptr %p, i64 %n) noinline {");
+    e.line("  %r = call i64 asm sideeffect \"syscall\", \"={rax},{rax},{rdi},{rsi},{rdx},~{rcx},~{r11},~{memory}\"(i64 1, i64 2, ptr %p, i64 %n)");
+    e.line("  ret void");
+    e.line("}");
+    // Signed, as the native one prints it: a negative index is the usual mistake.
+    e.line("define internal void @__kiln_bnd_num(i64 %v) noinline {");
+    e.line("entry:");
+    e.line("  %buf = alloca [32 x i8]");
+    e.line("  %neg = icmp slt i64 %v, 0");
+    e.line("  %mv = sub i64 0, %v");
+    e.line("  %abs = select i1 %neg, i64 %mv, i64 %v");
+    e.line("  br label %digit");
+    e.line("digit:");
+    e.line("  %x = phi i64 [ %abs, %entry ], [ %q, %digit ]");
+    e.line("  %at = phi i64 [ 32, %entry ], [ %at1, %digit ]");
+    e.line("  %q = udiv i64 %x, 10");
+    e.line("  %r = urem i64 %x, 10");
+    e.line("  %d = add i64 %r, 48");
+    e.line("  %c = trunc i64 %d to i8");
+    e.line("  %at1 = sub i64 %at, 1");
+    e.line("  %cp = getelementptr [32 x i8], ptr %buf, i64 0, i64 %at1");
+    e.line("  store i8 %c, ptr %cp");
+    e.line("  %more = icmp ne i64 %q, 0");
+    e.line("  br i1 %more, label %digit, label %sign");
+    e.line("sign:");
+    e.line("  %at2 = sub i64 %at1, 1");
+    e.line("  br i1 %neg, label %minus, label %out");
+    e.line("minus:");
+    e.line("  %mp = getelementptr [32 x i8], ptr %buf, i64 0, i64 %at2");
+    e.line("  store i8 45, ptr %mp");
+    e.line("  br label %out");
+    e.line("out:");
+    e.line("  %start = phi i64 [ %at1, %sign ], [ %at2, %minus ]");
+    e.line("  %sp = getelementptr [32 x i8], ptr %buf, i64 0, i64 %start");
+    e.line("  %len = sub i64 32, %start");
+    e.line("  call void @__kiln_bnd_put(ptr %sp, i64 %len)");
+    e.line("  ret void");
+    e.line("}");
+    e.line("define internal void @__kiln_bounds_fail(i64 %i, i64 %n, ptr %loc, i64 %loclen, i64 %kind) noreturn cold noinline {");
+    e.line("entry:");
+    // The head: "index" for an index, "slice end" for an end, "slice start" for either start.
+    e.line("  %isidx = icmp eq i64 %kind, 0");
+    e.line("  %isend = icmp eq i64 %kind, 1");
+    e.line("  %hs = select i1 %isend, ptr @bnd.rhead, ptr @bnd.shead");
+    e.line("  %h = select i1 %isidx, ptr @bnd.head, ptr %hs");
+    selectLen(&e, "%hls", "%isend", boundsText("__methRngHead").len, boundsText("__methStartHead").len);
+    hl: String;
+    hl.pushStr("  %hl = select i1 %isidx, i64 ");
+    hl.pushLong(boundsText("__methBndHead").len);
+    hl.pushStr(", i64 %hls");
+    e.putString(hl);
+    e.line("");
+    e.line("  call void @__kiln_bnd_put(ptr %h, i64 %hl)");
+    e.line("  call void @__kiln_bnd_num(i64 %i)");
+    // The middle: "is past slice end" for a start after its end, "out of range for length" else.
+    e.line("  %isord = icmp eq i64 %kind, 2");
+    e.line("  %m = select i1 %isord, ptr @bnd.omid, ptr @bnd.mid");
+    selectLen(&e, "%ml", "%isord", boundsText("__methOrdMid").len, boundsText("__methBndMid").len);
+    e.line("  call void @__kiln_bnd_put(ptr %m, i64 %ml)");
+    e.line("  call void @__kiln_bnd_num(i64 %n)");
+    e.line("  %has = icmp ne i64 %loclen, 0");
+    e.line("  br i1 %has, label %where, label %end");
+    e.line("where:");
+    s: String;
+    s.pushStr("  call void @__kiln_bnd_put(ptr @bnd.at, i64 ");
+    s.pushLong(boundsText("__methBndAt").len);
+    s.push(')');
+    e.putString(s);
+    e.line("");
+    e.line("  call void @__kiln_bnd_put(ptr %loc, i64 %loclen)");
+    e.line("  br label %end");
+    e.line("end:");
+    e.line("  call void @__kiln_bnd_put(ptr @bnd.nl, i64 1)");
+    e.line("  call void asm sideeffect \"syscall\", \"{rax},{rdi},~{rcx},~{r11},~{memory}\"(i64 60, i64 134)");
+    e.line("  unreachable");
+    e.line("}");
+}
+
+// `  <name> = select i1 <cond>, i64 <yes>, i64 <no>`: a length that depends on the wording.
+local selectLen inout e:LlvmEmitter name:str cond:str yes:long no:long -> void {
+    s: String;
+    s.pushStr("  ");
+    s.pushStr(name);
+    s.pushStr(" = select i1 ");
+    s.pushStr(cond);
+    s.pushStr(", i64 ");
+    s.pushLong(yes);
+    s.pushStr(", i64 ");
+    s.pushLong(no);
+    e.putString(s);
+    e.line("");
+}
+
+// `main args: ...str`: the OS argc/argv as a slice of `str` built on the stack, its address in rdi
+// for `main`. `Emitter.emitArgvSlice` in AT&T syntax: argc at [rsp], the pointers above it.
+local emitArgvSlice inout e:LlvmEmitter -> void {
+    lines: Vec<str> = vec![
+        "movq (%rsp), %rax", "leaq 8(%rsp), %rsi", "movq %rax, %rbx", "shlq $4, %rbx", "addq $16, %rbx",
+        "subq %rbx, %rsp", "xorq %rcx, %rcx",
+        ".Lkiln_args_build:", "cmpq %rax, %rcx", "jge .Lkiln_args_done", "movq (%rsi,%rcx,8), %rdx", "movq %rdx, %r8",
+        ".Lkiln_args_len:", "cmpb $0, (%r8)", "je .Lkiln_args_len_done", "incq %r8", "jmp .Lkiln_args_len",
+        ".Lkiln_args_len_done:", "subq %rdx, %r8", "movq %rcx, %r9", "shlq $4, %r9", "movq %rdx, (%rsp,%r9)",
+        "movq %r8, 8(%rsp,%r9)", "incq %rcx", "jmp .Lkiln_args_build",
+        ".Lkiln_args_done:", "movq %rax, %r9", "shlq $4, %r9", "leaq (%rsp,%r9), %r10", "movq %rsp, (%r10)",
+        "movq %rax, 8(%r10)", "movq %r10, %rdi"];
+    for l in lines {
+        e.put("module asm \"  ");
+        e.put(l);
+        e.line("\"");
+    }
 }
 
 // `callq "<name>"` in module-level assembly: a hook `_start` calls.
@@ -1017,7 +1356,7 @@ local emitFunc inout e:LlvmEmitter inout p:IRProgram fn:IRFunc -> void {
         if (in.op == IROp.Asm) {
             for j in 0..in.pieceCount {
                 at: long = in.firstPiece + j;
-                if (p.asmKinds.get(at) == AsmKind.Out) {
+                if (p.asmKinds.get(at) == AsmKind.Out && p.asmNames.get(at) != NO_SYM) {
                     e.declareSlot(p.asmNames.get(at), p.slotBytesOf(p.asmNames.get(at)));
                 }
             }
@@ -1043,12 +1382,12 @@ local emitFunc inout e:LlvmEmitter inout p:IRProgram fn:IRFunc -> void {
         e.declareSlot(in.name, p.slotBytesOf(in.name));
         s: String;
         s.pushLong(k);
-        // A by-value aggregate arrives as a POINTER to the caller's copy and the prologue copies
-        // it into storage of its own, which is what lets the body write the parameter without
-        // writing the caller's object. The body then reads it with `addrof self`, out of the slot,
-        // so a slot holding the pointer instead of the bytes reads a struct out of an address.
-        // The seed carries the byte count in `imm`, and `byValueAggregate` is the same test the
-        // native prologue makes.
+        // A by-value aggregate arrives as a pointer to the caller's copy, and the prologue copies
+        // it into storage of its own, which lets the body write the parameter without writing the
+        // caller's object. The body reads it out of the slot with `addrof self`, so a slot holding
+        // the pointer instead of the bytes would read a struct out of an address. The seed
+        // carries the byte count in `imm`, and `byValueAggregate` is the same test the native
+        // prologue makes.
         if (byValueAggregate(in.kind)) {
             pp: String = e.fresh();
             e.put("  ");
@@ -1075,6 +1414,8 @@ local emitFunc inout e:LlvmEmitter inout p:IRProgram fn:IRFunc -> void {
     }
 
     // The body, past the seeds: the prologue above has already stored them.
+    e.fnFirst = fn.firstInstr;
+    e.fnCount = fn.instrCount;
     for k in nparams..fn.instrCount {
         emitInstr(&e, p, p.code.get(fn.firstInstr + k));
     }
@@ -1085,6 +1426,9 @@ local emitFunc inout e:LlvmEmitter inout p:IRProgram fn:IRFunc -> void {
 
 local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
     if (in.op == IROp.Nop) { return; }
+    // A `raise` resumes at an address the record holds, with the stack and registers it saved,
+    // which LLVM cannot be told about.
+    if (in.op == IROp.RecoverPush || in.op == IROp.FaultEdge) { unsupported("a `recover` statement"); return; }
 
     if (in.op == IROp.Const) {
         s: String;
@@ -1108,6 +1452,10 @@ local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
     if (in.op == IROp.Store) {
         if (in.isGlobal) { e.storeGlobal(in, e.readTemp(in.a)); return; }
         v: String = e.readTemp(in.a);
+        // A slot is an `i64`, so a value that need not be one of the variable's (an `int` in a
+        // `u8`: a declaration takes any integer) is narrowed to it here, as the native store
+        // narrows by its width (`narrowsInto`).
+        if (narrowsInto(p.kindOf(in.a), in.kind)) { v = e.canonical(v, in.kind); }
         e.put("  store i64 ");
         e.putString(v);
         e.put(", ptr ");
@@ -1144,7 +1492,7 @@ local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
         e.put(" = xor i64 ");
         e.putString(x);
         e.line(", -1");
-        e.writeTemp(in.dst, r);
+        e.writeTemp(in.dst, e.canonical(r, in.kind));
         return;
     }
 
@@ -1269,7 +1617,6 @@ local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
         return;
     }
 
-    // Still to do. Named by what it is, so the message says which one.
     // `(*a)(args...)`: the target is an address in a temp, which is what a fn value and a vtable
     // slot both hold. With opaque pointers the call names its own signature, so nothing has to be
     // reconstructed from the callee.
@@ -1342,7 +1689,7 @@ local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
                     else {
                         close: long = i + 1;
                         while (close < line.len && charAt(line, close) != '}') { close = close + 1; }
-                        if (close >= line.len) { failStr(format("asm: unclosed register placeholder in: {}", line)); }
+                        if (close >= line.len) { failStr(format("unclosed register placeholder in an `asm` block\nnote: the line is `{}`\nhelp: a placeholder is a register name in braces, such as `{{rax}}`", line)); }
                         want: str = strSlice(line, i + 1, close - i - 1);
                         body.pushStr(sizedRegOf(p, in, want, line));
                         i = close + 1;
@@ -1412,8 +1759,24 @@ local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
         for k in 0..in.pieceCount {
             at: long = in.firstPiece + k;
             if (p.asmKinds.get(at) == AsmKind.Out) {
+                // The one output gone to a promoted local's temp (`Opt.promoteLocals`).
+                if (p.asmNames.get(at) == NO_SYM) { e.writeTemp(in.dst, r); continue; }
+                // A slot holds its integer's canonical word, which the register need not
+                // (`lock xadd [rbx], ax` leaves what was above `ax`): extended from the local's
+                // width first, as its loads and stores say its type is.
+                nk: Lit = Lit.Void;
+                for q in 0..e.fnCount {
+                    qi: long = e.fnFirst + q;
+                    qo: IROp = p.code[qi].op;
+                    if ((qo == IROp.Load || qo == IROp.Store) && !p.code[qi].isGlobal && p.code[qi].name == p.asmNames.get(at)) {
+                        nk = p.code[qi].kind;
+                        break;
+                    }
+                }
+                v: String = r.clone();
+                if (nk != Lit.Void) { v = e.canonical(r.clone(), nk); }
                 e.put("  store i64 ");
-                e.putString(r);
+                e.putString(v);
                 e.put(", ptr ");
                 e.putString(e.nameSlot(p.asmNames.get(at)));
                 e.line("");
@@ -1430,6 +1793,9 @@ local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
 
     // A load through a pointer, at the width its kind names and extended back to a word the way
     // the native emitter's sized load does.
+    // A load or store through an address may be through a raw pointer, which need not be aligned
+    // (`bytes.k` reads a word at any byte, `hash128.k` too): `align 1`, which LLVM would
+    // otherwise take as the type's own. On x86 the instructions are the same either way.
     if (in.op == IROp.PtrLoad) {
         a: String = e.readTemp(in.a);
         ptr: String = e.addrAt(a, in.imm);
@@ -1440,7 +1806,7 @@ local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
             e.putString(v);
             e.put(" = load i64, ptr ");
             e.putString(ptr);
-            e.line("");
+            e.line(", align 1");
             e.writeTemp(in.dst, v);
             return;
         }
@@ -1452,7 +1818,7 @@ local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
         e.putString(bits);
         e.put(", ptr ");
         e.putString(ptr);
-        e.line("");
+        e.line(", align 1");
         r: String = e.fresh();
         e.put("  ");
         e.putString(r);
@@ -1475,7 +1841,7 @@ local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
             e.putString(v);
             e.put(", ptr ");
             e.putString(ptr);
-            e.line("");
+            e.line(", align 1");
             return;
         }
         bits: String = intBits(w);
@@ -1493,7 +1859,54 @@ local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
         e.putString(n);
         e.put(", ptr ");
         e.putString(ptr);
-        e.line("");
+        e.line(", align 1");
+        return;
+    }
+
+    // An atomic, with the ordering its builtin names: an acquire load, a release store, and a
+    // sequentially consistent store, swap, compare-and-swap and add. Narrow words are widened back
+    // to a word the way the native emitter's sized load does.
+    if (in.op == IROp.Atomic) {
+        a: String = e.readTemp(in.a);
+        ptr: String = e.addrAt(a, 0);
+        w: long = widthOfKind(in.kind);
+        bits: String = intBits(w);
+        op: long = in.imm;
+        val: String;
+        if (in.b != NO_TEMP) { val = e.narrowTo(e.readTemp(in.b), w); }
+        old: String;
+        if (op == BI_ATOMIC_LOAD) {
+            old = e.fresh();
+            e.put("  "); e.putString(old); e.put(" = load atomic "); e.putString(bits); e.put(", ptr ");
+            e.putString(ptr); e.put(" acquire, align "); e.putNum(w); e.line("");
+        } else if (op == BI_ATOMIC_STORE || op == BI_ATOMIC_STORE_SC) {
+            e.put("  store atomic "); e.putString(bits); e.put(" "); e.putString(val); e.put(", ptr "); e.putString(ptr);
+            if (op == BI_ATOMIC_STORE) { e.put(" release"); } else { e.put(" seq_cst"); }
+            e.put(", align "); e.putNum(w); e.line("");
+            return;
+        } else if (op == BI_ATOMIC_CAS) {
+            want: String = e.narrowTo(e.readTemp(p.args.get(in.firstArg)), w);
+            pair: String = e.fresh();
+            e.put("  "); e.putString(pair); e.put(" = cmpxchg ptr "); e.putString(ptr); e.put(", ");
+            e.putString(bits); e.put(" "); e.putString(val); e.put(", "); e.putString(bits); e.put(" ");
+            e.putString(want); e.line(" seq_cst seq_cst");
+            old = e.fresh();
+            e.put("  "); e.putString(old); e.put(" = extractvalue { "); e.putString(bits); e.put(", i1 } ");
+            e.putString(pair); e.line(", 0");
+        } else {
+            old = e.fresh();
+            e.put("  "); e.putString(old); e.put(" = atomicrmw ");
+            if (op == BI_ATOMIC_ADD) { e.put("add"); } else { e.put("xchg"); }
+            e.put(" ptr "); e.putString(ptr); e.put(", "); e.putString(bits); e.put(" "); e.putString(val);
+            e.line(" seq_cst");
+        }
+        if (in.dst == NO_TEMP) { return; }
+        if (w == 8) { e.writeTemp(in.dst, old); return; }
+        r: String = e.fresh();
+        e.put("  "); e.putString(r);
+        if (isUnsignedInt(in.kind)) { e.put(" = zext "); } else { e.put(" = sext "); }
+        e.putString(bits); e.put(" "); e.putString(old); e.line(" to i64");
+        e.writeTemp(in.dst, r);
         return;
     }
 
@@ -1511,6 +1924,23 @@ local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
         s: String;
         s.pushLong(in.imm);
         e.putString(s);
+        e.line(", i1 false)");
+        return;
+    }
+
+    // `memcpy`: a length the program computes, so the intrinsic that may become a call.
+    if (in.op == IROp.MemCopy) {
+        a: String = e.readTemp(in.a);
+        b: String = e.readTemp(in.b);
+        n: String = e.readTemp(p.args.get(in.firstArg));
+        dp: String = e.addrAt(a, 0);
+        sp: String = e.addrAt(b, 0);
+        e.put("  call void @llvm.memcpy.p0.p0.i64(ptr ");
+        e.putString(dp);
+        e.put(", ptr ");
+        e.putString(sp);
+        e.put(", i64 ");
+        e.putString(n);
         e.line(", i1 false)");
         return;
     }
@@ -1535,14 +1965,14 @@ local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
         return;
     }
 
-    // Trap unless the index is in range. `imm == 1` is the inclusive form a range slice wants.
+    // Trap unless the index is in range. A slice check (any kind but `BOUNDS_INDEX`) is inclusive.
     if (in.op == IROp.Bounds) {
         x: String = e.operand(in, 0);
         y: String = e.readTemp(in.b);
         c: String = e.fresh();
         e.put("  ");
         e.putString(c);
-        if (in.imm == 1) { e.put(" = icmp ule i64 "); } else { e.put(" = icmp ult i64 "); }
+        if (in.imm != BOUNDS_INDEX) { e.put(" = icmp ule i64 "); } else { e.put(" = icmp ult i64 "); }
         e.putString(x);
         e.put(", ");
         e.putString(y);
@@ -1559,7 +1989,27 @@ local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
         e.put("\"");
         e.putString(badl);
         e.line("\":");
-        e.line("  call void @llvm.trap()");
+        // The native report: what was out of range, the length, where, then exit 134.
+        e.needBounds = true;
+        e.put("  call void @__kiln_bounds_fail(i64 ");
+        e.putString(x);
+        e.put(", i64 ");
+        e.putString(y);
+        if (in.name == NO_SYM) { e.put(", ptr null, i64 0"); }
+        else {
+            e.put(", ptr @bndloc.");
+            s: String;
+            s.pushLong(e.locIndex(in.name));
+            s.pushStr(", i64 ");
+            s.pushLong(nameOf(in.name).len);
+            e.putString(s);
+        }
+        k: String;
+        k.pushStr(", i64 ");
+        k.pushLong(in.imm);
+        k.pushStr(")");
+        e.putString(k);
+        e.line("");
         e.line("  unreachable");
         e.put("\"");
         e.putString(okl);
@@ -1607,9 +2057,9 @@ local emitInstr inout e:LlvmEmitter inout p:IRProgram in:Instr -> void {
         e.writeTemp(in.dst, v);
         return;
     }
-    // A fused compare-and-branch. `ir.k` says these come only from the optimizer, which stopped
-    // being true when `Lowerer::branchUnless` began lowering a condition as a jump: they arrive
-    // here with no optimizer in the path at all.
+    // A fused compare-and-branch. These do not come only from the optimizer:
+    // `Lowerer::branchUnless` lowers a condition as one, so they arrive here with no optimizer in
+    // the path at all.
     if (in.op == IROp.Jcc) {
         c: String;
         if (isFloat(in.kind)) { c = e.floatCmp(in, in.cmpOp); }

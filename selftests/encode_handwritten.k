@@ -1,7 +1,7 @@
 // A hand-written implementation wins over the derive, wherever it is met: here on a backed enum
 // used as a typed integer (`Sym`, an empty `enum Sym: long { }`), whose codec writes the number
 // biased by 1000, and on a struct (`Secret`) that writes only one of its fields. Both are
-// reached from inside DERIVED code -- `Rec`'s fields, `Vec<Rec>`'s elements, `Tok`'s payloads --
+// reached from inside DERIVED code (`Rec`'s fields, `Vec<Rec>`'s elements, `Tok`'s payloads),
 // so the check is that the derive calls them rather than deriving its own. The exact bytes are
 // checked, which also pins the format: zigzag LEB128 for a signed integer, LEB128 for a length
 // and a tag. Exit 0 when every check holds, otherwise the number of the first that did not.

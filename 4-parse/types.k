@@ -16,7 +16,7 @@ pub struct TypeInfo { size: long, precedence: long, name: str, aggregate: bool, 
 // `isUnsignedInt`, `higherPrecedence` and `canImplicitlyConvert`, which is several times
 // per expression node.
 //
-// Data, computed at build time; see `scalarNames` below.
+// Like `gScalarNames` below, this is data computed when the compiler itself is built.
 local gTypeRows: HashMap<long, TypeInfo> = map![
     Lit.Int      as long => TypeInfo { size: 4, precedence: 2, name: "int", aggregate: false, named: false, unsignedNum: false, bare: true },
     Lit.Long     as long => TypeInfo { size: 8, precedence: 3, name: "long", aggregate: false, named: false, unsignedNum: false, bare: true },
@@ -43,10 +43,11 @@ local gTypeRows: HashMap<long, TypeInfo> = map![
     Lit.Len      as long => TypeInfo { size: 0, precedence: 0, name: "length", aggregate: false, named: true, unsignedNum: false, bare: false },
 ];
 
-// A tag with no row of its own reads as `void`. The table stays the one place a row is written;
-// what is asked at run time is `gTypeDense`, the same rows by tag in an array, built from it when
-// this compiler is compiled. A hash probe per question was a fifth of what the compile-time
-// evaluator spent running a loop (every load and store asks a width), and a share of every pass.
+// A tag with no row of its own reads as `void`. The map stays the one place a row is written, but
+// what is asked at run time is `gTypeDense`: the same rows in an array indexed by tag, built from
+// the map when this compiler is compiled. A hash probe per question cost a fifth of the
+// compile-time evaluator's time running a loop (every load and store asks for a width), and a
+// share of every pass.
 local rowOf t:Lit -> TypeInfo {
     hit: Option<TypeInfo> = gTypeRows.find(t as long);
     match hit { Some(v) { return v; } None { } }
@@ -71,16 +72,15 @@ pub isAggregate t:Lit -> bool { return typeInfo(t).aggregate; }
 
 // The type a name spells, or `Lit.Void` if it names no scalar.
 //
-// Built from the rows above rather than repeating them: the canonical spelling of a type is
-// `TypeInfo.name` and was written a second time here, so renaming one meant renaming both or
-// leaving the parser accepting a name the diagnostics no longer printed. What is left is the
-// aliases, which are the only spellings no row carries: `i8`/`i32`/`i64` for the signed widths
-// that already have names and `byte`/`usize` for the unsigned ones. Only a genuinely new width
-// gets a row.
+// It is built from the rows above rather than repeating them. A type's canonical spelling is
+// `TypeInfo.name`; a second copy here would have to be renamed in step with it, or the parser
+// would go on accepting a name the diagnostics no longer print. What is added by hand is only the
+// aliases, the spellings no row carries: `i8`/`i32`/`i64` for signed widths that already have
+// names, and `byte`/`usize` for unsigned ones. Only a genuinely new width gets a row.
 //
-// One table answering both questions, computed when this compiler is compiled. `void` is in it so
-// a name spelled `void` is distinguishable from one that names nothing, which is the whole
-// difference between `scalarNamed` and `namesScalar`.
+// One table answers both questions, and it is computed when this compiler is compiled. `void` is
+// in it so that a name spelled `void` can be told apart from one that names nothing, which is the
+// whole difference between `scalarNamed` and `namesScalar`.
 local gScalarNames: HashMap<str, long> = buildScalarNames();
 
 local buildScalarNames -> HashMap<str, long> {
@@ -130,7 +130,7 @@ pub isInteger t:Lit -> bool {
 // Only lossless widening is implicit; everything else needs an explicit `as`.
 //   integer -> wider signed integer      lossless, always
 //   unsigned -> wider unsigned integer   lossless
-//   signed -> same-width unsigned, or any narrowing: Not implicit, write `x as u32`
+//   signed -> same-width unsigned, or any narrowing: not implicit, write `x as u32`
 pub canImplicitlyConvert from:Lit to:Lit -> bool {
     if (from == to) { return true; }
     // Pointers and `long` are interchangeable 8-byte addresses: `&x` initializes a `*T`, and a
@@ -152,30 +152,65 @@ pub canImplicitlyConvert from:Lit to:Lit -> bool {
     return false;
 }
 
-// Two operands of an arithmetic operator meet at the higher rank. Off the ladder (rank 0) the
-// left type stands, which is what makes an aggregate operand keep its own identity.
+// Whether an integer of type `from`, stored into a place of type `to`, has to be narrowed to
+// become one of `to`'s values. It does when it does not widen into `to` losslessly and `to` is
+// narrower than a word (at eight bytes, the canonical word already is the value). A store to
+// memory narrows by its width anyway; a place held in a register (or in an `i64` LLVM slot) needs
+// the conversion emitted.
+pub narrowsInto from:Lit to:Lit -> bool {
+    if (from == to || !isInteger(from) || !isInteger(to)) { return false; }
+    if (typeInfo(to).size >= 8) { return false; }
+    return !canImplicitlyConvert(from, to);
+}
+
+// The two operands of an arithmetic operator or a comparison meet at one type, which the operation
+// is computed (and wraps) at. Two integers meet where the widening rule says: at the one the other
+// widens to losslessly (`u8 + u16` is a `u16`, `u32 + long` a `long`), or, when neither holds the
+// other, at the narrowest signed type that holds both (`u8 + c` with `c: char` is an `i16`,
+// `char + u16` and `u16 + i16` are `int`, `u32 + int` is `long`). That way a mix computes the
+// value it means, and a comparison orders by that value. A `u64` and a signed type have no such
+// type (`noCommonType`), so the checker refuses the operation; what this returns for that pair
+// (the higher rank, or the left on a tie) only matters for code the compiler writes itself. Off
+// the ladder (rank 0) the left type stands, which is what lets an aggregate operand keep its own
+// identity. A literal operand has already taken the other's type before this is asked
+// (`Checker.adoptLiteral`).
 pub higherPrecedence a:Lit b:Lit -> Lit {
+    if (a != b && isInteger(a) && isInteger(b)) {
+        if (canImplicitlyConvert(a, b)) { return b; }
+        if (canImplicitlyConvert(b, a)) { return a; }
+        wide: long = typeInfo(a).size;
+        if (typeInfo(b).size > wide) { wide = typeInfo(b).size; }
+        if (wide < 2) { return Lit.I16; }
+        if (wide < 4) { return Lit.Int; }
+        if (wide < 8) { return Lit.Long; }
+    }
     if (typeInfo(b).precedence > typeInfo(a).precedence) { return b; }
     return a;
 }
 
-// A slice's element identity, used as the slice's companion name so `[char]` and `[int]` are
-// different types: the element's own name if it has one, else the scalar type's name.
-pub sliceElemName elemKind:Lit elemStruct:Sym -> str {
-    if (elemStruct == NO_SYM) { return typeName(elemKind); }
-    return nameOf(elemStruct);
+// Two integers no integer type holds both of: a `u64` and a signed type. An operation between
+// them is refused until one side says with `as` which it means.
+pub noCommonType a:Lit b:Lit -> bool {
+    if (a == b || !isInteger(a) || !isInteger(b)) { return false; }
+    if (canImplicitlyConvert(a, b) || canImplicitlyConvert(b, a)) { return false; }
+    return typeInfo(a).size >= 8 || typeInfo(b).size >= 8;
 }
 
-// How a type is spelled in a mangled symbol: a monomorphized instance name, a vtable label, a
-// trait-object companion. A named type is its name; everything else is its scalar spelling.
-// How a type is spelled inside a mangled name: a monomorphized instance, a vtable label. Only a
-// named aggregate contributes its own name; everything else contributes its kind, because two
-// instantiations that differ only in kind must not collide. `Vec<*u8>` spelled as `Vec_u8` is
-// `Vec<u8>`, and `Iter<&Res>` is not `Iter<Res>`, so a pointer, a slice and a borrow each say so.
+// A slice's element identity, used as the slice's companion name so `[char]` and `[int]` are
+// different types. It is the element's mangled spelling, which `unmangledType` reads back; a bare
+// companion name would make `[*u8]` a slice of bytes and `[fn(long)->long]` a slice of a struct.
+pub sliceElemName elemKind:Lit elemStruct:Sym -> str {
+    return typeMangleName(elemKind, elemStruct);
+}
+
+// How a type is spelled inside a mangled name: a monomorphized instance, a vtable label, a
+// trait-object companion. Only a named aggregate contributes its own name; everything else
+// contributes its kind, because two instantiations that differ only in kind must not collide.
+// `Vec<*u8>` spelled as `Vec_u8` would be `Vec<u8>`, and `Iter<&Res>` is not `Iter<Res>`, so a
+// pointer, a slice and a borrow each say what they are.
 //
-// A type variable is the one deviation from the C++ compiler, which has no case for it: this
-// compiler keys substitution on the spelling, so `T` has to come back as `T` for a pattern's name
-// to be rebuildable under a binding.
+// A type variable is spelled by its own name. Substitution is keyed on the spelling, so `T` has to
+// come back as `T` for a pattern's name to be rebuilt under a binding.
 pub typeMangleName k:Lit n:Sym -> str {
     if (n == NO_SYM) { return typeName(k); }
     // A length argument is its value: `Buf<64>` is `Buf_64`, however the 64 was spelled.
@@ -198,10 +233,17 @@ pub typeMangleName k:Lit n:Sym -> str {
             else if (c == '&') { s.push('r'); }
             else               { s.push('_'); }
         }
-        return keepString(s);
+        out: str = keepString(s);
+        if (!gFnMangled.has(out)) { gFnMangled.put(out, n); }
+        return out;
     }
     return typeName(k);
 }
+
+// Each fn type's mangled spelling, back to its signature key. A fn type that a pointer, a
+// borrow or a slice points at, or that a type parameter stands for (`*T` in `Vec<fn(long)->long>`),
+// travels as that spelling, and `unmangledType` has to read a fn type back out of it.
+pub var gFnMangled: HashMap<str, Sym> = map![];
 
 // ─── how a type is written in source ─────────────────────────────────────────
 
@@ -212,17 +254,9 @@ pub typeRefOf k:Lit -> TypeRef { return TypeRef { base: k, name: NO_SYM }; }
 pub namedTypeRef k:Lit n:Sym -> TypeRef { return TypeRef { base: k, name: n }; }
 
 
-// `typeMangleName` read backwards: the type a companion name spells. A `*T`, a `[T]` and a `&T`
-// each record their referent as the spelling the mangler produced, so `**Node` is a `Ptr` whose
-// companion is the text `ptr_Node`, and the only way back to "a pointer to Node" is to take that
-// prefix off again. Without this, `rows[0]` of a `**Node` came back as a struct called `ptr_Node`,
-// a type nothing declares, so `rows[0][0]` had no element type at all and fell through to `long`.
-//
-// A declared name is always `module::Name`, so no real struct's spelling begins with one of these
-// prefixes; a monomorphized instance carries them in the middle (`Vec_ptr_Node`), never in front.
-// `inout x:long`: the parameter is a pointer to the caller's scalar, typed `&$inout_long` (a
-// borrow of something no struct table holds, so nothing reads it as the scalar a `&self` of a
-// `long` is), and every use of `x` in the body is `*x`, a lent place (`lentPlaceOf`).
+// An `inout x:long` parameter is a pointer to the caller's scalar, typed `&$inout_long`. That is a
+// borrow of something no struct table holds, so nothing mistakes it for the `&self` of a `long`
+// method. Every use of `x` in the body is `*x`, a lent place (`lentPlaceOf`).
 pub INOUT_SCALAR: str = "$inout_";
 pub isInoutScalarName n:Sym -> bool { return n != NO_SYM && strStartsWith(nameOf(n), INOUT_SCALAR); }
 pub inoutScalarName k:Lit n:Sym -> Sym { return internString(format("{}{}", INOUT_SCALAR, typeMangleName(k, n))); }
@@ -231,11 +265,24 @@ pub inoutScalarOf n:Sym -> TypeRef {
     return unmangledType(strSlice(s, INOUT_SCALAR.len, s.len - INOUT_SCALAR.len));
 }
 
+// `typeMangleName` read backwards: the type a companion name spells. A `*T`, a `[T]` and a `&T`
+// each record their referent as the spelling the mangler produced, so `**Node` is a `Ptr` whose
+// companion is the text `ptr_Node`, and the only way back to "a pointer to Node" is to take that
+// prefix off again. Without this, `rows[0]` of a `**Node` would come back as a struct called
+// `ptr_Node`, a type nothing declares, so `rows[0][0]` would have no element type at all and
+// would fall through to `long`.
+//
+// A declared name is always `module::Name`, so no real struct's spelling begins with one of these
+// prefixes; a monomorphized instance carries them in the middle (`Vec_ptr_Node`), never in front.
 pub unmangledType n:str -> TypeRef {
     if (strStartsWith(n, "ptr_"))   { return TypeRef { base: Lit.Ptr,   name: intern(strSlice(n, 4, n.len - 4)) }; }
     if (strStartsWith(n, "ref_"))   { return TypeRef { base: Lit.Ref,   name: intern(strSlice(n, 4, n.len - 4)) }; }
     if (strStartsWith(n, "slice_")) { return TypeRef { base: Lit.Slice, name: intern(strSlice(n, 6, n.len - 6)) }; }
     if (namesScalar(n)) { return TypeRef { base: scalarNamed(n), name: NO_SYM }; }
+    if (strStartsWith(n, "fnfn")) {
+        hit: Option<Sym> = gFnMangled.find(n);
+        match hit { Some(key) { return TypeRef { base: Lit.Fn, name: key }; } None { } }
+    }
     return TypeRef { base: Lit.Struct, name: intern(n) };
 }
 
@@ -252,11 +299,12 @@ pub lengthValue t:TypeRef -> long {
 }
 
 // Whether an untyped literal's value is one the declared width can hold. A literal takes the
-// type it is handed. That is what makes `f(3)` into a `u8` parameter a 3 rather than a narrowing
-// the author has to write out, but only when the value is actually one of that type's.
-// `c: char = 300` is not: no `char` holds 300, and the store wrote 44. A negative literal fits no
-// unsigned type, a `u64` included. A literal written past `long`'s maximum is a `u64` literal
-// (its bits in `v`, so negative), asked about apart from this: nothing but a u64 holds it.
+// type it is handed, which is what makes `f(3)` into a `u8` parameter a 3 rather than a narrowing
+// the author has to write out, but only when the value really is one of that type's.
+// `c: char = 300` is not: no `char` holds 300, and the store would write 44. A negative literal
+// fits no unsigned type, `u64` included. A literal written past `long`'s maximum is a `u64`
+// literal (its bits are in `v`, so it reads as negative) and is checked apart from this, since
+// nothing but a `u64` holds it.
 pub literalFits v:long k:Lit -> bool {
     if (!isInteger(k) && k != Lit.Bool) { return true; }
     sz: long = typeInfo(k).size;

@@ -1,14 +1,14 @@
-// Deque<T> — a double-ended queue over a growable ring buffer. Push and pop at either end are
+// Deque<T>: a double-ended queue over a growable ring buffer. Push and pop at either end are
 // O(1) amortized, so one type is a stack, a queue and a deque; the same thing over a Vec would
 // make every dequeue an O(n) shift.
 //
 // `head` is the physical index of the logical front, and logical i sits at
 // `(head + i) & (cap - 1)`. Capacity is always a power of two so that wrap is a mask. Growth
-// doubles and RE-LINEARIZES — a raw copy of a wrapped ring would scramble it — which is two
+// doubles and re-linearizes, since a raw copy of a wrapped ring would scramble it. That takes two
 // block copies (the run from `head` to the ring's end, then the wrapped remainder).
 //
-// Any element type, like Vec: push and pop MOVE a value in and out, `q[i]` is a borrow of the
-// element in place, and only `get`/`front`/`back` -- which hand out a copy -- need `Copy`. An
+// Any element type, like Vec: push and pop move a value in and out, `q[i]` is a borrow of the
+// element in place, and only `get`/`front`/`back`, which hand out a copy, need `Copy`. An
 // owning element is released when it is popped and bound, when it is overwritten, and with the
 // deque. Every index is bounds-checked.
 //
@@ -21,9 +21,9 @@
 #include <{core, panic, heap, mem, option}>
 
 // Each of these ends the program, naming the end or the index it was asked for.
-local dequeEmpty what:str -> never { panicState(what, "the deque is empty"); }
+local dequeEmpty what:str -> never { panicState(what, "deque is empty"); }
 
-// cap is 0 (unallocated) or a power of two, which is what makes the wrap in `slot` a mask.
+// cap is 0 (unallocated) or a power of two, so the wrap in `slot` can be a mask.
 pub struct Deque<T> { ptr: *T, cap: long, head: long, count: long }
 
 methods Deque<T> for Default {
@@ -72,14 +72,14 @@ methods Deque<T> {
     pushBack &self v:T -> void {
         self.reserve(self.count + 1);
         unsafe { self.ptr[self.slot(self.count)] = v; }
-        self.count = self.count + 1;
+        self.count += 1;
     }
 
-    // Step head back one slot, wrapping, and write there — what a Vec cannot do cheaply.
+    // Step head back one slot, wrapping, and write there. A Vec cannot do this cheaply.
     pushFront &self v:T -> void {
         self.reserve(self.count + 1);
         self.head = (self.head + self.cap - 1) & (self.cap - 1);
-        self.count = self.count + 1;
+        self.count += 1;
         unsafe { self.ptr[self.slot(0)] = v; }
     }
 
@@ -88,7 +88,7 @@ methods Deque<T> {
         r: T;
         unsafe { r = self.ptr[self.slot(0)]; }
         self.head = (self.head + 1) & (self.cap - 1);
-        self.count = self.count - 1;
+        self.count -= 1;
         return r;
     }
 
@@ -96,7 +96,7 @@ methods Deque<T> {
         if (self.count <= 0) { dequeEmpty("Deque.popBack"); }
         r: T;
         unsafe { r = self.ptr[self.slot(self.count - 1)]; }
-        self.count = self.count - 1;
+        self.count -= 1;
         return r;
     }
 
@@ -143,7 +143,7 @@ methods Deque<T> for IndexSet<long, T> {
     setAt &self i:long v:T -> void { self.set(i, v); }
 }
 
-// Reading without removing hands out a COPY, which only a Copy element has to give.
+// Reading without removing hands out a copy, which only a Copy element has to give.
 // A deep copy (see Vec's Clone for why it has to be written out).
 methods Deque<T: Clone> for Clone {
     clone &self -> Deque<T> {

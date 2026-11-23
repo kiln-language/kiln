@@ -1,4 +1,4 @@
-// RingBuffer<T, N> — a double-ended queue of at most N elements, held inline: `Deque` without the
+// RingBuffer<T, N>: a double-ended queue of at most N elements, held inline: `Deque` without the
 // heap, for when the bound is part of the design.
 //
 //     q: RingBuffer<long, 16>;             // a bounded work queue
@@ -19,7 +19,7 @@ methods RingBuffer<T, N> for Default {
     new -> RingBuffer<T, N> { return RingBuffer { head: 0, count: 0 }; }   // data: zero-filled
 }
 
-local ringEmpty what:str -> never { panicState(what, "the ring is empty"); }
+local ringEmpty what:str -> never { panicState(what, "ring buffer is empty"); }
 
 methods RingBuffer<T, N> {
     len      &self -> long { return self.count; }
@@ -34,14 +34,14 @@ methods RingBuffer<T, N> {
     pushBack &self v:T -> bool {
         if (self.count == N) { return false; }
         self.data[self.slot(self.count)] = v;
-        self.count = self.count + 1;
+        self.count += 1;
         return true;
     }
     pushFront &self v:T -> bool {
         if (self.count == N) { return false; }
         self.head = (self.head + N - 1) % N;
         self.data[self.head] = v;
-        self.count = self.count + 1;
+        self.count += 1;
         return true;
     }
     // Add at the back, and when full make room by dropping the oldest, which comes back: the
@@ -59,12 +59,12 @@ methods RingBuffer<T, N> {
         if (self.count == 0) { ringEmpty("RingBuffer.popFront"); }
         v: T = self.data[self.head];
         self.head = (self.head + 1) % N;
-        self.count = self.count - 1;
+        self.count -= 1;
         return v;
     }
     popBack &self -> T {
         if (self.count == 0) { ringEmpty("RingBuffer.popBack"); }
-        self.count = self.count - 1;
+        self.count -= 1;
         return self.data[self.slot(self.count)];
     }
     tryPopFront &self -> Option<T> {

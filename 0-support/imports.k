@@ -101,9 +101,9 @@ methods ImportGraph {
         seen: HashMap<str, long>;
         queue: Vec<Sym>;
         // Collected here and sorted before it joins `reach`, so `reaches` below can binary-search
-        // it. Membership used to be a walk, on the reasoning that a run is "a handful of
-        // entries": true of this compiler's 52 modules and not of a program with a thousand,
-        // where a name lookup per call site over a list per module is the whole cost of a build.
+        // it. A linear walk would do for this compiler's 52 modules, but not for a program with a
+        // thousand, where a name lookup per call site over a list per module would be the whole
+        // cost of a build.
         found: Vec<Sym>;
         at: long = self.slotOf(here);
         if (at != MISSING) {
@@ -135,10 +135,9 @@ methods ImportGraph {
     visibleAt &self r:Run k:long -> Sym { return self.reach.get(r.first + k); }
 
     // Can a file in module `here` name something declared in `m`? Its own module always, and
-    // anything it includes. A binary search over the sorted closure: this is asked once per
-    // candidate declaration of a bare name, where the old arrangement asked the opposite question
-    // once per visible module, and the difference between those two is what made a program's
-    // build quadratic in its module count.
+    // anything it includes. This is asked once per candidate declaration of a bare name, and
+    // answered by a binary search over the sorted closure. Asking the opposite question instead,
+    // once per visible module, makes a program's build quadratic in its module count.
     reaches &self here:str m:Sym -> bool {
         if (here == nameOf(m)) { return true; }
         r: Run = self.visible(here);

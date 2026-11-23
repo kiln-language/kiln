@@ -19,10 +19,9 @@ pub struct VarType { kind: Lit, structName: Sym, isArray: bool }
 
 pub varType k:Lit n:Sym -> VarType { return VarType { kind: k, structName: n, isArray: false }; }
 
-// A type spelled as a mangled name, back as a type. A `fn(...)->R` records only its return that
-// way. Everything that needs the parameters reads the declaration instead.
-// A mangled type name back as a type. `*T` and `[T]` record their element this way, so binding
-// one to a parameter means reading the spelling as the type it stands for.
+// Turns a mangled type name back into a type. `*T` and `[T]` record their element this way, so
+// binding one to a parameter means reading the spelling as the type it stands for. A `fn(...)->R`
+// records only its return like this; anything that needs the parameters reads the declaration.
 pub typeRefNamed n:str -> TypeRef {
     if (namesScalar(n)) { return TypeRef { base: scalarNamed(n), name: NO_SYM }; }
     return TypeRef { base: Lit.Struct, name: intern(n) };
@@ -86,11 +85,15 @@ pub isAlwaysTrue e:Expr -> bool {
 // The program's `@panic` function, found once (`Checker.panicTarget`).
 local var gPanicFn: Sym = NO_SYM;
 local var gPanicScanned: bool = false;
+// The program's `@recover` function, found once (`Checker.recoverTarget`): what the code a `recover`
+// statement is lowered to calls to link and unlink its record.
+pub var gRecoverFn: Sym = NO_SYM;
+local var gRecoverScanned: bool = false;
 
 // A concrete value that a trait-typed parameter can be built from. A borrow is one: a trait
 // object is {data, vtable} and a ref is already the data pointer, so the coercion costs nothing
 // the by-value one did not, which is what lets a function that was lent a `String` write into it
-// through `Write`. The lowerer always handled it; only this test refused.
+// through `Write`. The lowerer builds the pair the same way for both.
 pub isConcreteForTrait e:Expr -> bool {
     if (e.structName == NO_SYM) { return false; }
     return e.kind == Lit.Struct || e.kind == Lit.Ref;
@@ -102,27 +105,43 @@ pub namedType n:Sym -> VarType {
     return varType(Lit.Struct, n);
 }
 
-// A struct's members, for the diagnostic that says a name is not one of them. The compiler's own
-// fields are skipped: a sum type's `$tag` and its per-variant payload slots are laid out by the
-// parser and nobody writes them, so naming them back would send the reader looking for a member
-// their source does not contain.
+// A struct's members, for the diagnostic that says a name is not one of them: "fields `x`, `y`",
+// or "no fields". The compiler's own fields are skipped: a sum type's `$tag` and its per-variant
+// payload slots are laid out by the parser and nobody writes them, so naming them back would send
+// the reader looking for a member their source does not contain.
 pub fieldNamesOf d:StructDef -> str {
     s: String;
+    s.pushStr("fields `");
     n: long = 0;
+    // A tuple's elements are its fields `$0`, `$1`, written `t.0`, `t.1`.
+    tuple: bool = isTupleName(d.name);
     for k in 0..d.fieldCount {
         f: str = nameOf(gReg.fieldAt(d, k).name);
-        if (f.len > 0 && charAt(f, 0) == '$') { continue; }
-        if (n > 0) { s.pushStr(", "); }
+        if (f.len > 0 && charAt(f, 0) == '$') {
+            if (!tuple) { continue; }
+            f = strSlice(f, 1, f.len - 1);
+        }
+        if (n > 0) { s.pushStr("`, `"); }
         s.pushStr(f);
         n = n + 1;
     }
     if (n == 0) { return "no fields"; }
+    s.push('`');
     return keepString(s);
 }
 
+// A kind with no fields whatever its companion name: the scalars, `any`, a function pointer, an
+// untyped raw pointer. A struct, a borrow or a trait object without a name is a type the checker
+// lost track of, which is not this question.
+local fieldless k:Lit -> bool {
+    return k == Lit.Int || k == Lit.Long || k == Lit.Char || k == Lit.Float || k == Lit.Double
+        || k == Lit.I16 || k == Lit.U8 || k == Lit.U16 || k == Lit.U32 || k == Lit.U64
+        || k == Lit.Bool || k == Lit.Any || k == Lit.Fn || k == Lit.Ptr;
+}
+
 // What a call through a `fn` value yields. A fn type's companion is a key into the signature
-// table rather than a type name of its own, so the result is looked up and never read off the
-// spelling, which is what a fn type keyed by its return alone used to let a caller do.
+// table rather than a type name of its own, so the result is looked up there and never read off
+// the spelling.
 pub fnSigReturn key:Sym -> VarType {
     at: long = gFnSigs.find(key);
     if (at < 0) { return varType(Lit.Void, NO_SYM); }
@@ -148,22 +167,11 @@ pub boxableAsAny k:Lit n:Sym -> bool {
 // values are integers of the backing width. A sum type answers no: it is laid out as a struct.
 pub isBackedEnum n:Sym -> bool {
     if (n == NO_SYM) { return false; }
-    at: long = gReg.findEnum(nameOf(n));
+    at: long = gReg.findEnumSym(n);
     if (at < 0) { return false; }
     return !gReg.enumDef(at).hasPayload;
 }
 
-// Whether a value of kind `gk` (companion name `gn`) may be handed to a place of kind `wk`
-// (companion `wn`). `weak` says the value is an untyped literal, which takes the type it is
-// handed rather than carrying one.
-//
-// Permissive wherever the compiler does not yet know a type (an unstamped type parameter, a
-// call whose return is still being decided, `any`) because this runs during the rounds where
-// those are still being settled, and a refusal invented from a half-known type is worse than
-// the silence it replaces. What it does catch is the mismatch of category: a `str` is a
-// {ptr,len} pair and a `long` is a word, and handing either where the other is declared reads
-// sixteen bytes off an eight-byte slot. `canImplicitlyConvert` (`parse::types`) has stated the
-// scalar rule since the port began and had no caller until now.
 // The value a borrow of a scalar or a `str` is, or `Lit.Void` when `t` is no such borrow. Only a
 // `&self` of `methods long`, `methods str`... has this type (`inout` takes no scalar, and a
 // stamped `&T` at a scalar T is the scalar), and it receives the value itself.
@@ -176,6 +184,16 @@ pub scalarRefKind t:VarType -> Lit {
     return Lit.Void;
 }
 
+// Whether a value of kind `gk` (companion name `gn`) may be handed to a place of kind `wk`
+// (companion `wn`). `weak` says the value is an untyped literal, which takes the type it is
+// handed rather than carrying one.
+//
+// It is permissive wherever the compiler does not know a type yet (an unstamped type parameter,
+// a call whose return is still being decided, `any`), because this runs during the rounds where
+// those are being settled, and a refusal invented from a half-known type is worse than saying
+// nothing. What it does catch is a mismatch of category: a `str` is a {ptr,len} pair and a
+// `long` is a word, and handing either where the other is declared reads sixteen bytes off an
+// eight-byte slot. The scalar rule itself is `canImplicitlyConvert` (`parse::types`).
 pub typeFits wk0:Lit wn0:Sym gk0:Lit gn0:Sym weak:bool -> bool {
     // A borrow of a scalar is the scalar: `&u64` and `u64` are one argument, and which of the
     // two a stamped generic parameter is written as depends on the pass that retyped it.
@@ -195,10 +213,10 @@ pub typeFits wk0:Lit wn0:Sym gk0:Lit gn0:Sym weak:bool -> bool {
     if (wk == Lit.TraitObj) {
         return gk == Lit.Struct || gk == Lit.Ref || gk == Lit.TraitObj || gk == Lit.Ptr;
     }
-    // A backed enum is an integer that carries which enum it came from: `Access.Read` types as
+    // A backed enum is an integer that remembers which enum it came from: `Access.Read` types as
     // the backing width, and the parameter that takes it names the enum. A sum type is not one
-    // of these -- it is laid out as a struct -- so the distinction is `hasPayload`.
-    // A distinct type is not one of these: it converts only by `as`.
+    // of these (it is laid out as a struct), so the test is `hasPayload`. Neither is a distinct
+    // type, which converts only with `as`.
     if (isBackedEnum(wn) && !gReg.isDistinct(wn) && (isInteger(gk) || (isBackedEnum(gn) && !gReg.isDistinct(gn)))) { return true; }
     if (isBackedEnum(gn) && !gReg.isDistinct(gn) && isInteger(wk)) { return true; }
     // A struct and a borrow of one are the same argument. A name mismatch between two structs is
@@ -206,7 +224,8 @@ pub typeFits wk0:Lit wn0:Sym gk0:Lit gn0:Sym weak:bool -> bool {
     if (wk == Lit.Struct || wk == Lit.Ref) {
         return gk == Lit.Struct || gk == Lit.Ref || gk == Lit.Ptr;
     }
-    if (wk == Lit.Fn)    { return gk == Lit.Fn || gk == Lit.Ptr || gk == Lit.Long; }
+    if (wk == Lit.Fn && gk == Lit.Fn) { return fnSigsFit(wn, gn); }
+    if (wk == Lit.Fn)    { return gk == Lit.Ptr || gk == Lit.Long; }
     if (wk == Lit.Slice) { return gk == Lit.Slice || gk == Lit.Str || gk == Lit.Ptr; }
     if (wk == Lit.Str)   { return gk == Lit.Str || gk == Lit.Slice; }
     if (wk == Lit.Tuple) { return gk == Lit.Tuple; }
@@ -257,7 +276,13 @@ pub struct Checker {
     ownUnsafe: long,               // the ownership walk is inside `unsafe`
     addrFills: Vec<Sym>,           // owning locals whose raw address the current statement takes
     stmtMoves: long,               // moves the ownership walk has made in the current statement
+    globalFnRefs: Vec<NodeId>,     // every `&f` in a global's initializer, for `enforceFnRef`
+    globalFnRefPos: Vec<long>,     // and where it stands
     guards: long,                 // makes each `with`'s guard a distinct name
+    // The `hold()` calls a `with` statement makes (by their index in `calls`): trusted whether or
+    // not the method is declared `unsafe`, since the guard it returns lives exactly for the block,
+    // inside the borrow it keeps a pointer into.
+    withHolds: HashMap<long, bool>,
     currentReturn: VarType,
     currentModule: Sym,            // the module whose body is being checked, for bare names
     // The file and package the body being checked was written in: what `local` and `pkg` are
@@ -290,6 +315,16 @@ pub struct Checker {
     loopMoved: Vec<Sym>,           // `moved` as each was entered, flattened
     loopMovedBase: Vec<long>,
     loopDepth: long,
+    // Inside the body of a `recover`, how many deep. A `raise` can leave the body between any two
+    // calls, so there a move is recorded before the statement that makes it, and a scope's
+    // release clears the flag of what it released. The tracked locals each open body declares
+    // and the values it moves are kept for its handler, flattened, with where each body's run
+    // begins.
+    ownRecover: long,
+    recLocals: Vec<OwnLocal>,
+    recLocalsBase: Vec<long>,
+    recMoved:  Vec<Sym>,
+    recMovedBase: Vec<long>,
     ownSeq:    long,               // unique names for the pass's own temporaries
     ownFn:     long,               // the function node being walked, for its parameter list
     ownSeeding: bool,              // the next block opened is a function body: seed its parameters
@@ -300,6 +335,10 @@ pub struct Checker {
     // to read what the first one moved: the subject the current arm's prologue has taken from.
     bindSubject: Sym,
     bmLocals:  HashMap<str, bool>, // a match through a borrow: the function's locals -> is a borrow
+    bmOwnRead: HashMap<str, bool>, // and its by-value parameters passed as borrows (inferred `read`)
+    bmCopies:  HashMap<str, long>, // and its bindings noted in `gCopyBinds`, by name
+    bmDry:     long,               // `bmArmBlock` noting for that copy what it would refuse, or -1
+    bmDestr:   bool,               // and that copy is a destructured name, for the words
     convIdx:   HashMap<str, long>, // parameter name -> its position, while inference scans a body
     capMut:    HashMap<str, bool>, // `<closure>.<capture>` -> the body writes it
     tmpDecl:   HashMap<str, long>, // a hoisted temporary -> its declaration, for its type
@@ -310,10 +349,10 @@ pub struct Checker {
     initBase:  Vec<long>,          // ...and where each open scope begins in it
     eqExtra:   Vec<long>,          // derived `eq` methods, waiting to be added to the page
     fnDone:    HashMap<str, bool>, // bodies already walked, so none is rewritten twice
-    // Macros run inside this pass. `ev` runs them; `page` is what it indexes; a function whose
-    // body invokes a macro that cannot run yet -- its body or something it calls is unchecked,
-    // or a generic it needs is not stamped -- is deferred to the next round, and `deferReason`
-    // says why the last one was, for the driver to report if no round makes progress.
+    // Macros run inside this pass: `ev` runs them, and `page` is what it indexes. A function whose
+    // body invokes a macro that cannot run yet (its body or something it calls is unchecked, or a
+    // generic it needs is not stamped) is deferred to the next round. `deferReason` says why the
+    // last one was, for the driver to report if no round makes progress.
     ev: Evaluator,
     page: long,
     curStmt: long,                 // the page statement being checked, for deferring it
@@ -388,7 +427,7 @@ local fieldSpelling n:Sym -> str {
 // A sum type whose all-zero value is a variant carrying nothing (tag 0, no payload): what an
 // omitted `Option<File>` field is, `None`, which owns nothing.
 local zeroIsEmptyVariant n:Sym -> bool {
-    at: long = gReg.findEnum(nameOf(n));
+    at: long = gReg.findEnumSym(n);
     if (at < 0) { return false; }
     ed: EnumDef = gReg.enumDef(at);
     if (!ed.hasPayload) { return false; }
@@ -406,6 +445,21 @@ local litFieldWhat n:Sym -> str {
     return fieldSpelling(n);
 }
 
+// How a note names the place a value was stored into: a bare name in backticks, a phrase ("the
+// assigned place", "`c`") as it is. A struct literal's field arrives bare, since `litFieldWhat`
+// builds nothing unless the store fails; this runs only once it has.
+local notePlace what:str -> str {
+    for k in 0..what.len {
+        c: long = charAt(what, k);
+        if (c == ' ' || c == '`') { return what; }
+    }
+    s: String;
+    s.push('`');
+    s.pushStr(what);
+    s.push('`');
+    return keepString(s);
+}
+
 // A condition that always holds: a bare `else` is the last link of its chain with one.
 local isAlways inout a:Ast cond:NodeId -> bool {
     if (cond == NO_NODE) { return false; }
@@ -419,19 +473,48 @@ local nodeIn xs:Vec<NodeId> x:NodeId -> bool {
     return false;
 }
 
+// Where binding `nm`'s declaration sits in an arm's prologue, with its store the statement after
+// it, or -1.
+local bindingAt inout a:Ast body:long nm:Sym -> long {
+    lim: long = a.blockLen(body) - 1;
+    for s in 0..lim {
+        st: Stmt = a.stmtAt(body, s);
+        if (st.kind == StmtKind.VarDecl && a.decls.get(st.at).name == nm) {
+            if (a.stmtAt(body, s + 1).kind != StmtKind.Expr) { return -1; }
+            return s;
+        }
+    }
+    return -1;
+}
+
+// An argument a call is handed by its address rather than its value, when the parameter does not
+// take it: a struct (or a tuple, or an enum with a payload), a borrow, a trait object, a slice, a
+// value boxed as `any`. A `str` is a view of bytes safe code never writes or releases.
+local byAddressKind k:Lit -> bool {
+    return k == Lit.Struct || k == Lit.Tuple || k == Lit.Ref || k == Lit.TraitObj || k == Lit.Slice || k == Lit.Any;
+}
+
+// A variant as the source names it: a deferred match's arm reads `?Some` until its type is known.
+local variantSpelling v:Sym -> str {
+    s: str = nameOf(v);
+    if (s.len > 0 && charAt(s, 0) == '?') { return strSlice(s, 1, s.len - 1); }
+    return s;
+}
+
 methods Checker for Default {
     new -> Checker {
         evl: Evaluator; drs: String; lm: Mono;
         return Checker { vars: map![], types: vec![], fnReturns: map![], fnNames: map![], varNames: map![], locals: map![],
-                         fnAt: map![], privateIn: map![], fnBare: BareIndex.new(), diverging: map![], wanted: vec![], wantedClones: vec![], addrOperand: NO_NODE, ownUnsafe: 0, addrFills: vec![], stmtMoves: 0, guards: 0, currentModule: NO_SYM, currentReturn: varType(Lit.Void, NO_SYM),
+                         fnAt: map![], privateIn: map![], fnBare: BareIndex.new(), diverging: map![], wanted: vec![], wantedClones: vec![], addrOperand: NO_NODE, ownUnsafe: 0, addrFills: vec![], stmtMoves: 0, globalFnRefs: vec![], globalFnRefPos: vec![], guards: 0, withHolds: map![], currentModule: NO_SYM, currentReturn: varType(Lit.Void, NO_SYM),
                          errors: 0,
                          dropOf: map![], dropDepth: map![], fresh: map![], ownParams: map![],
                          scope: vec![], scopeBase: vec![], moved: vec![],
                          pmust: vec![], pmustLoop: vec![], pmustLoopBase: vec![], pOwner: map![],
                          pField: map![], pFlags: vec![], pHoles: vec![], pCond: 0,
                          loopBase: vec![], loopMoved: vec![], loopMovedBase: vec![],
-                         loopDepth: 0, ownSeq: 0, ownFn: 0, ownSeeding: false, ownDone: false, notedTo: 0, macroOk: map![],
-                         bindSubject: NO_SYM, bmLocals: map![],
+                         loopDepth: 0, ownRecover: 0, recLocals: vec![], recLocalsBase: vec![], recMoved: vec![], recMovedBase: vec![],
+                         ownSeq: 0, ownFn: 0, ownSeeding: false, ownDone: false, notedTo: 0, macroOk: map![],
+                         bindSubject: NO_SYM, bmLocals: map![], bmOwnRead: map![], bmCopies: map![], bmDry: -1, bmDestr: false,
                          convIdx: map![], capMut: map![], tmpDecl: map![], declared: vec![], shadowed: vec![],
                          xPath: vec![], tracked: map![], assigned: vec![], initScope: vec![], initBase: vec![],
                          eqExtra: vec![], fnDone: map![], ev: evl, page: 0, curStmt: -1, deferredFns: vec![], deferReason: drs, initSeen: map![],
@@ -488,7 +571,7 @@ methods Checker {
     // `io::gStdout` meaning io's and not `here::io::gStdout`.
     ownDeclared &self used:Sym wantFn:bool -> Sym {
         if (self.currentModule == NO_SYM) { return used; }
-        q: Sym = qualifiedName(nameOf(self.currentModule), nameOf(used));
+        q: Sym = qualifiedSym(self.currentModule, used);
         if (wantFn) {
             if (self.fnNames.has(nameOf(q))) { return q; }
             return used;
@@ -541,8 +624,8 @@ methods Checker {
         self.noteFnName(fn);
     }
 
-    // What a name written bare resolves to. A template needs this as much as a function does (
-    // `newShared(v)` has to reach `shared::newShared` before its instance can be named) but it
+    // What a name written bare resolves to. A template needs this as much as a function does
+    // (`newShared(v)` has to reach `shared::newShared` before its instance can be named), but it
     // has no return type to record, since that is what the instantiation decides.
     noteFnName &self fn:Sym -> void {
         // Once per function: the collection pass walks the page again each driver round, and a
@@ -562,14 +645,14 @@ methods Checker {
         bare: str = nameOf(called);
         // Then the modules this one includes, the way a type name resolves: two `pub opName`s in
         // two modules are two functions, and which one a call means is decided by what the
-        // calling module can see -- not by which was registered last under the bare spelling.
+        // calling module can see, not by which was registered last under the bare spelling.
         if (self.currentModule != NO_SYM && !gImports.isEmpty() && lastComponentOf(bare).len == bare.len) {
             here: str = nameOf(self.currentModule);
             found: Sym = NO_SYM;
             // Another file's private function is no candidate: nothing here may call it, so it
-            // cannot make a name ambiguous (`float.k`'s `local isDigit` beside `chars::isDigit`,
-            // STDLIB_REVIEW gap 9). Kept aside only to be named by the refusal when it is the
-            // one function of that name in reach.
+            // cannot make a name ambiguous (`float.k`'s `local isDigit` beside `chars::isDigit`).
+            // It is kept aside only so the refusal can name it when it is the one function of
+            // that name in reach.
             hidden: Sym = NO_SYM;
             i: long = self.fnBare.firstOf(bare);
             while (i >= 0) {
@@ -600,8 +683,8 @@ methods Checker {
         match hit { Some(q) { return q; } None { } }
         return called;
     }
-    // Whether a bare name is a type's, seen from the module being checked -- a static call's
-    // receiver, `Vec.new()`, is one standing where a value is read.
+    // Whether a bare name is a type's, seen from the module being checked. A static call's
+    // receiver (`Vec` in `Vec.new()`) is a type name standing where a value is read.
     namesType &self n:Sym -> bool {
         if (gReg.declares(nameOf(n))) { return true; }
         b: BareName = gReg.resolveBareIn(nameOf(self.currentModule), nameOf(n));
@@ -651,17 +734,17 @@ methods Checker {
             st: Stmt = a.stmtAt(page, k);
             if (st.kind == StmtKind.FunctionDef) {
                 f: FnNode = a.fns.get(st.at);
-                // Two functions of one name: the second silently replaced the first here, both
-                // were emitted, and NASM reported a redefined label from a line number in
-                // generated assembly. A re-walk of the same function is not one. The page grows
-                // between rounds, so `st.at` is what distinguishes a second definition from the
-                // first's statement written again (a derive's).
+                // Two functions of one name. Without this check the second would silently replace
+                // the first here, both would be emitted, and the assembler would report a
+                // redefined label at a line of generated code. A re-walk of the same function is
+                // not a redefinition: the page grows between rounds, so `st.at` is what tells a
+                // second definition from the first one's statement written again (a derive's).
                 seen: Option<long> = self.fnAt.find(nameOf(f.name));
                 match seen {
                     Some(prev) {
                         if (prev != st.at) {
                             a.enterStmt(a.stmtIdAt(page, k));
-                            failStr(format("'{}' is defined twice", nameOf(f.name)));
+                            failStr(format("redefinition of `{}`", nameOf(f.name)));
                         }
                     }
                     None { }
@@ -673,6 +756,7 @@ methods Checker {
                 if (gFloatBoxFormat == NO_SYM && !f.isTemplate && nameOf(f.name) == FLOAT_BOX_FORMAT) {
                     gFloatBoxFormat = f.name;
                     gAddressedFns.push(f.name);      // a float box's `y` is its address
+                    gAddressedSigs.push(NO_SYM);
                 }
                 self.stmtOfFn.put(nameOf(f.name), a.stmtIdAt(page, k));
                 if (f.isTemplate) { self.noteFnName(f.name); k = k + 1; continue; }
@@ -715,8 +799,8 @@ methods Checker {
                 }
             }
         }
-        // A generic type's implementation stamped last round for a bound a derive met, whose
-        // body named instances that had to be laid out first: laid out now.
+        // Implementations of a generic type that were stamped last round, once a derive met their
+        // bounds. Their bodies named instances that had to be laid out first, which they now are.
         lateIds: Vec<long> = self.takeLate();
         for k in 0..lateIds.len() {
             self.curStmt = lateIds.get(k);
@@ -754,7 +838,7 @@ methods Checker {
         }
         return self.errors;
     }
-    // One page statement, typed under a recovery point (`armRecovery`): an error in it is reported
+    // One page statement, typed in the body of a `recover`: an error in it is reported
     // and the round goes on with the next statement, so one run reports the first error of every
     // function rather than of the first. What typing one function leaves in the checker's own
     // state is put back as the function's own exit would. A closure's body is not given one: the
@@ -774,25 +858,24 @@ methods Checker {
         wasFn: long = self.curFn;
         wasCtx: Sym = gCtxFn;
         wasInst: Sym = gCtxInst;
-        hit: long = 0;
-        unsafe { hit = armRecovery(); }
-        if (hit != 0) {
-            self.forgetLocals();
-            self.currentReturn = was;
-            self.currentModule = wasMod;
-            self.currentFile = wasFile;
-            self.currentPkg = wasPkg;
-            self.unsafeDepth = wasUnsafe;
-            self.curFn = wasFn;
-            self.expectType = NO_SYM;
-            self.noDefault = false;
-            self.bindSubject = NO_SYM;
-            gCtxFn = wasCtx;
-            gCtxInst = wasInst;
-            return;
+        unsafe {
+            recover {
+                self.checkStmtAt(a, id);
+            } else {
+                self.forgetLocals();
+                self.currentReturn = was;
+                self.currentModule = wasMod;
+                self.currentFile = wasFile;
+                self.currentPkg = wasPkg;
+                self.unsafeDepth = wasUnsafe;
+                self.curFn = wasFn;
+                self.expectType = NO_SYM;
+                self.noDefault = false;
+                self.bindSubject = NO_SYM;
+                gCtxFn = wasCtx;
+                gCtxInst = wasInst;
+            }
         }
-        self.checkStmtAt(a, id);
-        disarmRecovery();
     }
 
     takeDeferred &self -> Vec<long> {
@@ -852,6 +935,11 @@ methods Checker {
             return none;
         }
         if (st.kind == StmtKind.While) { return self.blockReturnType(a, a.whiles.get(st.at).body); }
+        if (st.kind == StmtKind.Recover) {
+            r: VarType = self.blockReturnType(a, a.whiles.get(st.at).body);
+            if (r.kind != Lit.Void) { return r; }
+            return self.blockReturnType(a, a.whiles.get(st.at).step);
+        }
         if (st.kind == StmtKind.Loop || st.kind == StmtKind.Unsafe || st.kind == StmtKind.Block) {
             return self.blockReturnType(a, a.blockStmts.get(st.at).body);
         }
@@ -895,8 +983,8 @@ methods Checker {
                 self.desugarArrayAssign(a, b, k);
                 st = a.stmtAt(b, k);
             }
-            // `m!(...)` as a statement: what the macro returns replaces the statement -- a
-            // Block of the statements it produced, or an expression as an expression statement.
+            // `m!(...)` as a statement: what the macro returns replaces the statement, either as a
+            // Block of the statements it produced or as an expression statement.
             if (st.kind == StmtKind.Expr && a.expr(a.exprStmts.get(st.at).value).op == Op.MacroCall) {
                 self.expandMacroStmt(a, a.stmtIdAt(b, k));
                 st = a.stmtAt(b, k);
@@ -958,13 +1046,13 @@ methods Checker {
         n: long = self.placeArrayLen(a, place);
         et: VarType = self.placeIsArray(a, place);
         if (n < 0 || !et.isArray) {
-            failStr(stringOf("`[a, b, ...]` is an array literal, and it is assigned only to an array: a local, a parameter, a global or a field of one (`xs = [...]`, `s.cells = [...]`)"));
+            failStr(stringOf("cannot assign an array literal to this place\nnote: an array literal `[a, b, ...]` is assigned whole only to an array: a local, a parameter, a global or a field of one (`xs = [...]`, `s.cells = [...]`)"));
         }
         lit: Expr = a.expr(e.right);
         ln: LitNode = a.lits.get(0);
         match lit.payload { Lit(l) { ln = a.lits.get(l); } _ { } }
         if (ln.initCount != n) {
-            failStr(format("an array of {} element(s) is given {} -- an array literal names every element",
+            failStr(format("wrong number of elements in an array literal: expected {}, found {}\nnote: an array literal names every element of the array",
                            n, ln.initCount));
         }
         ids: Vec<long>;
@@ -1008,14 +1096,14 @@ methods Checker {
                 q: Sym = self.resolveVar(n);
                 hit: Option<long> = self.arrayLens.find(nameOf(q));
                 match hit { Some(c) { if (self.locals.has(nameOf(q))) { return c; } } None { } }
-                gi: long = gReg.findGlobal(nameOf(q));
+                gi: long = gReg.findGlobalSym(q);
                 if (gi >= 0 && gReg.globalDef(gi).isArray) { return gReg.globalDef(gi).count; }
             }
             Field(f) {
                 fd: FieldNode = a.fields.get(f);
                 bt: VarType = self.placeIsArray(a, fd.base);
                 if (bt.isArray || (bt.kind != Lit.Struct && bt.kind != Lit.Ref)) { return -1; }
-                si: long = gReg.findStruct(nameOf(bt.structName));
+                si: long = gReg.findStructSym(bt.structName);
                 if (si < 0) { return -1; }
                 d: StructDef = gReg.structDef(si);
                 fi: long = gReg.findFieldSym(d, fd.name);
@@ -1044,21 +1132,29 @@ methods Checker {
         id: long = a.stmtIdAt(b, k);
         ds: DestructureNode = a.destructures.get(a.stmts.get(id).at);
         t: VarType = self.checkExpr(a, ds.value);
+        // A tuple, as a value or as a borrow of one (`v.at(i)`, `v[i]`): not a pointer to one, nor
+        // a slice of them, whose type names a tuple too.
+        isRef: bool = t.kind == Lit.Ref;
         si: long = -1;
-        if (isTupleName(t.structName)) { si = gReg.findStruct(nameOf(t.structName)); }
+        if ((t.kind == Lit.Tuple || t.kind == Lit.Struct || isRef) && !t.isArray && isTupleName(t.structName)) {
+            si = gReg.findStructSym(t.structName);
+        }
         if (si < 0) {
-            failStr(format("destructuring needs a tuple, not '{}'",
+            failStr(format("cannot destructure a value of type `{}`\nnote: only a tuple can be taken apart into names",
                            typeMangleName(t.kind, t.structName)));
         }
         d: StructDef = gReg.structDef(si);
         if (d.fieldCount != ds.nameCount) {
-            failStr(format("destructuring {} name(s) from a {}-tuple",
-                           ds.nameCount, d.fieldCount));
+            failStr(format("cannot destructure a {}-element tuple into {}",
+                           d.fieldCount, plural(ds.nameCount, "name")));
         }
         // A tuple's own kind is `Lit.Tuple`, which only the type table knows the shape of; as the
         // struct it is registered as, every path that sizes, copies or reads a field of an
-        // aggregate already handles it.
-        self.stamp(a, ds.value, varType(Lit.Struct, t.structName));
+        // aggregate already handles it. A borrow keeps its type: the hidden local reads what it
+        // points at, and a destructure through a borrow makes its names borrows of it
+        // (`bmDestructure`). Stamped as the tuple, the call returning it would have been called as
+        // one returning a tuple, with a result slot it never fills ahead of its arguments.
+        if (!isRef) { self.stamp(a, ds.value, varType(Lit.Struct, t.structName)); }
 
         // Each written as a declaration and a store, the shape the parser gives `x: T = v;`, so
         // the ownership walk sees each name take its field out of the hidden local (a partial
@@ -1174,8 +1270,8 @@ methods Checker {
         // of passing a value, not of holding one, which is why parameters may be `&T` and
         // locals may not.
         if (self.curFn >= 0 && self.unsafeDepth == 0 && d.kind == Lit.Ref && !isTempName(d.name)) {
-            failStr(format("'{}' is a {}, and a borrow cannot be held in a local — it lives only across the call that makes it; take the value, or use it where it is made",
-                           nameOf(d.name), self.spellType(d.kind, d.structName)));
+            failStr(format("cannot hold a borrow in the local `{}`\nnote: `{}` has type `{}`, and a borrow lives only across the call that makes it\nhelp: take the value, or use it where it is made",
+                           nameOf(d.name), nameOf(d.name), self.spellType(d.kind, d.structName)));
         }
         if (d.init == NO_NODE) {
             self.defaultInit(a, st.at, d);
@@ -1192,17 +1288,18 @@ methods Checker {
             for k in 0..ln.initCount {
                 v: NodeId = a.inits.get(ln.firstInit + k).value;
                 self.requireAssignable(a, varType(d.kind, d.structName), self.checkAimed(a, v, d.structName), v,
-                                       keepString(format("element {} of '{}'", k, nameOf(d.name))));
+                                       keepString(format("element {} of `{}`", k, nameOf(d.name))));
             }
             if (self.curFn < 0 && !gUpstreamPkgs.isEmpty()) { self.ctReachExpr(a, d.init); self.drainWalk(a); self.rtWalkExpr(a, d.init); }
             return;
         }
-        // `keepString`, not the `String` itself: `what` is declared `str`, and handing a
-        // String to it read the first 16 bytes of a 24-byte value. That worked only because
-        // {ptr,len} is a prefix of {ptr,len,cap} -- the new argument check is what found it.
+        // `keepString`, not the `String` itself: `what` is declared `str`, and handing it a String
+        // would read the first 16 bytes of a 24-byte value. That happens to work, because
+        // {ptr,len} is a prefix of {ptr,len,cap}, but the argument check rightly refuses it.
         self.requireAssignable(a, VarType { kind: d.kind, structName: d.structName, isArray: d.isArray },
                                self.checkAimed(a, d.init, d.structName), d.init,
-                               keepString(format("'{}'", nameOf(d.name))));
+                               keepString(format("`{}`", nameOf(d.name))));
+        if (d.isArray) { self.requireArrayLen(a, d.count, d.init, keepString(format("`{}`", nameOf(d.name)))); }
         // A global's initializer is run by the evaluator, so whatever upstream code it can
         // reach has to be checked here before that happens.
         if (self.curFn < 0 && !gUpstreamPkgs.isEmpty()) { self.ctReachExpr(a, d.init); self.drainWalk(a); self.rtWalkExpr(a, d.init); }
@@ -1230,7 +1327,7 @@ methods Checker {
                 if (self.late.stampBody(a, st.at)) {
                     self.deferredFns.push(self.curStmt);
                     self.deferReason.clear();
-                    self.deferReason.pushString(format("'{}' waits for the instances its body names to be stamped", key));
+                    self.deferReason.pushString(format("`{}` waits for the instances its body names to be stamped", key));
                     return;
                 }
                 f = a.fns.get(st.at);
@@ -1251,7 +1348,7 @@ methods Checker {
             self.fnDone.put(nameOf(f.name), true);
             // `main`'s result is the exit status (its low 8 bits): any integer type says one.
             if (nameOf(f.name) == "main" && !isInteger(f.returnKind)) {
-                failStr(format("'main' returns {}, and its result is the process's exit status -- declare it `-> int` or `-> long` (any integer type; the low 8 bits are the status)",
+                failStr(format("`main` has invalid return type `{}`\nnote: its result is the process's exit status (the low 8 bits), so it must be an integer\nhelp: declare it `-> int` or `-> long` (any integer type)",
                                self.spellType(f.returnKind, f.returnStruct)));
             }
             was: VarType = self.currentReturn;
@@ -1266,8 +1363,8 @@ methods Checker {
             wasCtx: Sym = gCtxFn;
             wasInst: Sym = gCtxInst;
             enterFn(f.name);
-            // An `unsafe` function's body is one trusted region from its first statement, which
-            // is also how the parser marks a closure's `call`, whose body it wrote itself.
+            // An `unsafe` function's body is one trusted region from its first statement. So is a
+            // closure's `call` written inside `unsafe` code, and no other.
             self.unsafeDepth = 0;
             if (f.isUnsafe) { self.unsafeDepth = 1; }
             self.currentModule = intern(stemOf(nameOf(f.file)));
@@ -1324,6 +1421,20 @@ methods Checker {
             return;
         }
         if (st.kind == StmtKind.If) { self.checkIf(a, st.at); return; }
+        // A `raise` under the body abandons every frame between it and here without releasing
+        // what they own, which is what makes a `recover` unsafe.
+        if (st.kind == StmtKind.Recover) {
+            self.requireUnsafe("`recover`");
+            if (self.recoverTarget(a) == NO_SYM) {
+                failStr(stringOf("`recover` needs its runtime from `stdlib::recover`
+note: no function in the program is marked `@recover`
+help: add `#include <stdlib::recover>`"));
+            }
+            w: WhileNode = a.whiles.get(st.at);
+            self.checkBlock(a, w.body);
+            self.checkBlock(a, w.step);
+            return;
+        }
         if (st.kind == StmtKind.While) {
             w: WhileNode = a.whiles.get(st.at);
             self.checkExpr(a, w.cond);
@@ -1378,6 +1489,19 @@ methods Checker {
             for k in 0..n.pieceCount {
                 p: AsmPiece = a.asmPieces.get(n.firstPiece + k);
                 if (p.value != NO_NODE) { self.checkExpr(a, p.value); }
+                // An `out` names what it writes the way a read names what it reads: a local
+                // first, then a global of this module or one it sees, held to that global's
+                // visibility. The piece takes the global's own name, so the passes after this
+                // one, and the lowerer that stores through it, see the global and not a slot
+                // that happens to share its spelling.
+                if (p.kind == AsmKind.Out) {
+                    q: Sym = self.resolveVar(p.name);
+                    if (!self.locals.has(nameOf(q))) {
+                        if (gReg.findGlobalSym(q) < 0) { failStr(format("cannot find value `{}` in this scope", nameOf(p.name))); }
+                        self.requireGlobalVisible(q);
+                    }
+                    if (q != p.name) { p.name = q; a.asmPieces.set(n.firstPiece + k, p); }
+                }
             }
             return;
         }
@@ -1428,6 +1552,7 @@ methods Checker {
             self.refuseStrStore(a, e.left, lt);
             rt = self.checkAimed(a, e.right, lt.structName);
             self.requireAssignable(a, lt, rt, e.right, self.placeName(a, e.left));
+            if (lt.isArray) { self.requireArrayLen(a, self.placeArrayLen(a, e.left), e.right, self.placeName(a, e.left)); }
             // A borrowed view stored into a field outlives the call that lent it: the struct
             // keeps the pointer and the frame it points into is left. Building one in a struct
             // literal is a different question (there the value and the struct are made together
@@ -1436,9 +1561,9 @@ methods Checker {
                 && self.holdsView(lt.kind, lt.structName, 0)) {
                 fldName: str = "this field";
                 pf: Payload = a.expr(e.left).payload;
-                match pf { Field(fi) { fldName = keepString(format("'{}'", nameOf(a.fields.get(fi).name))); } _ { } }
-                failStr(format("{} is {}, and storing one in a field keeps a pointer to a frame the call will leave",
-                               fldName, self.spellType(lt.kind, lt.structName)));
+                match pf { Field(fi) { fldName = keepString(format("the field `{}`", nameOf(a.fields.get(fi).name))); } _ { } }
+                failStr(format("cannot store a value of type `{}` in {}\nnote: `{}` holds a borrowed view, and a field would keep it after the call that lent it has left its frame",
+                               self.spellType(lt.kind, lt.structName), fldName, self.spellType(lt.kind, lt.structName)));
             }
         } else { rt = self.checkExpr(a, e.right); }
 
@@ -1461,21 +1586,21 @@ methods Checker {
                     ne.kind = sk; ne.structName = NO_SYM;
                     a.setExpr(id, ne);
                 }
-                // A name nothing declares. Answering `void` for it let `foo.bar()` on an
-                // undeclared `foo` reach the assembler as a call to `mfn_bar`. A function's or
-                // a type's name standing where a value is read is left to what reads it.
+                // A name nothing declares. Typing it as `void` would let `foo.bar()` on an
+                // undeclared `foo` reach the assembler as a call to `mfn_bar`. A function's or a
+                // type's name standing where a value is read is left to whatever reads it.
                 if (t.kind == Lit.Void && !self.vars.has(nameOf(q)) && !self.fnNames.has(nameOf(n))
                     && !self.fnAt.has(nameOf(q)) && !self.fnAt.has(nameOf(n)) && !self.namesType(n)
                     && !namesScalar(nameOf(n))) {
-                    failStr(format("'{}' is not declared", nameOf(n)));
+                    failStr(format("cannot find value `{}` in this scope", nameOf(n)));
                 }
-                // A function's name where a value is read: a fn value is `&name` (language.md,
-                // "Function pointers"). Taken bare it typed as nothing, passed every check, and
-                // lowered as a load of a global no one declared: the call through it crashed.
+                // A function's name where a value is read. A fn value is written `&name`; taken
+                // bare, the name would type as nothing, pass every check, and lower as a load of
+                // a global nobody declared, so a call through it would crash.
                 if (t.kind == Lit.Void && e.kind != Lit.Fn && self.addrOperand != id
                     && !self.vars.has(nameOf(q)) && !self.namesType(n) && !namesScalar(nameOf(n))
                     && (self.fnNames.has(nameOf(n)) || self.fnAt.has(nameOf(q)) || self.fnAt.has(nameOf(n)))) {
-                    failStr(format("'{}' is a function: write `&{}` to use it as a fn value, or call it",
+                    failStr(format("`{}` is a function, not a value\nhelp: write `&{}` to use it as a fn value, or call it",
                                    nameOf(n), nameOf(n)));
                 }
             }
@@ -1495,7 +1620,10 @@ methods Checker {
                         return inner;
                     }
                     view: bool = (e.kind == Lit.Str || e.kind == Lit.Slice) && (inner.kind == Lit.Str || inner.kind == Lit.Slice);
-                    if (!view) { failStr(format("cannot cast a {} to a {}", typeName(inner.kind), typeName(e.kind))); }
+                    if (!view) {
+                        failStr(format("cannot cast `{}` to `{}`\nnote: a cast converts one scalar to another, and only a slice and a `str` convert between each other as views",
+                                       self.spellType(inner.kind, inner.structName), self.spellType(e.kind, e.structName)));
+                    }
                 }
                 t = self.checkSub(a, id, inner);
             }
@@ -1504,7 +1632,7 @@ methods Checker {
             Index(i) { t = self.checkIndex(a, id, i); }
             Lit(l)   {
                 if (e.op == Op.ArrayLit) {
-                    failStr(stringOf("`[a, b, ...]` is an array literal, and it initializes an array where one is declared (`xs: [T; N] = [...]`) or is assigned to one as a whole (`xs = [...]`)"));
+                    failStr(stringOf("an array literal cannot be used here\nnote: an array literal `[a, b, ...]` initializes an array where one is declared (`xs: [T; N] = [...]`), or is assigned to one as a whole (`xs = [...]`)"));
                 }
                 self.checkLit(a, l);
                 if (e.op == Op.TupleLit) { t = self.tupleOfElems(a, id, l); }
@@ -1517,10 +1645,10 @@ methods Checker {
         return t;
     }
 
-    // A `match` on an expression whose type the parser could not know (`match f() { ... }`): its
+    // A `match` on an expression whose type the parser could not know (`match f() { ... }`). Its
     // arms were read by name, spelled `?V`, and are held to the subject's type here, where it is
-    // known -- each variant one the type has, its payload named in full, no variant twice, every
-    // variant handled -- and given the tests the parser gives a typed match.
+    // known: each variant must be one the type has, with its payload named in full, and every
+    // variant must be handled. Then each arm gets the test the parser gives a typed match.
     resolveMatch &self inout a:Ast at:long -> void {
         m: MatchNode = a.matches.get(at);
         pending: bool = false;
@@ -1534,15 +1662,15 @@ methods Checker {
         en: long = -1;
         ti: long = -1;
         if (owner != NO_SYM) {
-            en = gReg.findEnum(nameOf(owner));
+            en = gReg.findEnumSym(owner);
             if (en < 0) {
-                r: long = gReg.findRequest(nameOf(owner));
-                if (r >= 0) { ti = gReg.findTemplate(nameOf(gReg.requestAt(r).base)); }
+                r: long = gReg.findRequestSym(owner);
+                if (r >= 0) { ti = gReg.findTemplateSym(gReg.requestAt(r).base); }
                 if (ti < 0) { ti = gReg.templateOfInstance(nameOf(owner)); }
             }
         }
         if (en < 0 && ti < 0) {
-            failStr(format("`match` reads an enum, and this is a {}", self.spellType(t.kind, t.structName)));
+            failStr(format("cannot `match` on a value of type `{}`\nnote: `match` reads an enum", self.spellType(t.kind, t.structName)));
         }
         backing: Lit = Lit.Int;
         hasPayload: bool = true;
@@ -1573,12 +1701,15 @@ methods Checker {
                 vi: long = gReg.findGVariant(tp, vs);
                 if (vi >= 0) { gv: GVariant = gReg.gVariantAt(tp, vi); value = gv.value; arity = gv.payloadCount; }
             }
-            if (arity < 0) { failStr(format("enum {} has no variant '{}'", shown, vs)); }
-            if (arity == 0 && arm.bindCount > 0) { failStr(format("variant '{}' carries no payload", vs)); }
+            if (arity < 0) { failStr(format("no variant `{}` in enum `{}`", vs, shown)); }
+            if (arity == 0 && arm.bindCount > 0) { failStr(format("variant `{}` carries no payload, so its arm binds no names", vs)); }
             if (arity != arm.bindCount && arm.bindCount < arity) {
-                failStr(format("variant '{}' carries {} value(s) — name them, as {}(...)", vs, arity, vs));
+                failStr(format("too few names for the payload of `{}`: expected {}, found {}\nhelp: name every value it carries, as `{}(...)`",
+                               vs, arity, arm.bindCount, vs));
             }
-            if (arity != arm.bindCount) { failStr(format("variant '{}' carries only {} value(s)", vs, arity)); }
+            if (arity != arm.bindCount) {
+                failStr(format("too many names for the payload of `{}`: expected {}, found {}", vs, arity, arm.bindCount));
+            }
             covered.push(vn);
             arm.variant = vn;
             if (k + 1 < m.armCount) {
@@ -1602,7 +1733,7 @@ methods Checker {
                 if (en >= 0) { want = gReg.variantAt(gReg.enumDef(en), v).name; }
                 else { want = gReg.gVariantAt(gReg.templateDef(ti), v).name; }
                 if (!symIn(covered, want)) {
-                    failStr(format("match on {} does not cover {} — every variant must be handled, or add a `_` arm",
+                    failStr(format("`match` on `{}` does not cover `{}`\nhelp: handle every variant, or add a `_` arm",
                                    shown, nameOf(want)));
                 }
             }
@@ -1610,9 +1741,9 @@ methods Checker {
     }
 
     // `operand?` is written out through the core trait `Try` (`Parser.wrapTry`), its operand held
-    // in a hidden `$tryN`. Whether expression `id` reads that local: the local itself, or a call
-    // on it (`$tryN.residual()` handed to `fromResidual`). What lets a failure in those parts be
-    // said as the `?` it is, rather than as calls the source never wrote.
+    // in a hidden `$tryN`. Answers whether expression `id` reads that local: the local itself, or
+    // a call on it (`$tryN.residual()` handed to `fromResidual`). This is what lets a failure in
+    // those parts be reported as the `?` it is, rather than as calls the source never wrote.
     readsTryLocal &self inout a:Ast id:NodeId -> bool {
         if (id == NO_NODE) { return false; }
         e: Expr = a.expr(id);
@@ -1642,17 +1773,20 @@ methods Checker {
     }
     // The operand of a `?` has no `Try` (its `isBreak` is missing).
     refuseTryOperand &self t:VarType -> never {
-        failStr(format("`?` reads a value implementing `Try` (a Result or an Option) -- this is a {}",
+        failStr(format("cannot apply `?` to `{}`\nnote: `?` reads a value whose type implements `Try`, such as a `Result` or an `Option`",
                        self.spellType(t.kind, t.structName)));
     }
-    // A `?`'s failure goes back as it is: the operand's `Try` residual is what the return type's
-    // `fromResidual` takes (`want`, Void where only the return type is known), or the two do not
-    // fit.
+    // A `?`'s failure goes back as it is, so the operand's `Try` residual has to be what the return
+    // type's `fromResidual` takes (`want`, Void where only the return type is known). Here the two
+    // do not fit.
     refuseTryResidual &self have:VarType want:VarType -> never {
         rt: VarType = self.currentReturn;
         errs: str = "";
-        if (want.kind != Lit.Void) { errs = keepString(format(", whose errors are {}", self.spellType(want.kind, want.structName))); }
-        failStr(format("`?` hands the error back as it is, and this fails with a {} where the function returns {}{} -- convert it first (`?` does not)",
+        if (want.kind != Lit.Void) {
+            errs = keepString(format("\nnote: `{}` takes failures of type `{}`", self.spellType(rt.kind, rt.structName),
+                                     self.spellType(want.kind, want.structName)));
+        }
+        failStr(format("`?` cannot hand back a failure of type `{}` from a function that returns `{}`{}\nnote: `?` returns the failure as it is, without converting it\nhelp: convert it to the function's failure type first",
                        self.spellType(have.kind, have.structName), self.spellType(rt.kind, rt.structName), errs));
     }
 
@@ -1675,10 +1809,10 @@ methods Checker {
         rt: VarType = self.checkExpr(a, e.right);
         discard: bool = strStartsWith(lastComponentOf(nameOf(tgt)), "$disc");
         if (rt.kind == Lit.Void) {
-            if (discard) { failStr(stringOf("`_ = ...` discards a value, and this gives none")); }
-            failStr(stringOf("`match` reads a value, and this gives none"));
+            if (discard) { failStr(stringOf("this expression has no value for `_ = ...` to discard")); }
+            failStr(stringOf("this expression has no value to `match` on"));
         }
-        if (rt.isArray) { failStr(stringOf("an array is not a value to discard or match: name it")); }
+        if (rt.isArray) { failStr(stringOf("cannot discard or `match` on a whole array\nhelp: give it a name first, and use that")); }
         // A `&self` of a scalar or a `str` is the value (`scalarRefKind`); a literal its type.
         if (scalarRefKind(rt) != Lit.Void) { rt = varType(scalarRefKind(rt), NO_SYM); }
         d: VarDeclNode = a.decls.get(at);
@@ -1708,19 +1842,28 @@ methods Checker {
     // caller's value, as `p.x = v` writes the caller's field. The target becomes `*p`
     // (`lentPlaceOf`), typed as the value, and from there every pass treats it as a store to a
     // place: the old value is released after the new one is built, the new one is moved in, and a
-    // borrow on the right is copied from, or refused when it owns something. Before, the store
-    // re-aimed the parameter's own pointer and the caller saw nothing. A `&self` of a scalar (a
-    // backed enum, a distinct type) receives the value itself, so there is no caller's value to
-    // write and the store is refused. A borrow the function declares for itself (a `for x in &xs`
-    // element, a match binding through a borrow, an `unsafe` `&T` local) keeps its own rules.
+    // borrow on the right is copied from, or refused when it owns something. Without this, the
+    // store would re-aim the parameter's own pointer and the caller would see nothing. A `&self`
+    // of a scalar (a backed enum, a distinct type) receives the value itself, so there is no
+    // caller's value to write and the store is refused. A borrow the function declares for itself
+    // (a `for x in &xs` element, a match binding through a borrow, an `unsafe` `&T` local) keeps
+    // its own rules.
+    //
+    // A struct a closure captured is a lent place too: the closure holds a borrow of it in the
+    // field `__cl.t`, so `t = v` in the body writes the variable it was built over, as `t.x = v`
+    // does, and not the closure's own pointer.
     lendWhole &self inout a:Ast id:NodeId lt:VarType -> VarType {
         e: Expr = a.expr(id);
-        if (e.op != Op.Lvalue || self.curFn < 0) { return lt; }
+        if (self.curFn < 0) { return lt; }
         n: Sym = NO_SYM;
-        match e.payload { Name(x) { n = x; } _ { } }
-        if (n == NO_SYM) { return lt; }
-        f: FnNode = a.fns.get(self.curFn);
+        match e.payload { Name(x) { if (e.op == Op.Lvalue) { n = x; } } _ { } }
         lent: bool = false;
+        if (n == NO_SYM) {
+            if (!self.captureField(a, id) || lt.structName == NO_SYM) { return lt; }
+            lent = true;
+            match e.payload { Field(i) { n = a.fields.get(i).name; } _ { } }
+        }
+        f: FnNode = a.fns.get(self.curFn);
         k: long = 0;
         while (k < f.argCount && !lent) {
             p: VarDeclNode = a.paramAt(f, k);
@@ -1729,7 +1872,7 @@ methods Checker {
         }
         if (!lent) { return lt; }
         if (namedScalar(Lit.Struct, lt.structName)) {
-            failStr(format("cannot assign to '{}': a `&self` of {} receives the value itself (it is a scalar), so the store would change only this call's copy -- return the new value instead",
+            failStr(format("cannot assign to `{}`\nnote: a `&self` of `{}` receives the value itself (it is a scalar), so the store would change only this call's copy\nhelp: return the new value instead",
                            nameOf(n), self.spellType(Lit.Struct, lt.structName)));
         }
         inner: NodeId = a.addExpr(e);
@@ -1749,7 +1892,7 @@ methods Checker {
         match e.payload { Name(x) { n = x; } _ { return; } }
         t: VarType = self.lookup(self.resolveVar(n));
         if (scalarRefKind(t) == Lit.Void) { return; }
-        failStr(format("cannot assign to '{}': a `&self` of {} receives the value itself (it is a scalar), so the store would change only this call's copy -- return the new value instead",
+        failStr(format("cannot assign to `{}`\nnote: a `&self` of `{}` receives the value itself (it is a scalar), so the store would change only this call's copy\nhelp: return the new value instead",
                        nameOf(n), typeName(scalarRefKind(t))));
     }
 
@@ -1761,7 +1904,7 @@ methods Checker {
         n: LitNode = a.lits.get(at);
         // A closure literal's initializers are not the author's: the parser wrote them, and a
         // scalar capture is `&x` (a raw address) because that is how a write inside the closure
-        // reaches the original. Trusted for the same reason the `call` body is.
+        // reaches the original. Trusted, as the body's reads through them are (`captureRead`).
         if (isClosureStruct(n.typeName)) {
             self.unsafeDepth = self.unsafeDepth + 1;
             self.checkLitFields(a, at);
@@ -1773,24 +1916,24 @@ methods Checker {
 
     checkLitFields &self inout a:Ast at:long -> void {
         n: LitNode = a.lits.get(at);
-        si: long = gReg.findStruct(nameOf(n.typeName));
+        si: long = gReg.findStructSym(n.typeName);
         // `..rest` supplies every field not named, so the count is not the question, where the
         // rest come from is. It is a copy, so a type that owns something is refused.
         if (n.rest != NO_NODE) {
             if (si >= 0 && gReg.structDef(si).isEnum) {
-                failStr(format("`..` has no meaning for the sum type {} — a value covers one variant",
+                failStr(format("cannot use `..` in a literal of the sum type `{}`\nnote: a value of a sum type holds one variant, so there are no remaining fields to fill",
                                nameOf(n.typeName)));
             }
             // `..` copies the fields it was not given, and a type that owns something cannot be
             // copied that way: the base and the new value would both release the same buffer.
             if (gReg.needsDrop(n.typeName)) {
-                failStr(format("{} owns something, so `..` cannot copy the rest of it — name every field, or clone the base first",
-                               nameOf(n.typeName)));
+                failStr(format("cannot copy the remaining fields of `{}` with `..`\nnote: `{}` owns something, and the base and the new value would both release it\nhelp: name every field, or clone the base first",
+                               nameOf(n.typeName), nameOf(n.typeName)));
             }
             r: VarType = self.checkExpr(a, n.rest);
             if (!(r.kind == Lit.Struct || r.kind == Lit.Ref) || r.structName != n.typeName) {
-                failStr(format("`..` needs a {} to take the remaining fields from",
-                               nameOf(n.typeName)));
+                failStr(format("mismatched types: expected `{}`, found `{}`\nnote: `..` takes the remaining fields from a value of the literal's own type",
+                               nameOf(n.typeName), self.spellType(r.kind, r.structName)));
             }
         }
         k: long = 0;
@@ -1815,12 +1958,14 @@ methods Checker {
                 continue;
             }
             vt: VarType = self.checkAimed(a, iv.value, f.structName);
-            // Held to the field's type as a store to it is: a `Node` where a `Box<Node>` is
-            // declared was accepted, and the box's pointer read the node's first word. A
-            // closure's captures are the parser's (`&x` into a `&T` field) and are not asked.
+            // Held to the field's type as a store to it is. Otherwise a `Node` where a `Box<Node>`
+            // is declared would be accepted, and the box's pointer would read the node's first
+            // word. A closure's captures are the parser's (`&x` into a `&T` field) and are not
+            // asked.
             if (!isClosureStruct(n.typeName)) {
                 self.requireAssignable(a, VarType { kind: f.kind, structName: f.structName, isArray: f.isArray },
                                        vt, iv.value, litFieldWhat(f.name));
+                if (f.isArray) { self.requireArrayLen(a, f.count, iv.value, litFieldWhat(f.name)); }
             }
             if (f.kind == Lit.TraitObj && a.expr(iv.value).kind == Lit.Struct) {
                 self.aimTraitObj(a, a.expr(iv.value).structName, f.structName);
@@ -1846,13 +1991,13 @@ methods Checker {
         ln: LitNode = a.lits.get(0);
         match e.payload { Lit(l) { ln = a.lits.get(l); } _ { } }
         if (ln.initCount != f.count) {
-            failStr(format("an array of {} element(s) is given {} -- an array literal names every element",
+            failStr(format("wrong number of elements in an array literal: expected {}, found {}\nnote: an array literal names every element of the array",
                            f.count, ln.initCount));
         }
         for j in 0..ln.initCount {
             v: NodeId = a.inits.get(ln.firstInit + j).value;
             self.requireAssignable(a, varType(f.kind, f.structName), self.checkAimed(a, v, f.structName), v,
-                                   keepString(format("element {} of field '{}'", j, nameOf(f.name))));
+                                   keepString(format("element {} of field `{}`", j, nameOf(f.name))));
         }
         e.kind = f.kind;
         e.structName = f.structName;
@@ -1863,7 +2008,7 @@ methods Checker {
     // struct that owns nothing and a sum type whose zero is a variant with no payload (`Option`'s
     // is `None`), and those stay zero-filled. An omitted field whose type implements `Default`
     // gets its default (`T.new()`, an initializer of its own). One that owns a resource and has no
-    // default is refused: zeroed, a `File` was fd 0, and releasing it closed stdin.
+    // default is refused: a zeroed `File` would be fd 0, and releasing it would close stdin.
     fillOmitted &self inout a:Ast at:long d:StructDef -> void {
         n: LitNode = a.lits.get(at);
         extra: Vec<InitNode>;
@@ -1886,8 +2031,8 @@ methods Checker {
                 self.checkExpr(a, v);
                 extra.push(InitNode { name: f.name, value: v });
             } else if (gReg.needsDrop(f.structName)) {
-                failStr(format("field '{}' of type {} must be given: it owns a resource and has no default",
-                               fieldSpelling(f.name), self.spellType(Lit.Struct, f.structName)));
+                failStr(format("missing field `{}` of type `{}`\nnote: `{}` owns a resource and has no default, so the field cannot be left out",
+                               fieldSpelling(f.name), self.spellType(Lit.Struct, f.structName), self.spellType(Lit.Struct, f.structName)));
             }
         }
         if (extra.len() == 0) { return; }
@@ -1914,24 +2059,52 @@ methods Checker {
         if (self.unsafeDepth > 0) { return; }
         s: String;
         s.pushStr(what);
-        s.pushStr(" is only allowed inside an `unsafe { }` block");
+        s.pushStr(" is only allowed in an `unsafe` block or function");
         failStr(s);
+    }
+
+    // `*__cl.n` in a closure's `call`: the parser's read of a scalar it captured by pointer
+    // (`Parser.captureOf`), through the receiver it declared. The field holds the address of a
+    // variable the closure was built over, so the read is the compiler's, not the author's, and
+    // safe code may hold it. The receiver is known by being the call's first parameter with the
+    // capture struct's type: a local of that name in safe code could not hold that borrow.
+    captureRead &self inout a:Ast id:NodeId -> bool {
+        v: NodeId = NO_NODE;
+        match a.expr(id).payload { Sub(x) { v = x; } _ { return false; } }
+        return self.captureField(a, v);
+    }
+
+    // `__cl.x` in a closure's `call`: a capture, read off the receiver the parser declared.
+    captureField &self inout a:Ast id:NodeId -> bool {
+        if (self.curFn < 0 || id == NO_NODE) { return false; }
+        fe: Expr = a.expr(id);
+        if (fe.op != Op.FieldAccess) { return false; }
+        base: NodeId = NO_NODE;
+        match fe.payload { Field(i) { base = a.fields.get(i).base; } _ { return false; } }
+        be: Expr = a.expr(base);
+        if (be.op != Op.Lvalue) { return false; }
+        n: Sym = NO_SYM;
+        match be.payload { Name(x) { n = x; } _ { return false; } }
+        f: FnNode = a.fns.get(self.curFn);
+        if (f.argCount == 0 || a.paramAt(f, 0).name != n || !isClosureCall(f.name)) { return false; }
+        t: VarType = self.lookup(n);
+        return t.kind == Lit.Ref && isClosureStruct(t.structName);
     }
 
     // An `unsafe` function may only be called from an unsafe context. That is what declaring one
     // `unsafe` means, and it applies to methods too, which reach here as ordinary calls.
     //
-    // A closure's `call` is the exception, and only because the parser marks it `unsafe` for a
-    // different reason: its body reads captures through raw pointers the compiler itself wrote, so
-    // it is a trusted region rather than a dangerous function. Nobody wrote `unsafe` on a closure.
+    // A closure's `call` is the exception. It is `unsafe` only when it was written inside
+    // `unsafe` code, whose author vouched for its body where it stands; whoever is handed the
+    // closure calls it as any other.
     requireSafeCallee &self inout a:Ast fn:Sym -> void {
         if (isClosureCall(fn)) { return; }
         at: long = self.fnNodeOf(fn);
         if (at < 0 || !a.fns.get(at).isUnsafe) { return; }
         s: String;
-        s.pushStr("calling the unsafe function '");
+        s.pushStr("calling the unsafe function `");
         s.pushStr(nameOf(fn));
-        s.push(''');
+        s.push('`');
         self.requireUnsafe(keepString(s));
     }
 
@@ -1946,13 +2119,14 @@ methods Checker {
         return NO_SYM;
     }
 
-    // A value in memory, as a cast sees it: a struct, a str, a slice -- not an enum, which is
-    // `Struct`-kinded but a scalar underneath, and casts to its backing integer.
+    // A value in memory, as a cast sees it: a struct, a str or a slice. A backed enum is not one:
+    // it is `Struct`-kinded but a scalar underneath, and casts to its backing integer.
     aggregateType &self k:Lit n:Sym -> bool {
         if (!isAggregate(k)) { return false; }
         // A backed enum is its backing integer and casts like one. A sum type is not: it is a tag
-        // and a payload, and casting one to an integer reads its tag by accident. Asking
-        // `findEnum` alone exempted both, which is what let `Shape.Empty as long` through.
+        // and a payload, and casting one to an integer would read its tag by accident. That is
+        // why this asks `isBackedEnum` and not `findEnum`, which would let `Shape.Empty as long`
+        // through.
         if (k == Lit.Struct && isBackedEnum(n)) { return false; }
         return true;
     }
@@ -1967,9 +2141,13 @@ methods Checker {
             if (scalarRefKind(inner) != Lit.Void) { fromK = scalarRefKind(inner); }
             toK: Lit = storedKind(e.kind, e.structName);
             if ((isFloat(fromK) || isFloat(toK)) && !((isFloat(fromK) || isInteger(fromK)) && (isFloat(toK) || isInteger(toK)))) {
-                failStr(format("cannot convert a {} to a {}: a float converts only to and from the integers and the other float width",
+                failStr(format("cannot cast `{}` to `{}`\nnote: a float converts only to and from the integers and the other float width",
                                self.spellType(inner.kind, inner.structName), self.spellType(e.kind, e.structName)));
             }
+            // A fn value made of a raw word (a vtable slot read through a pointer, as `fmt.k`'s
+            // `callDisplay` does): its type is noted, since a call through one may reach any
+            // implementation the compiler placed in a vtable (`ConstGuard.rawFits`).
+            if (e.kind == Lit.Fn && inner.kind != Lit.Fn && e.structName != NO_SYM) { gRawFnSigs.push(e.structName); }
             return varType(e.kind, e.structName);
         }
         // `&name` of a function is a function pointer, not an address: it is what a `fn` variable
@@ -1978,6 +2156,10 @@ methods Checker {
             fs: Sym = self.addressedFn(a, id);
             if (fs != NO_SYM) {
                 gAddressedFns.push(self.addressedName(a, id));
+                gAddressedSigs.push(fs);
+                // A global's initializer is in no body the convention walk judges, so its `&f`
+                // is kept for `enforceGlobalFnRefs`.
+                if (self.curFn < 0) { self.globalFnRefs.push(id); self.globalFnRefPos.push(gPos); }
                 // A safe caller could otherwise smuggle an unsafe function out through a pointer.
                 at: long = self.fnNodeOf(self.addressedName(a, id));
                 if (at >= 0 && a.fns.get(at).isUnsafe) {
@@ -1992,7 +2174,7 @@ methods Checker {
             // An array in safe code is lent as its elements, to a slice parameter (`decayArrayLend`
             // rewrites `&arr` there into `&arr[..]`); anywhere else it is said what to write.
             if (inner.isArray && self.unsafeDepth == 0) {
-                failStr(stringOf("'&' of an array lends it to a slice parameter (`inout xs:[T]`), as `&xs[..]` -- a type parameter or a struct cannot stand for an array; wrap it in a struct to lend it whole, or take its raw address inside `unsafe`"));
+                failStr(stringOf("cannot lend a whole array here\nnote: `&` of an array lends its elements to a slice parameter (`inout xs:[T]`), as `&xs[..]`, and a type parameter or a struct cannot stand for an array\nhelp: wrap the array in a struct to lend it whole, or take its raw address inside `unsafe`"));
             }
             if (!(inner.kind == Lit.Struct || inner.kind == Lit.Ref || inner.kind == Lit.Slice)
                 || inner.isArray) {
@@ -2002,23 +2184,24 @@ methods Checker {
                     self.scalarLends.push(id);
                     return varType(Lit.Long, NO_SYM);
                 }
-                self.requireUnsafe("taking a raw address with '&'");
+                self.requireUnsafe("taking a raw address with `&`");
             }
             return varType(Lit.Long, NO_SYM);
         }
-        // `~x` and `!x` on an aggregate. Both fell through to the machine operation on the pointer
-        // an aggregate flows as: `~s` complemented the ADDRESS and handed the result back typed as
-        // the struct. `~` answers to a trait like every other operator; `!` does not, because it
-        // asks whether a truth value is false and a block of bytes has none to ask about.
-        if (e.op == Op.BitwiseNot && comparedByCall(inner)) {
+        // `~x` and `!x` on an aggregate. Left alone, both would fall through to the machine
+        // operation on the pointer an aggregate flows as: `~s` would complement the ADDRESS and
+        // hand the result back typed as the struct. `~` answers to a trait like every other
+        // operator; `!` does not, because it asks whether a truth value is false, and a block of
+        // bytes has none to ask about.
+        if (e.op == Op.BitwiseNot && comparedByCall(underBorrow(inner))) {
             return self.rewriteToNot(a, id, inner);
         }
-        if (e.op == Op.LogicalNot && comparedByCall(inner)) {
-            failStr(format("cannot apply `!` to '{}' — it has no truth value; compare it, or call something that answers one",
-                           typeMangleName(inner.kind, inner.structName)));
+        if (e.op == Op.LogicalNot && comparedByCall(underBorrow(inner))) {
+            failStr(format("cannot apply `!` to `{}`\nnote: `{}` has no truth value\nhelp: compare it, or call something that answers one",
+                           typeMangleName(inner.kind, inner.structName), typeMangleName(inner.kind, inner.structName)));
         }
         if ((e.op == Op.LogicalNot || e.op == Op.BitwiseNot) && isFloat(inner.kind)) {
-            failStr(format("`{}` is not defined on {}: compare it, `x == 0.0`", opName(e.op), typeName(inner.kind)));
+            failStr(format("cannot apply `{}` to `{}`\nhelp: compare it instead, as in `x == 0.0`", opName(e.op), typeName(inner.kind)));
         }
         // `!b` of a `bool` (or of a truth value: a comparison, `&&`, `||`, another `!`) is a
         // `bool`. Of an integer it is still "is zero", a 0/1 `int`.
@@ -2040,7 +2223,7 @@ methods Checker {
                 st: TypeRef = inoutScalarOf(inner.structName);
                 return varType(st.base, st.name);
             }
-            self.requireUnsafe("dereferencing a raw pointer");
+            if (!self.captureRead(a, id)) { self.requireUnsafe("dereferencing a raw pointer"); }
             // `*p` yields the pointee, which the pointer's companion name records: as the
             // spelling the mangler produced, so `**T` peels to a `*T` rather than to a struct
             // called `ptr_T`.
@@ -2062,30 +2245,32 @@ methods Checker {
         // only the type can answer, so `==` on one means whatever its `Eq` says it means. Only
         // the two equality operators dispatch: ordering is a separate contract and would be a
         // separate trait.
+        // A borrow of an aggregate is the aggregate here: `a == b` of two `&P` is P's `Eq`, not a
+        // comparison of the addresses the borrows hold.
         if ((e.op == Op.IsEqual || e.op == Op.IsNotEqual)
-            && (comparedByCall(lt) || comparedByCall(rt))) {
+            && (comparedByCall(underBorrow(lt)) || comparedByCall(underBorrow(rt)))) {
             return self.rewriteToEq(a, id, lt, rt);
         }
         // An aggregate has no machine arithmetic either, so `+` on one means whatever its type
         // says it means: a call to `Add::add`. Only addition dispatches: the others have no
         // meaning worth guessing at, and a type that wants one can say so when there is a trait
-        // for it. Left as a machine add, `s + "x"` on a String added two addresses and the result
-        // was read as a String.
-        if (opTraitName(e.op).len > 0 && (isAggregate(lt.kind) || isAggregate(rt.kind))) {
+        // for it. Left as a machine add, `s + "x"` on a String would add two addresses and read
+        // the result as a String.
+        if (opTraitName(e.op).len > 0 && (isAggregate(underBorrow(lt).kind) || isAggregate(underBorrow(rt).kind))) {
             return self.rewriteToOperator(a, id, lt, rt, opTraitName(e.op));
         }
         // Ordering an aggregate is the same story as equality: there is no machine answer for a
-        // block of bytes, so `<` means whatever the type's `Ord` says it means. Left alone this
-        // fell through to the integer compare below, which on an aggregate compared the POINTERS
-        // the operands flow as: two structs with identical fields reported an order, and which
-        // one came first depended on where they sat in the frame.
-        if (isRelational(e.op) && (comparedByCall(lt) || comparedByCall(rt))) {
+        // block of bytes, so `<` means whatever the type's `Ord` says it means. Left alone it would
+        // fall through to the integer compare below, which on an aggregate compares the POINTERS
+        // the operands flow as: two structs with identical fields would report an order, and
+        // which one came first would depend on where they sat in the frame.
+        if (isRelational(e.op) && (comparedByCall(underBorrow(lt)) || comparedByCall(underBorrow(rt)))) {
             return self.rewriteToOrd(a, id, lt, rt);
         }
-        // A comparison computes an int and means a bool. It is typed as what it computes,
-        // because that is the width its result is stored at; the places that want the meaning:
-        // a `bool` annotation, an inferred return, an `Fn(..) -> bool` bound: convert there.
-        // Typing it `bool` here writes one byte where four are read.
+        // A comparison computes an int and means a bool. It is typed as what it computes, because
+        // that is the width its result is stored at, and the places that want the meaning (a
+        // `bool` annotation, an inferred return, an `Fn(..) -> bool` bound) convert it there.
+        // Typed `bool` here, it would be written as one byte where four are read.
         // A float meets only a float of its own width. A literal on one side takes the other's
         // (`x < 1.5` with `x: f32`); `-x` is the parser's `0 - x` with the zero marked, and over a
         // float it is a negation, not a subtraction from an integer. A borrow of a float (`self`
@@ -2101,19 +2286,50 @@ methods Checker {
             if (self.adoptFloat(a, e.right, lt.kind)) { rt = varType(lt.kind, NO_SYM); }
             if (self.adoptFloat(a, e.left, rt.kind)) { lt = varType(rt.kind, NO_SYM); }
             if (lt.kind != rt.kind) {
-                failStr(format("`{}` between a {} and a {} -- a float meets only a float of its own width; convert one with `as`",
+                failStr(format("cannot apply `{}` to `{}` and `{}`\nnote: a float meets only a float of its own width\nhelp: convert one of them with `as`",
                                opName(e.op), self.spellType(lt.kind, lt.structName), self.spellType(rt.kind, rt.structName)));
             }
             if (e.op == Op.Modulus || e.op == Op.BitwiseAnd || e.op == Op.BitwiseOr || e.op == Op.BitwiseXor
                 || e.op == Op.ShiftLeft || e.op == Op.ShiftRight) {
-                failStr(format("`{}` is not defined on {}: a float has `+ - * /` and the comparisons",
+                failStr(format("cannot apply `{}` to `{}`\nnote: a float has `+`, `-`, `*`, `/` and the comparisons",
                                opName(e.op), self.spellType(lt.kind, lt.structName)));
             }
+        }
+        // A shift is computed at its left operand's type, whatever the count's: `h >> k` with
+        // `h: u64` and `k: long` is a `u64`, `b << 4` with `b: u8` a `u8`. A literal on the left
+        // has no type of its own to give, and takes the count's where that is wider than an
+        // `int` (`1 << k` is a `long` for `k: long`, an `int` for `k: int`), or a wider one that
+        // what it meets or is stored in asks for (`adoptWide`: `m: long = 1 << k`).
+        if ((e.op == Op.ShiftLeft || e.op == Op.ShiftRight) && isInteger(lt.kind) && isInteger(rt.kind)) {
+            if (self.weakArg(a, e.left) && !self.weakArg(a, e.right)) {
+                k: Lit = higherPrecedence(lt.kind, rt.kind);
+                if (noCommonType(lt.kind, rt.kind)) { k = rt.kind; }
+                if (k != lt.kind && typeInfo(k).size > typeInfo(lt.kind).size) {
+                    match self.weakValue(a, e.left) {
+                        Some(v) { if (literalFits(v, k)) { self.retypeIntTree(a, e.left, k); return varType(k, NO_SYM); } }
+                        None { }
+                    }
+                }
+            }
+            return lt;
         }
         // Literal arithmetic meeting an 8-byte integer is computed at its width (`adoptWide`).
         if (e.op != Op.Assignment && e.op != Op.LogicalAnd && e.op != Op.LogicalOr) {
             if (self.adoptWide(a, e.right, lt.kind)) { rt = varType(lt.kind, NO_SYM); }
             if (self.adoptWide(a, e.left, rt.kind)) { lt = varType(rt.kind, NO_SYM); }
+        }
+        // A literal operand takes the other operand's type when its value is one of that type's:
+        // `b + 1` with `b: u8` is a `u8`, `h * 31` with `h: u64` a `u64`, `x < 0` with `x: u32`
+        // compares two `u32`s. One that is not keeps its own and meets as any operand does
+        // (`b + 300` is an `int`, and `h == -1` meets no type).
+        if (e.op != Op.Assignment && e.op != Op.LogicalAnd && e.op != Op.LogicalOr
+            && isInteger(lt.kind) && isInteger(rt.kind)) {
+            if (self.adoptLiteral(a, e.right, rt.kind, e.left, lt.kind)) { rt = varType(lt.kind, NO_SYM); }
+            else if (self.adoptLiteral(a, e.left, lt.kind, e.right, rt.kind)) { lt = varType(rt.kind, NO_SYM); }
+            if (noCommonType(lt.kind, rt.kind)) {
+                failStr(format("cannot apply `{}` to `{}` and `{}`\nnote: no integer type holds both\nhelp: say which one is meant with `as` (`x as long`, `n as u64`)",
+                               opName(e.op), typeName(lt.kind), typeName(rt.kind)));
+            }
         }
         if (isComparison(e.op)) { return varType(Lit.Int, NO_SYM); }
         if (e.op == Op.LogicalAnd || e.op == Op.LogicalOr) {
@@ -2125,10 +2341,12 @@ methods Checker {
     }
 
     // `a == b` on an aggregate, as the call it means. Dispatch is by bound, not through a vtable:
-    // both operand types are known here, so the call is direct and the inliner can erase it, an
+    // both operand types are known here, so the call is direct and the inliner can erase it. An
     // operator costs exactly what writing the method call by hand costs. `a != b` becomes
-    // `!a.eq(b)`, one contract with no way for the two to disagree.
-    rewriteToEq &self inout a:Ast id:NodeId lt:VarType rt:VarType -> VarType {
+    // `!a.eq(b)`: one contract, with no way for the two to disagree.
+    rewriteToEq &self inout a:Ast id:NodeId lt0:VarType rt0:VarType -> VarType {
+        lt: VarType = underBorrow(lt0);
+        rt: VarType = underBorrow(rt0);
         owner: Sym = self.eqOwner(lt);
         fn: Sym = NO_SYM;
         if (owner != NO_SYM) { fn = self.eqMethodOf(owner, rt); }
@@ -2141,9 +2359,9 @@ methods Checker {
             fn = self.eqMethodOf(owner, rt);
         }
         if (fn == NO_SYM) {
-            failStr(format("cannot compare values of type '{}' — implement `Eq<{}>` for it, or compare their fields{}",
-                           typeMangleName(lt.kind, lt.structName),
-                           typeMangleName(rt.kind, rt.structName), distinctHint(lt)));
+            failStr(format("cannot compare `{}` with `{}`{}\nhelp: implement `Eq<{}>` for `{}`, or compare their fields",
+                           typeMangleName(lt.kind, lt.structName), typeMangleName(rt.kind, rt.structName), distinctHint(lt),
+                           typeMangleName(rt.kind, rt.structName), typeMangleName(lt.kind, lt.structName)));
         }
         e: Expr = a.expr(id);
         c: long = self.eqCall(a, fn, e.left, e.right);
@@ -2178,11 +2396,12 @@ methods Checker {
     }
 
     // `~a` on an aggregate, as the call it means: `a.not()`.
-    rewriteToNot &self inout a:Ast id:NodeId t:VarType -> VarType {
+    rewriteToNot &self inout a:Ast id:NodeId t0:VarType -> VarType {
+        t: VarType = underBorrow(t0);
         fn: Sym = self.bareMethodOf(self.eqOwner(t), "not");
         if (fn == NO_SYM) {
-            failStr(format("'{}' has no `Not` — implement it for the type, or write the operation out",
-                           typeMangleName(t.kind, t.structName)));
+            failStr(format("cannot apply `~` to `{}`\nhelp: implement `Not` for `{}`, or write the operation out",
+                           typeMangleName(t.kind, t.structName), typeMangleName(t.kind, t.structName)));
         }
         e: Expr = a.expr(id);
         operand: NodeId = NO_NODE;
@@ -2205,12 +2424,14 @@ methods Checker {
     // Not derived the way `==` is. What equality means field by field is obvious; what ORDER means
     // is a choice only the type can make, and guessing at declaration order would be a silent
     // answer to a question the program did not ask.
-    rewriteToOrd &self inout a:Ast id:NodeId lt:VarType rt:VarType -> VarType {
+    rewriteToOrd &self inout a:Ast id:NodeId lt0:VarType rt0:VarType -> VarType {
+        lt: VarType = underBorrow(lt0);
+        rt: VarType = underBorrow(rt0);
         owner: Sym = self.eqOwner(lt);
         fn: Sym = self.ordMethodOf(owner);
         if (fn == NO_SYM || lt.kind != rt.kind || lt.structName != rt.structName) {
-            failStr(format("cannot order values of type '{}' — implement `Ord` for it, or compare their fields{}",
-                           typeMangleName(lt.kind, lt.structName), distinctHint(lt)));
+            failStr(format("cannot order values of type `{}`{}\nhelp: implement `Ord` for `{}`, or compare their fields",
+                           typeMangleName(lt.kind, lt.structName), distinctHint(lt), typeMangleName(lt.kind, lt.structName)));
         }
         e: Expr = a.expr(id);
         c: long = self.eqCall(a, fn, e.left, e.right);
@@ -2223,21 +2444,23 @@ methods Checker {
     }
 
     // `a + b` on an aggregate, as the call it means. Dispatch is by bound, not through a vtable:
-    // both operand types are known here, so the call is direct and the inliner can erase it, an
+    // both operand types are known here, so the call is direct and the inliner can erase it. An
     // operator costs exactly what writing the method call by hand costs. `add` takes `self` by
     // value, so `s + "x"` hands `s` over and gets the grown buffer back: that move is what makes
     // a chain cost one allocation's growth instead of a whole String per step, and it is why
     // using `s` afterwards is a compile error rather than a stale read.
-    rewriteToOperator &self inout a:Ast id:NodeId lt:VarType rt:VarType trait:str -> VarType {
+    rewriteToOperator &self inout a:Ast id:NodeId lt0:VarType rt0:VarType trait:str -> VarType {
+        lt: VarType = underBorrow(lt0);
+        rt: VarType = underBorrow(rt0);
         owner: Sym = self.eqOwner(lt);
         fn: Sym = NO_SYM;
         if (owner != NO_SYM) { fn = self.opMethodOf(owner, rt, trait, lowerOf(trait)); }
         if (fn == NO_SYM) {
             hint: str = distinctHint(lt);
             if (hint.len == 0) { hint = distinctHint(rt); }
-            failStr(format("'{}' has no `{}<{}>` — implement it for the left operand, or write the operation out{}",
-                           typeMangleName(lt.kind, lt.structName), trait,
-                           typeMangleName(rt.kind, rt.structName), hint));
+            failStr(format("cannot apply `{}` to `{}` and `{}`{}\nhelp: implement `{}<{}>` for `{}`, or write the operation out",
+                           opName(a.expr(id).op), typeMangleName(lt.kind, lt.structName), typeMangleName(rt.kind, rt.structName), hint,
+                           trait, typeMangleName(rt.kind, rt.structName), typeMangleName(lt.kind, lt.structName)));
         }
         e: Expr = a.expr(id);
         c: long = self.eqCall(a, fn, e.left, e.right);
@@ -2304,7 +2527,7 @@ methods Checker {
     // rather than following it.
     canDeriveEq &self s:Sym depth:long -> bool {
         if (depth > 32 || s == NO_SYM) { return false; }
-        at: long = gReg.findStruct(nameOf(s));
+        at: long = gReg.findStructSym(s);
         if (at < 0) { return false; }
         d: StructDef = gReg.structDef(at);
         // A tagged union compares by tag and payload, which is not this shape; a struct with no
@@ -2323,9 +2546,8 @@ methods Checker {
                 if (f.kind != Lit.Struct) { return false; }        // str / slice / trait object
                 // A backed enum is carried as `Lit.Struct` companioned with its own name, but it IS
                 // its backing integer: comparing two is an integer compare, and there is no struct
-                // row to recurse into, so asking `findStruct` about one used to end the walk and
-                // refuse the whole type. `TypeRef { base: Lit, name: Sym }` was the case that
-                // showed it: `typeRefEq` existed only because `==` would not derive.
+                // row to recurse into. Asking `findStruct` about one would end the walk and refuse
+                // the whole type, as it would for `TypeRef { base: Lit, name: Sym }`.
                 if (!namedScalar(f.kind, f.structName)) {
                     if (self.eqMethodOf(f.structName, varType(Lit.Struct, f.structName)) == NO_SYM
                         && !self.canDeriveEq(f.structName, depth + 1)) { return false; }
@@ -2348,7 +2570,7 @@ methods Checker {
         name: Sym = methodSymbol(methodSymbol(s, internString(format("Eq_{}", nameOf(s)))),
                                  intern("eq"));
         if (self.fnNames.has(nameOf(name))) { return true; }
-        d: StructDef = gReg.structDef(gReg.findStruct(nameOf(s)));
+        d: StructDef = gReg.structDef(gReg.findStructSym(s));
         // Recorded before the body is built, so a field of this same type asks once.
         self.noteReturn(name, varType(Lit.Bool, NO_SYM));
 
@@ -2433,9 +2655,9 @@ methods Checker {
     }
 
     // `E_nameof v -> str`: the name of the variant `v` holds, derived from the enum's declaration
-    // the first time `nameof(E, ...)` is met. An if-chain over the variants' values returning
-    // string literals, which is what every hand-maintained name table was, with the compiler now
-    // the one keeping it. A backed enum's value is its backing integer and arrives as one; a sum
+    // the first time `nameof(E, ...)` is met. It is an if-chain over the variants' values that
+    // returns string literals: the name table a program would otherwise keep by hand, kept by the
+    // compiler instead. A backed enum's value is its backing integer and arrives as one; a sum
     // type arrives as a borrow, whose `$tag` field is the discriminant.
     //
     // Built already resolved and already typed, for the reason a derived `eq` is: it is generated
@@ -2443,7 +2665,7 @@ methods Checker {
     deriveNameOf &self inout a:Ast en:Sym -> Sym {
         name: Sym = internString(format("{}_nameof", nameOf(en)));
         if (self.fnNames.has(nameOf(name))) { return name; }
-        at: long = gReg.findEnum(nameOf(en));
+        at: long = gReg.findEnumSym(en);
         if (at < 0) { return name; }
         ed: EnumDef = gReg.enumDef(at);
         // Recorded before the body is built, so a caller reads `str` whichever order they are met.
@@ -2504,7 +2726,7 @@ methods Checker {
         // A call through a value or a dispatch has no declaration to make `&n` a lend.
         if (self.scalarLends.len() > mark) {
             while (self.scalarLends.len() > mark) { self.scalarLends.pop(); }
-            self.requireUnsafe("taking a raw address with '&'");
+            self.requireUnsafe("taking a raw address with `&`");
         }
         return t;
     }
@@ -2527,8 +2749,8 @@ methods Checker {
         forcedStatic: bool = false;
         if (forced != NO_SYM && self.traitMethodIsStatic(forced, cn.name)) {
             if (want == NO_SYM) {
-                failStr(format("`{}.{}(...)` is {}'s static method, for the type its result goes to, and nothing says which type that is -- write `x: T = {}.{}(...)`",
-                               lastComponentOf(nameOf(forced)), nameOf(cn.name), lastComponentOf(nameOf(forced)),
+                failStr(format("cannot infer which type `{}.{}(...)` is called for\nnote: `{}` is a static method of `{}`, called for the type its result is stored into, and nothing here says which type that is\nhelp: write `x: T = {}.{}(...)`",
+                               lastComponentOf(nameOf(forced)), nameOf(cn.name), nameOf(cn.name), lastComponentOf(nameOf(forced)),
                                lastComponentOf(nameOf(forced)), nameOf(cn.name)));
             }
             forcedStatic = true;
@@ -2538,8 +2760,8 @@ methods Checker {
             a.calls.set(c, cn);
         } else if (forced != NO_SYM) {
             if (cn.argCount == 0) {
-                failStr(format("`{}.{}(...)` calls {}'s method on the value it is handed first -- write `{}.{}(x)`",
-                               lastComponentOf(nameOf(forced)), nameOf(cn.name), lastComponentOf(nameOf(forced)),
+                failStr(format("too few arguments to `{}.{}`: expected at least 1, found 0\nnote: `{}.{}(x)` calls the trait's method on the value it is handed first",
+                               lastComponentOf(nameOf(forced)), nameOf(cn.name),
                                lastComponentOf(nameOf(forced)), nameOf(cn.name)));
             }
             cn = CallNode { name: cn.name, receiver: a.argAt(cn, 0), firstArg: cn.firstArg + 1,
@@ -2570,7 +2792,7 @@ methods Checker {
         if (recv.structName != NO_SYM) {
             cf: long = self.callableField(recv.structName, cn.name);
             if (cf >= 0) {
-                cd: StructDef = gReg.structDef(gReg.findStruct(nameOf(recv.structName)));
+                cd: StructDef = gReg.structDef(gReg.findStructSym(recv.structName));
                 cfd: FieldDef = gReg.fieldAt(cd, cf);
                 a.fields.push(FieldNode { base: cn.receiver, name: cn.name });
                 cn = CallNode { name: intern("call"),
@@ -2627,7 +2849,7 @@ methods Checker {
             else if (forcedStatic) { }
             // A static method a carried implementation gives (`R.new()` from a trait whose `new`
             // carries its name beside core `Default`'s), or one of two of them: as for a method.
-            else if (!gReg.carriedOwners.isEmpty() && !gReg.isGeneric(nameOf(st))) {
+            else if (!gReg.carriedOwners.isEmpty() && !gReg.isGenericSym(st)) {
                 fn = self.carriedAmbiguity(a, c, st, cn.name, fn, true);
             }
             // A static method of a parameterized trait's implementation carries the trait's
@@ -2639,7 +2861,7 @@ methods Checker {
             }
             // `Option.fromFlag(true, 5)`: a static method of a generic type, named by the
             // template. Which instance is meant is read off the arguments and the destination.
-            if (gReg.isGeneric(nameOf(st))) { fn = self.instantiateOwner(a, cn, st, fn, want); }
+            if (gReg.isGenericSym(st)) { fn = self.instantiateOwner(a, cn, st, fn, want); }
             // `T.decode(inp)` on a type with no `decode`: a trait's static method, derived or
             // stamped for it now, exactly as an instance method is below.
             else if (!self.fnNames.has(nameOf(fn)) && self.implementForMethod(a, st, cn.name, true)) {
@@ -2655,10 +2877,10 @@ methods Checker {
                 // `Ret.fromResidual($tryN.residual())`, a `?`'s early return: the return type is
                 // what has no `Try`.
                 if (cn.argCount == 1 && self.readsTryLocal(a, a.argAt(cn, 0))) {
-                    failStr(format("`?` returns early with the failure, so the function must return a type implementing `Try` (a Result or an Option) -- this one returns {}",
+                    failStr(format("cannot use `?` in a function that returns `{}`\nnote: `?` returns early with the failure, so the function must return a type implementing `Try`, such as a `Result` or an `Option`",
                                    self.spellType(self.currentReturn.kind, self.currentReturn.structName)));
                 }
-                failStr(format("{} has no static method '{}'", self.spellType(Lit.Struct, st), nameOf(cn.name)));
+                failStr(format("no static method `{}` on type `{}`", nameOf(cn.name), self.spellType(Lit.Struct, st)));
             }
             self.requireSafeCallee(a, fn);
             self.boxTraitArgsStatic(a, cn, fn);
@@ -2680,12 +2902,12 @@ methods Checker {
             if (held.kind == Lit.Fn) {
                 want: long = fnSigArity(held.structName);
                 if (want >= 0 && cn.argCount != want) {
-                    failStr(format("indirect call to '{}' with the wrong number of arguments",
-                                   nameOf(cn.name)));
+                    failStr(format("wrong number of arguments in the call through `{}`: expected {}, found {}",
+                                   nameOf(cn.name), want, cn.argCount));
                 }
-                // Under the name the variable resolves to: a file global's is its qualified
-                // one, which is what the lowerer's `isGlobalName` answers for -- the bare
-                // spelling read a local slot of that name, which nothing had written.
+                // Under the name the variable resolves to. A file global's is its qualified one,
+                // which is what the lowerer's `isGlobalName` answers for; the bare spelling would
+                // read a local slot of that name, which nothing wrote.
                 a.calls.set(c, CallNode { name: self.resolveVar(cn.name), receiver: cn.receiver,
                                           firstArg: cn.firstArg, argCount: cn.argCount,
                                           slot: SLOT_FNPTR, callee: NO_NODE,
@@ -2717,8 +2939,8 @@ methods Checker {
             // else resolves statically to `T_method`.
             if (recv.kind == Lit.TraitObj) {
                 if (forced != NO_SYM && forced != owner) {
-                    failStr(format("`{}.{}(...)` is handed a {} object, which has {}'s methods and no others",
-                                   lastComponentOf(nameOf(forced)), nameOf(cn.name),
+                    failStr(format("cannot call `{}.{}(...)` on a trait object of `{}`\nnote: an object of `{}` has the methods of `{}` and no others",
+                                   lastComponentOf(nameOf(forced)), nameOf(cn.name), self.spellType(Lit.TraitObj, owner),
                                    self.spellType(Lit.TraitObj, owner), self.spellType(Lit.TraitObj, owner)));
                 }
                 return self.checkDispatch(a, c, cn, owner);
@@ -2728,7 +2950,7 @@ methods Checker {
             // the field-access expression itself.
             fld: long = self.fnField(owner, cn.name);
             if (fld >= 0) {
-                d: StructDef = gReg.structDef(gReg.findStruct(nameOf(owner)));
+                d: StructDef = gReg.structDef(gReg.findStructSym(owner));
                 f: FieldDef = gReg.fieldAt(d, fld);
                 a.fields.push(FieldNode { base: cn.receiver, name: cn.name });
                 fe: NodeId = a.leafOf(Op.FieldAccess, Payload.Field(a.fields.len() - 1),
@@ -2737,8 +2959,8 @@ methods Checker {
                 // than left to arrive at whatever the field happens to hold with the wrong stack.
                 want: long = fnSigArity(f.structName);
                 if (want >= 0 && cn.argCount != want) {
-                    failStr(format("call through {}.{} expects {} argument(s)",
-                                   nameOf(owner), nameOf(cn.name), want));
+                    failStr(format("wrong number of arguments in the call through `{}.{}`: expected {}, found {}",
+                                   nameOf(owner), nameOf(cn.name), want, cn.argCount));
                 }
                 a.calls.set(c, CallNode { name: cn.name, receiver: NO_NODE,
                                           firstArg: cn.firstArg, argCount: cn.argCount,
@@ -2779,7 +3001,7 @@ methods Checker {
                 //
                 // What it will return has to be known now, not when the derived body is checked
                 // next round: the derivation happens after this expression is typed, and a call
-                // left typed `:void` gets no destination slot, the caller then reads a struct
+                // left typed `void` gets no destination slot, so the caller would read a struct
                 // out of a return register that never held one. A derived `clone` returns Self,
                 // which is exactly the receiver's type, so there is nothing to wait for.
                 //
@@ -2788,14 +3010,14 @@ methods Checker {
                 // what it owns with the original, both released. A generic type's own `clone`
                 // whose bound this instance misses says that instead.
                 else if (nameOf(cn.name) == "clone" && recv.kind != Lit.TraitObj
-                         && gReg.hasStruct(nameOf(owner))) {
+                         && gReg.hasStructSym(owner)) {
                     why: str = gReg.cloneBlocker(owner);
                     if (why.len == 0 && !gReg.cloneByTemplate(owner)) {
                         self.wantedClones.push(owner);
                         self.noteReturn(target, varType(Lit.Struct, owner));
                     } else if (!self.templateMethodPending(a, owner, cn.name)) {
-                        if (why.len == 0) { why = "its generic type's own clone was not stamped for it"; }
-                        failStr(format("{} has no Clone: {} -- write `methods {} for Clone`, or move the value instead",
+                        if (why.len == 0) { why = "its generic type's own `clone` was not stamped for it"; }
+                        failStr(format("`{}` does not implement `Clone`\nnote: {}\nhelp: write `methods {} for Clone`, or move the value instead",
                                        self.spellType(Lit.Struct, owner), why,
                                        self.spellType(Lit.Struct, owner)));
                     }
@@ -2815,7 +3037,7 @@ methods Checker {
         if (cn.receiver == NO_NODE && nameOf(target) == "$panic") {
             target = self.panicTarget(a);
             if (target == NO_SYM) {
-                failStr(stringOf("`assert!` fails through the program's `@panic` function, and nothing is marked `@panic` -- include <panic>, or declare one: `@panic name msg:str -> never { ... }`"));
+                failStr(stringOf("`assert!` needs a `@panic` function, and nothing is marked `@panic`\nnote: a failed `assert!` calls the program's `@panic` function\nhelp: `#include <stdlib::panic>`, or declare one: `@panic name msg:str -> never { ... }`"));
             }
         }
         resolved: Sym = self.resolveFn(target);
@@ -2823,14 +3045,14 @@ methods Checker {
         // A plain call to a name no function has: refused here, where it is written, rather than
         // reported by the emitter as a call to a function nobody defined.
         if (cn.receiver == NO_NODE && self.fnNodeOf(resolved) < 0 && !self.fnNames.has(nameOf(resolved))) {
-            failStr(format("'{}' is not declared -- no function of that name is visible here", nameOf(cn.name)));
+            failStr(format("cannot find function `{}` in this scope", nameOf(cn.name)));
         }
         if (cn.receiver == NO_NODE) { resolved = self.instantiate(a, cn, resolved, want, 0); }
         // A method with type parameters of its own, called on a value: stamped per call, as a
         // generic function is, from the arguments after the receiver and from the destination.
         else { resolved = self.instantiate(a, cn, resolved, want, 1); }
         self.requireVisible(a, resolved);
-        self.requireSafeCallee(a, resolved);
+        if (!self.withHolds.has(c)) { self.requireSafeCallee(a, resolved); }
         self.boxTraitArgs(a, cn, resolved);
         rbase: long = 0;
         if (cn.receiver != NO_NODE) { rbase = 1; }
@@ -2852,7 +3074,7 @@ methods Checker {
         if (t.kind == Lit.Str || t.kind == Lit.Slice) { return varType(Lit.Long, NO_SYM); }
         if ((t.kind != Lit.Struct && t.kind != Lit.Ref) || t.structName == NO_SYM) { return none; }
         if (self.fnNames.has(nameOf(methodSymbol(t.structName, intern("len"))))) { return none; }
-        sd: long = gReg.findStruct(nameOf(t.structName));
+        sd: long = gReg.findStructSym(t.structName);
         if (sd < 0) { return none; }
         d: StructDef = gReg.structDef(sd);
         k: long = gReg.findField(d, "len");
@@ -2863,14 +3085,14 @@ methods Checker {
     }
 
     // `x.m()` where x's type has no method `m` and none can arrive (no overload, no trait to derive
-    // it from, not `clone`). Refused here, at the call, where it can be said why: before, the
-    // call survived to the emitter as "'string::String_len' is called by 'main' and no function
-    // of that name is defined", with no position. Two answers: a generic type's method declared in
-    // a block whose bound this instance does not meet (`extendSlice` in `methods Vec<T: Copy>`, on
-    // a `Vec<String>`), and a method that does not exist at all. Silent where the type is not
-    // settled yet (an instance not laid out, a method of one whose bounds hold but which is not
-    // stamped yet): those are another round's to decide. `tryOp`: the receiver is a `?`'s operand
-    // (`readsTryLocal`), and the method one of `Try`'s, so it is the `?` that is refused.
+    // it from, not `clone`). It is refused here, at the call, where it can be said why; otherwise
+    // the call would survive to the emitter as a call to a function nobody defined, reported with
+    // no position. There are two answers: a generic type's method declared in a block whose bound
+    // this instance does not meet (`extendSlice` in `methods Vec<T: Copy>`, on a `Vec<String>`),
+    // and a method that does not exist at all. It stays silent where the type is not settled yet
+    // (an instance not laid out, or a method of one whose bounds hold but which is not stamped
+    // yet): those are another round's to decide. `tryOp` says the receiver is a `?`'s operand
+    // (`readsTryLocal`) and the method one of `Try`'s, so it is the `?` that is refused.
     refuseNoMethod &self inout a:Ast owner:Sym m:Sym tryOp:bool -> void {
         on: str = nameOf(owner);
         if (gReg.findStruct(on) < 0 && gReg.findEnum(on) < 0 && !namesScalar(on)) { return; }
@@ -2879,9 +3101,9 @@ methods Checker {
         why: str = "";
         sd: long = gReg.findStruct(on);
         if (sd >= 0 && gReg.findFieldSym(gReg.structDef(sd), m) >= 0) {
-            why = keepString(format(" -- '{}' is a field; read it without '()'", nameOf(m)));
+            why = keepString(format("\nnote: `{}` is a field\nhelp: read it without `()`", nameOf(m)));
         }
-        failStr(format("{} has no method '{}'{}", self.spellType(Lit.Struct, owner), nameOf(m), why));
+        failStr(format("no method `{}` on type `{}`{}", nameOf(m), self.spellType(Lit.Struct, owner), why));
     }
 
     // `owner` is an instance of a generic type whose template declares `m` in a block with
@@ -2891,7 +3113,7 @@ methods Checker {
         on: str = nameOf(owner);
         ti: long = NOT_FOUND;
         r: long = gReg.findRequest(on);
-        if (r >= 0) { ti = gReg.findTemplate(nameOf(gReg.requestAt(r).base)); }
+        if (r >= 0) { ti = gReg.findTemplateSym(gReg.requestAt(r).base); }
         if (ti >= 0) {
             t: GTemplate = gReg.templateDef(ti);
             gm: Sym = methodSymbol(t.name, m);
@@ -2905,8 +3127,8 @@ methods Checker {
                             arg: TypeRef = gReg.gArgAt(req, mb.param);
                             if (!self.late.satisfies(arg, mb.trait.name)) {
                                 tr: str = lastComponentOf(nameOf(mb.trait.name));
-                                failStr(format("{} has no method '{}' here: it is declared for {}: {} only, and {} is not {}",
-                                               self.spellType(Lit.Struct, owner), nameOf(m),
+                                failStr(format("no method `{}` on type `{}`\nnote: `{}` is declared for `{}: {}` only, and `{}` does not implement `{}`",
+                                               nameOf(m), self.spellType(Lit.Struct, owner), nameOf(m),
                                                nameOf(gReg.gParamAt(t, mb.param)), tr,
                                                self.spellType(arg.base, arg.name), tr));
                             }
@@ -2954,7 +3176,7 @@ methods Checker {
         e: Expr = a.expr(arg);
         if (e.op == Op.MacroCall || e.op == Op.TupleLit) { return true; }
         if (e.op == Op.StructLit) {
-            match e.payload { Lit(l) { return gReg.findTemplate(nameOf(a.lits.get(l).typeName)) >= 0; } _ { } }
+            match e.payload { Lit(l) { return gReg.findTemplateSym(a.lits.get(l).typeName) >= 0; } _ { } }
             return false;
         }
         if (e.op != Op.FunctionCall && e.op != Op.MethodCall) { return false; }
@@ -2972,8 +3194,6 @@ methods Checker {
         return at >= 0 && a.fns.get(at).isTemplate;
     }
 
-    // The type argument `k` of call `cn` is handed to, as a destination: the parameter's named
-    // type, or NO_SYM where it names none (a scalar, a slice, a variadic's elements).
     // `&x` where `x` is a fixed array (a local, a parameter, a field of one).
     arrayLendArg &self inout a:Ast arg:NodeId -> bool {
         e: Expr = a.expr(arg);
@@ -2985,9 +3205,9 @@ methods Checker {
     }
 
     // The declared type of a place made of names and fields (`h.cells`, `self.grid.rows`), read
-    // without typing it: the argument is typed once, later, and typing it here as well resolved
-    // its calls twice (`&gs.at(0).xs` then looked `at` up under its already-resolved name). A
-    // place with anything else in it (a call, an index) answers not-an-array.
+    // without typing it. The argument is typed once, later; typing it here as well would resolve
+    // its calls twice (`&gs.at(0).xs` would then look `at` up under its already-resolved name).
+    // A place with anything else in it (a call, an index) answers not-an-array.
     placeIsArray &self inout a:Ast id:NodeId -> VarType {
         none: VarType = varType(Lit.Void, NO_SYM);
         e: Expr = a.expr(id);
@@ -2998,7 +3218,7 @@ methods Checker {
                 fd: FieldNode = a.fields.get(f);
                 bt: VarType = self.placeIsArray(a, fd.base);
                 if (bt.isArray || (bt.kind != Lit.Struct && bt.kind != Lit.Ref)) { return none; }
-                si: long = gReg.findStruct(nameOf(bt.structName));
+                si: long = gReg.findStructSym(bt.structName);
                 if (si < 0) { return none; }
                 d: StructDef = gReg.structDef(si);
                 fi: long = gReg.findFieldSym(d, fd.name);
@@ -3033,10 +3253,12 @@ methods Checker {
             a.setExpr(arg, e);
             return;
         }
-        failStr(format("argument {} lends an array whole, and parameter '{}' cannot take one: a type parameter or a struct cannot stand for an array -- lend its elements as a slice (`&xs[..]` to an `inout [T]` parameter), or wrap the array in a struct",
-                       k, nameOf(p.name)));
+        failStr(format("cannot lend a whole array to parameter `{}`\nnote: a type parameter or a struct cannot stand for an array\nhelp: lend its elements as a slice (`&xs[..]` to an `inout [T]` parameter), or wrap the array in a struct",
+                       nameOf(p.name)));
     }
 
+    // The type argument `k` of call `cn` is handed to, as a destination: the parameter's named
+    // type, or NO_SYM where it names none (a scalar, a slice, a variadic's elements).
     paramWant &self inout a:Ast at:long cn:CallNode k:long -> Sym {
         f: FnNode = a.fns.get(at);
         i: long = k;
@@ -3048,10 +3270,10 @@ methods Checker {
         return NO_SYM;
     }
 
-    // What `pub`, `pkg` and `local` mean at a call: everywhere, inside the declaring package, and
-    // inside the declaring file. The three levels have been parsed and recorded on every
-    // definition since the port began and read by nothing, so a `local` helper of another module
-    // was reachable from anywhere that included it, which is most of the program.
+    // What `pub`, `pkg` and `local` mean at a call: callable from everywhere, from inside the
+    // declaring package, and from inside the declaring file. Without this, a `local` helper of
+    // another module would be reachable from anywhere that included it, which is most of the
+    // program.
     //
     // Silent wherever there is no answer to give: a derived function (`clone`, `nameof`, drop
     // glue) is built with no file of its own, and a call from a global's initializer has no
@@ -3066,74 +3288,70 @@ methods Checker {
         if (f.file == self.currentFile) { return; }
         if (f.visibility == Vis.Pkg) {
             if (f.pkg == NO_SYM || f.pkg == self.currentPkg) { return; }
-            failStr(format("'{}' is package-private to '{}', and this is '{}' — declare it `pub` to let another package call it",
-                           nameOf(fn), nameOf(f.pkg), nameOf(self.currentPkg)));
+            failStr(format("`{}` is private to package `{}`\nhelp: declare it `pub` to call it from another package",
+                           nameOf(fn), nameOf(f.pkg)));
         }
-        failStr(format("'{}' is file-private to {}, and this is {} — declare it `pkg` or `pub` to let another file call it",
-                       nameOf(fn), nameOf(f.file), nameOf(self.currentFile)));
+        failStr(format("`{}` is private to `{}`\nhelp: declare it `pkg` or `pub` to call it from another file",
+                       nameOf(fn), nameOf(f.file)));
     }
 
     // A global read or written from another file, held to its visibility as a function's call is:
-    // `local` (or none) is its file's own, `pkg` its package's. Every other kind of name already
-    // was; a global was reachable from any file that could see its module.
+    // `local` (or none) is its file's own, and `pkg` its package's.
     requireGlobalVisible &self q:Sym -> void {
         if (self.currentFile == NO_SYM) { return; }
-        gi: long = gReg.findGlobal(nameOf(q));
+        gi: long = gReg.findGlobalSym(q);
         if (gi < 0) { return; }
         g: GlobalDef = gReg.globalDef(gi);
         if (g.file == NO_SYM || g.visibility == Vis.Pub || g.file == self.currentFile) { return; }
         if (g.visibility == Vis.Pkg) {
             if (g.pkg == NO_SYM || g.pkg == self.currentPkg) { return; }
-            failStr(format("'{}' is package-private to '{}', and this is '{}' — declare it `pub` to let another package use it",
-                           nameOf(q), nameOf(g.pkg), nameOf(self.currentPkg)));
+            failStr(format("`{}` is private to package `{}`\nhelp: declare it `pub` to use it from another package",
+                           nameOf(q), nameOf(g.pkg)));
         }
-        failStr(format("'{}' is file-private to {}, and this is {} — declare it `pkg` or `pub` to let another file use it",
-                       nameOf(q), nameOf(g.file), nameOf(self.currentFile)));
+        failStr(format("`{}` is private to `{}`\nhelp: declare it `pkg` or `pub` to use it from another file",
+                       nameOf(q), nameOf(g.file)));
     }
 
-    // A struct stored where a different struct was declared: the store copies the declared width
-    // out of a value of another layout, so `v: Vec<long> = vecOf(1, 2, 3)` -- a `Vec<int>` -- is
-    // refused here rather than read back as garbage.
+    // A struct stored where a different struct was declared. The store would copy the declared
+    // width out of a value with another layout, so `v: Vec<long> = vecOf(1, 2, 3)` (which makes a
+    // `Vec<int>`) is refused here rather than read back as garbage.
     requireSameStruct &self want:VarType got:VarType what:str -> void {
         if (want.kind != Lit.Struct || got.kind != Lit.Struct) { return; }
         if (want.structName == NO_SYM || got.structName == NO_SYM || want.structName == got.structName) { return; }
-        failStr(format("{} is a {}, and this gives it a {}", what, nameOf(want.structName), nameOf(got.structName)));
+        failStr(format("mismatched types: expected `{}`, found `{}`\nnote: {} has type `{}`",
+                       nameOf(want.structName), nameOf(got.structName), notePlace(what), nameOf(want.structName)));
     }
 
-    // The same question for everything that is not two structs, where what differs is the kind
-    // rather than the name: a `str` stored in a `long`, a borrow laundered into an integer, a
-    // scalar handed to a trait object. `src` is the expression being stored, needed for what a
-    // type alone cannot say: whether it is an untyped literal.
     // A `return` is a store into the function's result, held to exactly what `x: T = e` is held
-    // to (`requireAssignable`): a `str` returned from `-> int` is refused, a struct of another
-    // name, a value from a `-> void` function, nothing from one that returns something. A closure
-    // written without `-> T` is not held here: its return type is what its body returns
-    // (`settleReturn`).
+    // to (`requireAssignable`). That refuses a `str` returned from `-> int`, a struct of another
+    // name, a value from a `-> void` function, and nothing from one that returns something. A
+    // closure written without `-> T` is not held here: its return type is whatever its body
+    // returns (`settleReturn`).
     holdReturn &self inout a:Ast v:NodeId got:VarType -> void {
         if (self.curFn < 0) { return; }
         f: FnNode = a.fns.get(self.curFn);
         if (f.inferReturn) { return; }
         if (isNeverFn(f)) {
-            failStr(format("'{}' is declared `-> never`, and this `return` would come back", nameOf(f.name)));
+            failStr(format("`{}` is declared `-> never`, but this `return` comes back", nameOf(f.name)));
         }
         want: VarType = self.currentReturn;
         if (want.kind == Lit.Void) {
             if (v != NO_NODE && got.kind != Lit.Void) {
-                failStr(format("'{}' returns nothing, and this `return` gives it a {}",
-                               nameOf(f.name), self.spellType(got.kind, got.structName)));
+                failStr(format("mismatched types: expected nothing, found `{}`\nnote: `{}` returns nothing",
+                               self.spellType(got.kind, got.structName), nameOf(f.name)));
             }
             return;
         }
         if (v == NO_NODE) {
-            failStr(format("'{}' returns a {}, and this `return` gives it nothing",
-                           nameOf(f.name), self.spellType(want.kind, want.structName)));
+            failStr(format("mismatched types: expected `{}`, found nothing\nnote: `{}` returns `{}`, and this `return` has no value",
+                           self.spellType(want.kind, want.structName), nameOf(f.name), self.spellType(want.kind, want.structName)));
         }
         if (got.kind == Lit.Void && a.expr(v).op != Op.Literal) {
-            failStr(format("'{}' returns a {}, and this `return` gives it nothing (the expression yields no value)",
-                           nameOf(f.name), self.spellType(want.kind, want.structName)));
+            failStr(format("mismatched types: expected `{}`, found nothing\nnote: `{}` returns `{}`, and this expression yields no value",
+                           self.spellType(want.kind, want.structName), nameOf(f.name), self.spellType(want.kind, want.structName)));
         }
-        // A `?`'s early return (`Ret.fromResidual($tryN.residual())`) whose generic return type the
-        // failure made another instance: the failure is what does not fit.
+        // A `?`'s early return (`Ret.fromResidual($tryN.residual())`) where the failure made the
+        // generic return type another instance: what does not fit is the failure, so say that.
         if (got.kind != want.kind || got.structName != want.structName) {
             r: NodeId = self.tryResidualArg(a, v);
             if (r != NO_NODE) {
@@ -3141,25 +3359,59 @@ methods Checker {
                 self.refuseTryResidual(varType(re.kind, re.structName), varType(Lit.Void, NO_SYM));
             }
         }
-        self.requireAssignable(a, want, got, v, keepString(format("the return value of '{}'", nameOf(f.name))));
-        // And held to the language's integer rule, which a declaration does not enforce yet
-        // (`requireAssignable` takes any integer at any width, for inferred types a stamped
-        // body never spelled): a returned value converts implicitly only by lossless widening.
-        // The return type is always written, so a narrowing here is one nobody asked for --
-        // `-> int { return n.len; }` dropped the high half without a word. A literal is held to
-        // fit instead, as everywhere.
-        if (isInteger(want.kind) && isInteger(got.kind) && !canImplicitlyConvert(got.kind, want.kind)
-            && self.literalValue(a, v).isNone()) {
-            failStr(format("the return value of '{}' is a {}, and this gives it a {} -- not every {} is one: write `as {}`{}",
-                           nameOf(f.name), typeName(want.kind), typeName(got.kind), typeName(got.kind),
-                           typeName(want.kind), self.mainHint(f, got.kind)));
+        // Held to the language's integer rule as every store is (`narrows`), but asked here first
+        // so the message can suggest `main -> long`. A returned value converts implicitly only by
+        // lossless widening, and a constant has to fit, so `-> int { return n.len; }` cannot drop
+        // the high half without a word.
+        if (isInteger(want.kind) && isInteger(got.kind) && !canImplicitlyConvert(got.kind, want.kind)) {
+            cv: Option<long> = Option.None;
+            if (self.weakArg(a, v)) { cv = self.weakValue(a, v); }
+            match cv {
+                Some(x) {
+                    if (!literalFits(x, want.kind)) {
+                        failStr(format("constant `{}` out of range for `{}`\nnote: `{}` returns `{}`",
+                                       x, typeName(want.kind), nameOf(f.name), typeName(want.kind)));
+                    }
+                }
+                None {
+                    failStr(format("mismatched types: expected `{}`, found `{}`\nnote: `{}` returns `{}`\nhelp: a value of type `{}` may not fit in `{}`; convert it explicitly with `as {}`{}",
+                                   typeName(want.kind), typeName(got.kind), nameOf(f.name), typeName(want.kind),
+                                   typeName(got.kind), typeName(want.kind), typeName(want.kind), self.mainHint(f, got.kind)));
+                }
+            }
         }
+        self.requireAssignable(a, want, got, v, keepString(format("the return value of `{}`", nameOf(f.name))));
     }
+    // The end of the narrowing help when the function is `main`, whose result type is the
+    // author's to choose, so widening it is the other way out.
     mainHint &self f:FnNode got:Lit -> str {
         if (lastComponentOf(nameOf(f.name)) == "main") { return keepString(format(", or declare `main -> {}`", typeName(got))); }
         return "";
     }
 
+    // "`long`" or "an array of `long`": a store's two sides, when one of them is an array.
+    spellArrayOrNot &self t:VarType -> String {
+        if (t.isArray) { return format("an array of `{}`", self.spellType(t.kind, t.structName)); }
+        return format("`{}`", self.spellType(t.kind, t.structName));
+    }
+
+    // `b = a`, `b: [T; N] = a`, `S { f: a }` with `a` a whole array: `a` has to be as long as
+    // the destination. `want` is the destination's length; an array literal is held elsewhere.
+    requireArrayLen &self inout a:Ast want:long src:NodeId what:str -> void {
+        if (want < 0 || src == NO_NODE || a.expr(src).op == Op.ArrayLit) { return; }
+        got: long = self.placeArrayLen(a, src);
+        if (got >= 0 && got != want) {
+            failStr(format("mismatched array lengths: expected {}, found {}\nnote: {} holds {}, and a fixed array is assigned whole only from an array of the same length",
+                           want, got, what, plural(want, "element")));
+        }
+    }
+
+    // Whether a value of type `got` may be stored in a place of type `want`. Two structs are asked
+    // by name (`requireSameStruct`); everything else differs by kind: a `str` stored in a `long`,
+    // a borrow laundered into an integer, a scalar handed to a trait object. `src` is the
+    // expression being stored, needed for what a type alone cannot say, such as whether it is an
+    // untyped literal. `what` names the place for the note under a mismatch ("`c`", "the return
+    // value of `f`").
     requireAssignable &self inout a:Ast want:VarType got:VarType src:NodeId what:str -> void {
         self.requireSameStruct(want, got, what);
         if (src == NO_NODE) { return; }
@@ -3168,8 +3420,8 @@ methods Checker {
         if (self.adoptWide(a, src, want.kind)) { gk = want.kind; }
         gn: Sym = got.structName;
         // Inside `unsafe`, `&x` is a raw address and may be held as one: that is the whole of
-        // what the block grants. In safe code it is a lend, and laundering it into an integer
-        // is what `ref_decay_err` is about.
+        // what the block grants. In safe code it is a lend, and laundering it into an integer is
+        // refused below.
         if (self.unsafeDepth > 0 && (gk == Lit.Ref || gk == Lit.Ptr)) { return; }
         // `&x` on a struct is a lend, and a lend lives only as long as the borrow it was made
         // for. Stored in an integer it becomes an address that outlives it, which is the one
@@ -3178,12 +3430,30 @@ methods Checker {
         // an address, and the author has said so.
         if (self.unsafeDepth == 0 && self.isLend(a, src)
             && want.kind != Lit.Ref && want.kind != Lit.Struct && want.kind != Lit.TraitObj) {
-            failStr(format("{} is a {}, and `&` here lends a value rather than giving an address — a borrow cannot be held past the call it was made for",
-                           what, self.spellType(want.kind, want.structName)));
+            failStr(format("mismatched types: expected `{}`, found a borrow\nnote: `&` here lends a value rather than giving an address, and a borrow cannot be held past the call it was made for",
+                           self.spellType(want.kind, want.structName)));
         }
-        // An array declaration's `kind` is its element's, so the initializer is not being
-        // matched against it.
-        if (want.isArray || got.isArray) { return; }
+        // A fixed array is a value: its element type and its length together. `kind` is the
+        // element's on both sides, so an array meets only an array of the same element type here,
+        // and the length is held by the caller that knows the destination's (`requireArrayLen`).
+        // An array literal is held element by element where it is written. Without this,
+        // `x: long = arr` or a store of another length would read whatever the store left.
+        if (want.isArray || got.isArray) {
+            if (a.expr(src).op == Op.ArrayLit) { return; }
+            if (want.isArray != got.isArray || want.kind != got.kind || want.structName != got.structName) {
+                failStr(format("mismatched types: expected {}, found {}\nnote: a fixed array is assigned only from an array of the same element type and length",
+                               self.spellArrayOrNot(want), self.spellArrayOrNot(got)));
+            }
+            // Elements that own something cannot be copied as bytes (both arrays would release
+            // them): a whole array of them is MOVED, its source left moved-from, which the
+            // ownership pass writes out and refuses where no flag can record it (`ownArrayStore`).
+            // A global's initializer is in no function that pass walks.
+            if (want.kind == Lit.Struct && gReg.needsDrop(want.structName) && self.curFn < 0) {
+                failStr(format("cannot initialize {} from another array\nnote: an array of `{}` owns what its elements hold, so it is moved rather than copied, and a global is not built by moving another array\nhelp: give it an array literal, or keep the elements in a `Vec`",
+                               what, self.spellType(want.kind, want.structName)));
+            }
+            return;
+        }
         // A concrete value stored in a trait-typed place becomes an object there, so the trait
         // has to be one. Checked here rather than at the `MakeTraitObj` that lowering reads,
         // because a declaration is where the author named the trait.
@@ -3200,33 +3470,45 @@ methods Checker {
                 // Written past `long`'s maximum: a u64's, whatever it is stored in.
                 wide: bool = a.expr(src).kind == Lit.U64 && v < 0;
                 if (wide && want.kind != Lit.U64 && (isInteger(want.kind) || want.kind == Lit.Bool)) {
-                    failStr(format("{} is a {}, and {} is not one — the value does not fit (only a u64 holds it)",
-                                   what, self.spellType(want.kind, want.structName), v as u64));
+                    failStr(format("literal `{}` out of range for `{}`\nnote: only a `u64` holds it",
+                                   v as u64, self.spellType(want.kind, want.structName)));
                 }
                 if (!wide && !literalFits(v, want.kind)) {
-                    failStr(format("{} is a {}, and {} is not one — the value does not fit",
-                                   what, self.spellType(want.kind, want.structName), v));
+                    failStr(format("literal `{}` out of range for `{}`",
+                                   v, self.spellType(want.kind, want.structName)));
                 }
             }
             None { }
         }
-        // Two integers are accepted at either width, which is weaker than `canImplicitlyConvert`
-        // states. The reason is inference, not policy: `fold(xs, 0, &addLL)` pins the
-        // accumulator `U` from the weak literal `0` -- an `int` -- while the step function it was
-        // handed returns `long`, so the stamped body assigns a long into an int. The types there
-        // were never written by anyone, and refusing them would refuse the corpus. Narrowing an
-        // integer at an assignment is the one thing this does not catch yet; it is a width, not a
-        // category, and no read of the wrong number of bytes can come of it.
-        if ((isInteger(want.kind) || want.kind == Lit.Bool) && (isInteger(gk) || gk == Lit.Bool)) { return; }
+        // An integer is held to the rule `canImplicitlyConvert` states: it converts implicitly only
+        // by lossless widening, and a constant only when its value is one of the destination's
+        // (`narrows`). Anything else is written with `as`. This relies on a callable bound saying
+        // what a type parameter is first (`bindFromCallable`): otherwise `fold(xs, 0, &addLL)`
+        // would make U an `int` from the literal while the step returns `long`.
+        if ((isInteger(want.kind) || want.kind == Lit.Bool) && (isInteger(gk) || gk == Lit.Bool)) {
+            if (self.narrows(a, want.kind, gk, src)) {
+                failStr(format("mismatched types: expected `{}`, found `{}`\nnote: {} has type `{}`\nhelp: a value of type `{}` may not fit in `{}`; convert it explicitly with `as {}`",
+                               typeName(want.kind), typeName(gk), notePlace(what), typeName(want.kind),
+                               typeName(gk), typeName(want.kind), typeName(want.kind)));
+            }
+            return;
+        }
         if (typeFits(want.kind, want.structName, gk, gn, self.weakArg(a, src))) { return; }
         // A distinct type and its base (or any other scalar) meet only through `as`.
         if ((want.kind == Lit.Struct && gReg.isDistinct(want.structName)) || (gk == Lit.Struct && gReg.isDistinct(gn))) {
-            failStr(format("{} is a {}, and this gives it a {} -- a distinct type converts only by `as`: `x as {}`", what,
+            failStr(format("mismatched types: expected `{}`, found `{}`\nnote: a distinct type converts only with `as`\nhelp: write `x as {}`",
                            self.spellType(want.kind, want.structName), self.spellType(gk, gn),
                            self.spellType(want.kind, want.structName)));
         }
-        failStr(format("{} is a {}, and this gives it a {}", what,
-                       self.spellType(want.kind, want.structName), self.spellType(gk, gn)));
+        // Two fn types that `fnSigsFit` keeps apart: a call through the place is compiled against
+        // its own type, so the function stored must take the same arguments the same way.
+        if (want.kind == Lit.Fn && gk == Lit.Fn) {
+            failStr(format("mismatched types: expected `{}`, found `{}`\nnote: a fn value must take the same parameters, each passed the same way (lent, or given with `sink` where the type owns something), and return the same type",
+                           nameOf(want.structName), nameOf(gn)));
+        }
+        failStr(format("mismatched types: expected `{}`, found `{}`\nnote: {} has type `{}`",
+                       self.spellType(want.kind, want.structName), self.spellType(gk, gn), notePlace(what),
+                       self.spellType(want.kind, want.structName)));
     }
     // A float literal (`Op.Literal` with its spelling) stored where an `f32` is wanted is an `f32`
     // literal: rounded once, from the decimal, to that width. So is arithmetic over nothing but
@@ -3239,15 +3521,26 @@ methods Checker {
     }
 
     // Arithmetic over nothing but integer literals (`1 << 40`, `65536 * 65536`) where an 8-byte
-    // integer is wanted -- stored in one, passed as one, or meeting one in an operation -- is
-    // computed at that width, as a lone literal takes the type it is handed. It was computed as an
-    // `int` and wrapped: `x: long = 1 << 40` was 0. Answers whether it changed anything.
+    // integer is wanted (stored in one, passed as one, or meeting one in an operation) is computed
+    // at that width, as a lone literal takes the type it is handed. Computed as an `int` it would
+    // wrap, and `x: long = 1 << 40` would be 0. The same goes for a shift whose left operand is
+    // such arithmetic, whatever its count: a shift has its left operand's type, and
+    // `m: long = 1 << k` means a `long` one. Answers whether it changed anything.
     adoptWide &self inout a:Ast id:NodeId want:Lit -> bool {
         if (id == NO_NODE || (want != Lit.Long && want != Lit.U64)) { return false; }
         e: Expr = a.expr(id);
-        if (e.left == NO_NODE || e.kind == want || !self.weakArg(a, id)) { return false; }
-        self.retypeIntTree(a, id, want);
-        return true;
+        if (e.left == NO_NODE || e.kind == want) { return false; }
+        if (self.weakArg(a, id)) {
+            self.retypeIntTree(a, id, want);
+            return true;
+        }
+        if ((e.op == Op.ShiftLeft || e.op == Op.ShiftRight) && self.weakArg(a, e.left)) {
+            self.retypeIntTree(a, e.left, want);
+            e.kind = want;
+            a.setExpr(id, e);
+            return true;
+        }
+        return false;
     }
     retypeIntTree &self inout a:Ast id:NodeId want:Lit -> void {
         if (id == NO_NODE) { return; }
@@ -3295,7 +3588,8 @@ methods Checker {
         if (self.adoptFloat(a, id, want)) { return; }
         if (!isFloat(want) && !isFloat(got)) { return; }
         if (want == got || want == Lit.Void || got == Lit.Void || want == Lit.TypeVar || got == Lit.TypeVar) { return; }
-        failStr(format("{} is a {}, and this gives it a {} -- convert with `as`", what, typeName(want), typeName(got)));
+        failStr(format("mismatched types: expected `{}`, found `{}`\nnote: {} has type `{}`\nhelp: convert it explicitly with `as {}`",
+                       typeName(want), typeName(got), notePlace(what), typeName(want), typeName(want)));
     }
 
     // The zero the parser writes for `-x`: an integer literal 0, marked.
@@ -3323,6 +3617,72 @@ methods Checker {
         p: Payload = e.payload;
         match p { Num(v) { return Option.Some(v); } _ { } }
         return Option.None;
+    }
+
+    // The value of a weak expression (`weakArg`: a literal, or arithmetic over nothing but
+    // literals), computed exactly in 64 bits, or None when it is not one or has no value (a
+    // division by zero, a shift past the word).
+    weakValue &self inout a:Ast id:NodeId -> Option<long> {
+        if (id == NO_NODE) { return Option.None; }
+        e: Expr = a.expr(id);
+        if (e.left == NO_NODE) {
+            if (!isWeakLiteral(e)) { return Option.None; }
+            return self.literalValue(a, id);
+        }
+        if (isComparison(e.op) || e.op == Op.LogicalAnd || e.op == Op.LogicalOr || e.op == Op.Assignment) { return Option.None; }
+        l: long = 0;
+        r: long = 0;
+        match self.weakValue(a, e.left) { Some(v) { l = v; } None { return Option.None; } }
+        match self.weakValue(a, e.right) { Some(v) { r = v; } None { return Option.None; } }
+        if (e.op == Op.Addition)       { return Option.Some(l + r); }
+        if (e.op == Op.Subtraction)    { return Option.Some(l - r); }
+        if (e.op == Op.Multiplication) { return Option.Some(l * r); }
+        if (e.op == Op.BitwiseAnd)     { return Option.Some(l & r); }
+        if (e.op == Op.BitwiseOr)      { return Option.Some(l | r); }
+        if (e.op == Op.BitwiseXor)     { return Option.Some(l ^ r); }
+        if (e.op == Op.Division || e.op == Op.Modulus) {
+            if (r == 0) { return Option.None; }
+            if (e.op == Op.Division) { return Option.Some(l / r); }
+            return Option.Some(l % r);
+        }
+        if ((e.op == Op.ShiftLeft || e.op == Op.ShiftRight) && r >= 0 && r < 64) {
+            if (e.op == Op.ShiftLeft) { return Option.Some(l << r); }
+            return Option.Some(l >> r);
+        }
+        return Option.None;
+    }
+
+    // A literal operand `id` (or literal arithmetic) meeting a typed integer operand `other` of
+    // type `want` takes that type when its value is one of `want`'s, as the untyped constant it is
+    // (`b + 1` is a `u8` for `b: u8`): it is replaced by that value, a literal of `want`, so the
+    // arithmetic it was written as is not redone at `want`'s width (`b + 600 / 3`). Answers
+    // whether it did.
+    adoptLiteral &self inout a:Ast id:NodeId own:Lit other:NodeId want:Lit -> bool {
+        if (id == NO_NODE || own == want || !isInteger(want) || !self.weakArg(a, id) || self.weakArg(a, other)) { return false; }
+        v: long = 0;
+        match self.weakValue(a, id) { Some(x) { v = x; } None { return false; } }
+        if (!literalFits(v, want)) { return false; }
+        e: Expr = a.expr(id);
+        a.setExpr(id, Expr { op: Op.Literal, left: NO_NODE, right: NO_NODE, kind: want, structName: NO_SYM,
+                             isParen: e.isParen, payload: Payload.Num(v) });
+        return true;
+    }
+
+    // Whether storing `src`, a `got`, into a place of integer type `want` narrows it: `got` does
+    // not widen into `want` losslessly and `src` is no constant that is one of `want`'s values.
+    // A constant that is not is refused here, said as what it is.
+    narrows &self inout a:Ast want:Lit got:Lit src:NodeId -> bool {
+        if (!isInteger(want) || !isInteger(got) || canImplicitlyConvert(got, want)) { return false; }
+        if (src != NO_NODE && self.weakArg(a, src)) {
+            match self.weakValue(a, src) {
+                Some(v) {
+                    if (literalFits(v, want)) { return false; }
+                    failStr(format("constant `{}` out of range for `{}`", v, typeName(want)));
+                }
+                None { }
+            }
+        }
+        return true;
     }
 
     // The variable a borrow is rooted in: the base of a field chain, the base of an index, the
@@ -3361,13 +3721,13 @@ methods Checker {
         if (self.unsafeDepth > 0 || v == NO_NODE) { return; }
         root: Sym = self.borrowRoot(a, v, 0);
         if (root == NO_SYM) { return; }
-        if (gReg.findGlobal(nameOf(root)) >= 0) { return; }
+        if (gReg.findGlobalSym(root) >= 0) { return; }
         conv: Conv = self.paramConvOf(a, self.curFn, root);
         if (conv == Conv.Read || conv == Conv.Inout) { return; }
-        why: str = "this frame's own local";
-        if (conv == Conv.Sink) { why = "a `sink` parameter, which this frame releases when it ends"; }
-        failStr(format("'{}' returns a borrow of {} ('{}') — return the value, or take the parameter as a borrow so the caller still owns it",
-                       nameOf(a.fns.get(self.curFn).name), why, nameOf(root)));
+        why: str = "a local of this function, which ends with the call";
+        if (conv == Conv.Sink) { why = "a `sink` parameter, which this function releases when it ends"; }
+        failStr(format("cannot return a borrow of `{}`\nnote: `{}` is {}\nhelp: return the value, or take the parameter as a borrow so the caller still owns it",
+                       nameOf(root), nameOf(root), why));
     }
 
     // A place as a message names it: the variable, without the suffix shadowing gave it.
@@ -3379,7 +3739,7 @@ methods Checker {
                     nm: str = nameOf(n);
                     cut: Option<long> = strFind(nm, "$");
                     match cut { Some(i) { nm = strSlice(nm, 0, i); } None { } }
-                    return keepString(format("'{}'", nm));
+                    return keepString(format("`{}`", nm));
                 }
                 _ { }
             }
@@ -3387,12 +3747,9 @@ methods Checker {
         return "the assigned place";
     }
 
-    // The type a receiver names, when it names a type rather than holding a value: a bare name
-    // that no variable owns and that the registry knows as a struct. NO_SYM for everything else,
-    // which is the ordinary case of a method on a value.
     // A generic struct or sum type, as opposed to a generic function: one that has methods.
     isTypeTemplate &self n:Sym -> bool {
-        at: long = gReg.findTemplate(nameOf(n));
+        at: long = gReg.findTemplateSym(n);
         if (at < 0) { return false; }
         t: GTemplate = gReg.templateDef(at);
         return t.isEnum || t.fieldCount > 0;
@@ -3409,7 +3766,7 @@ methods Checker {
         at: long = -1;
         match hit { Some(i) { at = i; } None { return fn; } }
         f: FnNode = a.fns.get(at);
-        t: GTemplate = gReg.templateDef(gReg.findTemplate(nameOf(st)));
+        t: GTemplate = gReg.templateDef(gReg.findTemplateSym(st));
         bind: HashMap<str, TypeRef>;
         for pass in 0..2 {
             k: long = 0;
@@ -3433,7 +3790,7 @@ methods Checker {
                 None {
                     b = gReg.gParamDefault(t, k);
                     if (b.base == Lit.Void) {
-                        failStr(format("cannot infer {} for this call to '{}': no argument or destination says which {} it is",
+                        failStr(format("cannot infer `{}` for the call to `{}`\nnote: no argument or destination says which `{}` it is",
                                        nameOf(gReg.gParamAt(t, k)), nameOf(fn), nameOf(st)));
                     }
                     bind.put(nameOf(gReg.gParamAt(t, k)), b);
@@ -3463,6 +3820,9 @@ methods Checker {
         return m;
     }
 
+    // The type a receiver names, when it names a type rather than holding a value: a bare name
+    // that no variable owns and that the registry knows as a struct. NO_SYM for everything else,
+    // which is the ordinary case of a method on a value.
     staticOwner &self inout a:Ast recv:NodeId -> Sym {
         if (recv == NO_NODE) { return NO_SYM; }
         e: Expr = a.expr(recv);
@@ -3473,17 +3833,17 @@ methods Checker {
         if (self.lookup(n).kind != Lit.Void) { return NO_SYM; }      // a variable of that name wins
         // Already qualified: monomorphization writes the bound type's full name where a template
         // said `T`, and resolving one of those again finds nothing.
-        if (gReg.hasStruct(nameOf(n))) { return n; }
+        if (gReg.hasStructSym(n)) { return n; }
         // A scalar's spelling, which is what monomorphization writes for `T.decode(inp)` at
         // T = long: its methods are `long_decode`, named from that spelling.
         if (namesScalar(nameOf(n)) && isImplableScalar(scalarNamed(nameOf(n)))) { return n; }
         // An enum of named integers has no struct row, but static methods all the same.
-        if (gReg.findEnum(nameOf(n)) >= 0) { return n; }
+        if (gReg.findEnumSym(n) >= 0) { return n; }
         // Resolved from the module being checked, so a type declared here wins over one of the
         // same name imported from elsewhere: `LockGuard.new()` in a file with its own LockGuard
         // means that one, not `sync`'s.
         q: Sym = gReg.resolveBare(nameOf(self.currentModule), nameOf(n));
-        if (gReg.hasStruct(nameOf(q))) { return q; }
+        if (gReg.hasStructSym(q)) { return q; }
         // A generic type named bare (`Option.fromFlag(...)`): the instance is the call's to infer.
         if (self.isTypeTemplate(n)) { return n; }
         if (self.isTypeTemplate(q)) { return q; }
@@ -3491,13 +3851,13 @@ methods Checker {
         al: long = gReg.findAlias(nameOf(q));
         if (al >= 0) {
             t: TypeRef = gReg.aliasDef(al).target;
-            if (t.base == Lit.Struct && gReg.hasStruct(nameOf(t.name))) { return t.name; }
+            if (t.base == Lit.Struct && gReg.hasStructSym(t.name)) { return t.name; }
         }
         return NO_SYM;
     }
 
-    // A weak argument: a bare integer literal, or arithmetic over nothing but those -- `3 * 4`
-    // is as undecided as `12`, and takes the width of whatever it meets the same way.
+    // A weak argument: a bare integer literal, or arithmetic over nothing but those. `3 * 4` is
+    // as undecided as `12`, and takes the width of whatever it meets the same way.
     weakArg &self inout a:Ast id:NodeId -> bool {
         e: Expr = a.expr(id);
         if (e.left != NO_NODE) {
@@ -3526,8 +3886,8 @@ methods Checker {
             }
             return;
         }
-        rp: long = gReg.findRequest(nameOf(f.returnStruct));
-        wp: long = gReg.findRequest(nameOf(want));
+        rp: long = gReg.findRequestSym(f.returnStruct);
+        wp: long = gReg.findRequestSym(want);
         if (rp < 0 || wp < 0) { return; }
         r: GRequest = gReg.requestAt(rp);
         w: GRequest = gReg.requestAt(wp);
@@ -3546,7 +3906,7 @@ methods Checker {
     // `off` is where the arguments start among the parameters: 1 for a method called on a value,
     // whose receiver is parameter 0 (and says nothing about the method's own type parameters).
     instantiate &self inout a:Ast cn:CallNode fn:Sym want:Sym off:long -> Sym {
-        tat: long = gReg.findTemplate(nameOf(fn));
+        tat: long = gReg.findTemplateSym(fn);
         if (tat < 0) { return fn; }
         t: GTemplate = gReg.templateDef(tat);
         if (t.fieldCount > 0 || t.isEnum) { return fn; }        // a type, not a function
@@ -3559,8 +3919,9 @@ methods Checker {
         // default but takes the width of whatever it meets, so in `binarySearchBy(&xs, 6, c)`
         // it must not out-vote the `Vec<long>` that already fixed T. Strong arguments bind
         // first; a literal then fills in only a parameter nothing else reached, which is what
-        // keeps `takesT(5)` inferring int. Without the split, `key:T` bound T = int after
-        // `v:Vec<T>` had bound it long, and the body called `Vec_int`'s methods on a `Vec<long>`.
+        // keeps `takesT(5)` inferring int. Without the split, `key:T` would bind T = int after
+        // `v:Vec<T>` had bound it long, and the body would call `Vec_int`'s methods on a
+        // `Vec<long>`.
         //
         // A parameter no argument mentions (`count<T, I: Iter<T>>`, where T is named only in
         // I's bound) is read out of the bound instead. That is a fact, so it is asked at the
@@ -3588,7 +3949,7 @@ methods Checker {
                 }
                 k = k + 1;
             }
-            self.inferThroughBounds(&bind, t, f);
+            self.inferThroughBounds(a, &bind, t, f);
             // What the result is stored into speaks after the strong arguments and before a
             // literal: `v: Vec<long> = vecOf(1, 2)` is a Vec<long>, and `vec![]` is inferable.
             if (pass == 0) { self.bindFromExpected(&bind, f, want); }
@@ -3605,7 +3966,7 @@ methods Checker {
                     // What nothing in the call says, the declaration may: `N: long = 4096`.
                     b = gReg.gParamDefault(t, k);
                     if (b.base == Lit.Void) {
-                        failStr(format("cannot infer {} for this call to '{}': no argument says what it is",
+                        failStr(format("cannot infer `{}` for the call to `{}`\nnote: no argument says what it is",
                                        nameOf(gReg.gParamAt(t, k)), nameOf(fn)));
                     }
                     bind.put(nameOf(gReg.gParamAt(t, k)), b);
@@ -3616,19 +3977,20 @@ methods Checker {
             if (gReg.gParamIsLen(t, k) != (b.base == Lit.Len)) {
                 what: str = "a type";
                 if (gReg.gParamIsLen(t, k)) { what = "a length"; }
-                failStr(format("'{}' of '{}' is {}, and this call makes it {}", nameOf(gReg.gParamAt(t, k)),
+                failStr(format("`{}` of `{}` is {} parameter, but this call makes it {}", nameOf(gReg.gParamAt(t, k)),
                                nameOf(fn), what, self.spellType(b.base, b.name)));
             }
             args.push(b);
             s.push('_');
             s.pushStr(typeMangleName(b.base, b.name));
         }
-        // Each of the template's own bounds, held at the call where its parameters became known:
-        // `reset(5)` against `reset<T: Default>` used to be stamped and reach the emitter as
-        // "'int_new' is called". Asked here rather than when the clone is stamped because here a
-        // derive can still be run on demand (`meetsBound`) and a fn value or closure is typed.
-        // On the function's node: a generic function's own, a method's own type parameters' (an
-        // instance's copy of a method takes them from the method's template).
+        // Each of the template's own bounds, held at the call where its parameters became known,
+        // so `reset(5)` against `reset<T: Default>` is refused here instead of being stamped and
+        // reaching the emitter as a call to an `int_new` nobody defined. It is asked here rather
+        // than when the clone is stamped, because here a derive can still be run on demand
+        // (`meetsBound`) and a fn value or closure is typed. The bounds are on the function's
+        // node: a generic function's own, or a method's own type parameters' (an instance's copy
+        // of a method takes them from the method's template).
         bFirst: long = f.firstBound;
         bCount: long = f.boundCount;
         for b in 0..bCount {
@@ -3637,9 +3999,9 @@ methods Checker {
             arg: TypeRef = args.get(mb.param);
             if (!self.boundHolds(a, arg, mb.trait)) {
                 tn: String = spellTypeRef(TypeRef { base: Lit.Struct, name: mb.trait.name });
-                failStr(format("'{}' needs {}: {}, and {} does not implement {}",
-                               nameOf(fn), nameOf(gReg.gParamAt(t, mb.param)), keepString(tn),
-                               self.spellType(arg.base, arg.name), keepString(tn)));
+                failStr(format("`{}` does not implement `{}`\nnote: required by the bound `{}: {}` on `{}`",
+                               self.spellType(arg.base, arg.name), keepString(tn),
+                               nameOf(gReg.gParamAt(t, mb.param)), keepString(tn), nameOf(fn)));
             }
         }
         inst: Sym = internString(s);
@@ -3667,11 +4029,11 @@ methods Checker {
         if (isCoreTraitName(bare) && strStartsWith(bare, "Fn")) {
             if (base.base == Lit.Fn || base.base == Lit.TraitObj) { return true; }
             if (base.base != Lit.Struct) { return false; }
-            return gReg.findStruct(nameOf(base.name)) < 0
+            return gReg.findStructSym(base.name) < 0
                 || self.fnNames.has(nameOf(methodSymbol(base.name, intern("call"))));
         }
         if (base.base == Lit.Struct && !namedScalar(base.base, base.name)
-            && gReg.findStruct(nameOf(base.name)) < 0 && gReg.findEnum(nameOf(base.name)) < 0) { return true; }
+            && gReg.findStructSym(base.name) < 0 && gReg.findEnumSym(base.name) < 0) { return true; }
         if (bare == "Eq") {
             if (base.base != Lit.Struct || namedScalar(base.base, base.name)) { return true; }
             if (gReg.structImplements(nameOf(base.name), tr.name)) { return true; }
@@ -3680,9 +4042,6 @@ methods Checker {
         return self.meetsBound(a, base, tr.name, 0);
     }
 
-    // A template's declared return type under the bindings a call inferred. A bare `T` is what T
-    // turned out to be; `Option<T>` is that template at the bound arguments, which has to be
-    // requested as well as named, since the type did not exist until this call asked for it.
     // How a note names a generic function's instance: `vecOf<long>`.
     instanceLabel &self fn:Sym args:Vec<TypeRef> -> Sym {
         s: String;
@@ -3696,6 +4055,9 @@ methods Checker {
         return internString(s);
     }
 
+    // A template's declared return type under the bindings a call inferred. A bare `T` is what T
+    // turned out to be; `Option<T>` is that template at the bound arguments, which has to be
+    // requested as well as named, since the type did not exist until this call asked for it.
     substReturn &self inout bind:HashMap<str, TypeRef> k:Lit n:Sym -> TypeRef {
         if (k == Lit.TypeVar) {
             hit: Option<TypeRef> = bind.find(nameOf(n));
@@ -3716,7 +4078,7 @@ methods Checker {
             if (!changed) { return TypeRef { base: k, name: n }; }
             return TypeRef { base: k, name: registerTuple(elems) };
         }
-        at: long = gReg.findRequest(nameOf(n));
+        at: long = gReg.findRequestSym(n);
         if (at < 0) { return TypeRef { base: k, name: n }; }
         r: GRequest = gReg.requestAt(at);
         if (!gReg.isPatternRequest(r)) { return TypeRef { base: k, name: n }; }
@@ -3757,28 +4119,32 @@ methods Checker {
     }
 
     // `with x { ... }`: a scoped wrapper. `x.hold()` returns a guard, the body runs, and the
-    // guard is released at the end of the block. Written out here as an ordinary block so that
+    // guard is released when the block is left. Written out here as an ordinary block so that
     // nothing downstream has to know `with` exists:
     //
-    //     { g: G = x.hold();  <body>  G_drop(&g); }
+    //     { g: G = x.hold();  <body> }
     //
-    // The guard is what makes the release automatic even though the body never mentions it. A
-    // `return` out of the body would skip that release (the same hole `with` exists to close)
-    // so one is rejected rather than silently leaking the lock.
+    // The guard is a local like any other, so its release is the ordinary drop at the end of its
+    // scope, which ownership places on every way out of the block: the end, a `break` or a
+    // `continue`, a `return` or a `?`, and a `raise` that a `recover` around it catches. A drop
+    // written out here as well would release the guard a second time.
     desugarWith &self inout a:Ast at:long -> void {
         w: WithNode = a.withs.get(at);
         x: VarType = self.lookup(self.resolveVar(w.name));
         if (x.kind != Lit.Struct || x.structName == NO_SYM) {
-            failStr(format("`with` needs a wrapper struct, but '{}' is not one", nameOf(w.name)));
+            failStr(format("cannot use `{}` in `with`\nnote: `with` needs a wrapper struct", nameOf(w.name)));
         }
         hold: Sym = self.resolveFn(methodSymbol(x.structName, intern("hold")));
         g: VarType = self.returnOf(hold);
         if (g.kind != Lit.Struct || g.structName == NO_SYM) {
-            failStr(format("'{}' has no hold() returning a guard, so it cannot be used in `with`",
-                           nameOf(x.structName)));
+            failStr(format("cannot use `{}` in `with`\nnote: its type `{}` has no `hold()` that returns a guard",
+                           nameOf(w.name), nameOf(x.structName)));
         }
-        if (self.blockReturns(a, w.body)) {
-            failStr(stringOf("`return` inside `with` would skip the release — end the block first"));
+        // A guard with no Drop would make `with` a no-op that quietly holds the lock forever, so
+        // its absence is an error rather than something to skip.
+        if (!self.fnNames.has(nameOf(methodSymbol(g.structName, intern("drop"))))) {
+            failStr(format("the guard `{}` that `{}.hold()` returns does not implement `Drop`\nnote: `with` releases the guard by dropping it, so without `Drop` it would never be released",
+                           nameOf(g.structName), nameOf(x.structName)));
         }
 
         // g: G = x.hold();
@@ -3789,6 +4155,7 @@ methods Checker {
         // owner prepended to it a second time.
         a.calls.push(CallNode { name: intern("hold"), receiver: recv, firstArg: 0, argCount: 0,
                                 slot: NO_SLOT, callee: NO_NODE, sigKey: NO_SYM });
+        self.withHolds.put(a.calls.len() - 1, true);
         call: NodeId = a.leafOf(Op.MethodCall, Payload.Call(a.calls.len() - 1),
                                 Lit.Struct, g.structName);
         gname: Sym = internString(format("$guard{}", self.guards));
@@ -3810,23 +4177,6 @@ methods Checker {
 
         n: long = a.blockLen(w.body);
         for k in 0..n { ids.push(a.stmtRuns.get(a.blocks.get(w.body).firstStmt + k)); }
-
-        // G_drop(&g): the release, at the end and on every path through the block.
-        // The release. A guard with no Drop would make `with` a no-op that quietly holds the
-        // lock forever, so its absence is an error rather than something to skip.
-        drop: Sym = methodSymbol(g.structName, intern("drop"));
-        if (!self.fnNames.has(nameOf(drop))) {
-            failStr(format("'{}' is the guard '{}.hold()' returns but has no Drop, so `with` would never release it",
-                           nameOf(g.structName), nameOf(x.structName)));
-        }
-        // Written as `g.drop()` rather than as a direct call on `&g`: a `&self` receiver is passed
-        // by address, and the method path is what knows that.
-        gref: NodeId = a.leafOf(Op.Lvalue, Payload.Name(gname), Lit.Struct, g.structName);
-        a.calls.push(CallNode { name: intern("drop"), receiver: gref, firstArg: 0, argCount: 0,
-                                slot: NO_SLOT, callee: NO_NODE, sigKey: NO_SYM });
-        dc: NodeId = a.leafOf(Op.MethodCall, Payload.Call(a.calls.len() - 1), Lit.Void, NO_SYM);
-        a.exprStmts.push(ExprStmtNode { value: dc });
-        ids.push(a.addStmt(StmtKind.Expr, a.exprStmts.len() - 1));
 
         // The rewritten run replaces the `with`'s body, so the node stays a `With` and the
         // lowerer runs it as the block it now is.
@@ -3857,7 +4207,7 @@ methods Checker {
                 self.projectBlock(a, nd.body, x, g, reader);
                 f = nd.elseIf;
             }
-        } else if (st.kind == StmtKind.While) {
+        } else if (st.kind == StmtKind.While || st.kind == StmtKind.Recover) {
             wn: WhileNode = a.whiles.get(st.at);
             self.projectExpr(a, wn.cond, x, g, reader);
             self.projectBlock(a, wn.body, x, g, reader);
@@ -3895,14 +4245,14 @@ methods Checker {
         // `&x` inside the body has nothing to point at: within the block `x` names the value the
         // guard holds, reached through `get()`/`set()`, and it has no address of its own. The
         // `Sub` arm below would rewrite the operand to `g.get()` and leave the `&` taking the
-        // address of that temporary, which compiled cleanly and segfaulted. A name that cannot
+        // address of that temporary, which would compile cleanly and crash. A name that cannot
         // be lent has to say so.
         if (e.op == Op.AddressOf) {
             p0: Payload = e.payload;
             match p0 {
                 Sub(v) {
                     if (self.namesVar(a, v, x)) {
-                        failStr(format("can't take the address of '{}' inside `with` — there it names the value the guard holds, which has no address of its own",
+                        failStr(format("cannot take the address of `{}` inside `with`\nnote: inside the block it names the value the guard holds, which has no address of its own",
                                        nameOf(x)));
                     }
                 }
@@ -3955,8 +4305,8 @@ methods Checker {
                              payload: Payload.Call(a.calls.len() - 1) });
     }
 
-    // Whether a block can leave its function. Only the statements a `with` body may hold are
-    // walked, which is all this question needs.
+    // Whether a block can leave its function through a `return` (a `?` is one by now) anywhere
+    // inside it.
     blockReturns &self inout a:Ast b:long -> bool {
         n: long = a.blockLen(b);
         for k in 0..n {
@@ -3970,6 +4320,10 @@ methods Checker {
             if (st.kind == StmtKind.While) {
                 if (self.blockReturns(a, a.whiles.get(st.at).body)) { return true; }
             }
+            if (st.kind == StmtKind.Recover) {
+                if (self.blockReturns(a, a.whiles.get(st.at).body)) { return true; }
+                if (self.blockReturns(a, a.whiles.get(st.at).step)) { return true; }
+            }
             if (st.kind == StmtKind.Loop || st.kind == StmtKind.Unsafe
                 || st.kind == StmtKind.Block) {
                 if (self.blockReturns(a, a.blockStmts.get(st.at).body)) { return true; }
@@ -3977,9 +4331,9 @@ methods Checker {
             if (st.kind == StmtKind.With) {
                 if (self.blockReturns(a, a.withs.get(st.at).body)) { return true; }
             }
-            // A `return` in an arm. Missing, a function whose every path returns from inside a
-            // `match` (`BufWriter.due`) counted as never returning, which the back end now
-            // believes: code after a call to one is deleted (`Instr.noReturn`).
+            // A `return` in an arm. Without this, a function whose every path returns from inside
+            // a `match` (`BufWriter.due`) would count as never returning, and the back end
+            // believes that: code after a call to one is deleted (`Instr.noReturn`).
             if (st.kind == StmtKind.Match) {
                 m: MatchNode = a.matches.get(st.at);
                 for j in 0..m.armCount {
@@ -4026,6 +4380,10 @@ methods Checker {
         }
         // A `with` body that exits takes its guard's release with it; the desugar puts the
         // release before the return, and a `return` out of one is refused elsewhere.
+        // A `raise` under the body lands in the handler, so both have to.
+        if (st.kind == StmtKind.Recover) {
+            return self.alwaysExits(a, a.whiles.get(st.at).body) && self.alwaysExits(a, a.whiles.get(st.at).step);
+        }
         if (st.kind == StmtKind.With) { return self.alwaysExits(a, a.withs.get(st.at).body); }
         // Every arm, or it is not settled, and a `match` is exhaustive, so every arm is every
         // path.
@@ -4095,6 +4453,11 @@ methods Checker {
                 if (self.blockBreaks(a, a.withs.get(st.at).body)) { return true; }
                 continue;
             }
+            if (st.kind == StmtKind.Recover) {
+                if (self.blockBreaks(a, a.whiles.get(st.at).body)) { return true; }
+                if (self.blockBreaks(a, a.whiles.get(st.at).step)) { return true; }
+                continue;
+            }
             if (st.kind == StmtKind.Match) {
                 m: MatchNode = a.matches.get(st.at);
                 for j in 0..m.armCount {
@@ -4140,7 +4503,7 @@ methods Checker {
     holdsView &self k:Lit n:Sym depth:long -> bool {
         if (k == Lit.TraitObj) { return true; }
         if (k != Lit.Struct || n == NO_SYM || depth > MAX_VIEW_DEPTH) { return false; }
-        at: long = gReg.findStruct(nameOf(n));
+        at: long = gReg.findStructSym(n);
         if (at < 0) { return false; }
         d: StructDef = gReg.structDef(at);
         for i in 0..d.fieldCount {
@@ -4162,18 +4525,19 @@ methods Checker {
             what: str = "a borrowed view";
             if (f.returnKind != Lit.TraitObj) { what = "a value holding a borrowed view"; }
             self.atFn(a, i - 1);
-            failStr(format("'{}' returns {} ({}) — it points into the frame this returns from; take the concrete type, or declare the function `unsafe` to vouch for it",
-                           nameOf(f.name), what, self.spellType(f.returnKind, f.returnStruct)));
+            failStr(format("cannot return {} of type `{}` from `{}`\nnote: it points into the frame the function returns from\nhelp: return the concrete type, or declare the function `unsafe` to vouch for it",
+                           what, self.spellType(f.returnKind, f.returnStruct), nameOf(f.name)));
         }
     }
 
     // A `str`, a slice, a trait object and a fn value are views: what the closure captures is the
     // handle, copied, so assigning to it inside the body changes the copy and nothing outside.
-    // The write compiled and did nothing, which is worse than either allowing or refusing it.
+    // Left alone, the write would compile and do nothing, which is worse than either a write that
+    // works or a refusal.
     //
-    // A captured struct is not one of these (it is captured as the value it is) so only the
-    // four handle kinds are refused. `capturesMutably` already answers which captures a body
-    // writes; it was only ever asked for the exclusivity check.
+    // A captured struct is not one of these (it is captured as the value it is), so only the
+    // four handle kinds are refused. `capturesMutably` answers which captures a body writes; the
+    // exclusivity check asks it too.
     checkCapturedWrites &self inout a:Ast -> void {
         for i in 0..gReg.structCount() {
             d: StructDef = gReg.structDef(i);
@@ -4187,7 +4551,7 @@ methods Checker {
                       || f.kind == Lit.TraitObj || f.kind == Lit.Fn)) { continue; }
                 if (!self.capturesMutably(a, d.name, f.name)) { continue; }
                 self.atFn(a, self.fnNodeOf(methodName(d.name, intern("call"))));
-                failStr(format("a closure cannot assign to '{}': a {} is captured by value, so the write would change the closure's own copy and nothing else",
+                failStr(format("cannot assign to the captured `{}` inside a closure\nnote: a closure captures a `{}` by value, so the write would change only its own copy",
                                nameOf(f.name), typeName(f.kind)));
             }
         }
@@ -4206,7 +4570,7 @@ methods Checker {
     checkImplConventions &self inout a:Ast -> void {
         for i in 0..gReg.implCount() {
             im: TraitImplDef = gReg.implAt(i);
-            tat: long = gReg.findTrait(nameOf(im.trait.name));
+            tat: long = gReg.findTraitSym(im.trait.name);
             if (tat < 0) { continue; }
             t: TraitDef = gReg.traitDef(tat);
             for m in 0..t.methodCount {
@@ -4228,10 +4592,10 @@ methods Checker {
                     if ((want.conv == Conv.Inout) != (have.conv == Conv.Inout)) {
                         self.atFn(a, at);
                         if (want.conv == Conv.Inout) {
-                            failStr(format("'{}' does not fit '{}': the trait lends parameter {} ('{}') `inout`, and this implementation does not -- declare it `inout`",
+                            failStr(format("method `{}` has an incompatible signature for trait `{}`\nnote: the trait lends parameter {} (`{}`) `inout`, and this implementation does not\nhelp: declare it `inout`",
                                            nameOf(f.name), nameOf(im.trait.name), idx, nameOf(want.name)));
                         }
-                        failStr(format("'{}' does not fit '{}': this implementation declares parameter {} ('{}') `inout`, and the trait does not -- a caller through the trait would not know it is written; declare it `inout` in the trait",
+                        failStr(format("method `{}` has an incompatible signature for trait `{}`\nnote: this implementation declares parameter {} (`{}`) `inout`, and the trait does not, so a caller through the trait would not know it is written\nhelp: declare it `inout` in the trait",
                                        nameOf(f.name), nameOf(im.trait.name), idx, nameOf(want.name)));
                     }
                     if (want.kind != Lit.Struct && want.kind != Lit.Ref) { continue; }
@@ -4242,7 +4606,7 @@ methods Checker {
                     fix:  str = "drop the `sink`";
                     if (want.conv == Conv.Sink) { verb = "takes"; fix = "declare it `sink`"; }
                     self.atFn(a, at);
-                    failStr(format("'{}' does not fit '{}': the trait {} parameter {} ('{}') and this implementation does not — {}",
+                    failStr(format("method `{}` has an incompatible signature for trait `{}`\nnote: the trait {} parameter {} (`{}`), and this implementation does not\nhelp: {}",
                                    nameOf(f.name), nameOf(im.trait.name), verb, idx,
                                    nameOf(want.name), fix));
                 }
@@ -4297,14 +4661,14 @@ methods Checker {
             // `-> never`: no path may reach the end (a `return` in one was refused where it stood).
             if (isNeverFn(f) && !self.alwaysExits(a, f.body)) {
                 self.atFn(a, i - 1);
-                failStr(format("'{}' is declared `-> never`, and control can reach the end of it -- every path must end in a call to a `-> never` function, an endless `loop`, or an `asm -> never` block",
+                failStr(format("control can reach the end of `{}`, which is declared `-> never`\nhelp: end every path with a call to a `-> never` function, an endless `loop`, or an `asm -> never` block",
                                nameOf(f.name)));
             }
             if (f.returnKind == Lit.Void) { continue; }
             if (self.alwaysExits(a, f.body)) { continue; }
             self.atFn(a, i - 1);
-            failStr(format("'{}' returns a {}, and control can reach the end of it without one — every path needs a `return`",
-                           nameOf(f.name), self.spellType(f.returnKind, f.returnStruct)));
+            failStr(format("missing `return` at the end of `{}`\nnote: `{}` returns `{}`, and control can reach the end of its body",
+                           nameOf(f.name), nameOf(f.name), self.spellType(f.returnKind, f.returnStruct)));
         }
     }
 
@@ -4312,13 +4676,22 @@ methods Checker {
     // `I: Iter<T>` with I = Range: Range implements `Iter<long>`, so the bound's argument list
     // and the impl's line up and T is whatever sits where T was written. Only bounds whose own
     // subject is already bound can say anything, so this runs after the arguments are matched.
-    inferThroughBounds &self inout bind:HashMap<str, TypeRef> t:GTemplate f:FnNode -> void {
+    inferThroughBounds &self inout a:Ast inout bind:HashMap<str, TypeRef> t:GTemplate f:FnNode -> void {
         for b in 0..f.boundCount {
             mb: MethodBound = gReg.boundAt(f.firstBound + b);
             if (mb.trait.argCount == 0 || mb.param >= t.paramCount) { continue; }
             subject: Option<TypeRef> = bind.find(nameOf(gReg.gParamAt(t, mb.param)));
             sub: TypeRef = TypeRef { base: Lit.Void, name: NO_SYM };
             match subject { Some(v) { sub = v; } None { continue; } }
+            // A callable bound (`F: Fn(sink U, &T) -> U`) is answered by the signature of the
+            // callable F turned out to be: a fn value's or a closure's. That is a fact about the
+            // call, so it speaks before a literal: `fold(xs, 0, &addLL)` with `addLL` over `long`s
+            // makes U a `long` (otherwise the `0` would make it an `int`, and the body would store
+            // a `long` in it).
+            if (isCoreTraitName(lastComponentOf(nameOf(mb.trait.name))) && strStartsWith(lastComponentOf(nameOf(mb.trait.name)), "Fn")) {
+                self.bindFromCallable(a, bind, mb.trait, sub);
+                continue;
+            }
             if (sub.base != Lit.Struct) { continue; }
             // The impl of that trait the concrete subject has, and its arguments beside the
             // bound's: a type variable in the bound is answered by what stands opposite it.
@@ -4335,6 +4708,32 @@ methods Checker {
                 }
             }
         }
+    }
+
+    // The parameters and result of the callable `sub` against a callable bound's arguments (the
+    // parameters, then the result), binding each type variable the bound names there.
+    bindFromCallable &self inout a:Ast inout bind:HashMap<str, TypeRef> tr:TraitRef sub:TypeRef -> void {
+        n: long = tr.argCount - 1;
+        if (sub.base == Lit.Fn) {
+            gi: long = gFnSigs.find(sub.name);
+            if (gi < 0) { return; }
+            have: FnSig = gFnSigs.sigAt(gi);
+            if (have.paramCount != n) { return; }
+            for k in 0..n { self.bindPart(bind, gReg.traitArgAt(tr, k), fnParamType(gFnSigs.paramAt(have, k))); }
+            self.bindPart(bind, gReg.traitArgAt(tr, n), have.ret);
+            return;
+        }
+        if (sub.base != Lit.Struct || sub.name == NO_SYM) { return; }
+        hit: Option<long> = self.fnAt.find(nameOf(methodSymbol(sub.name, intern("call"))));
+        at: long = -1;
+        match hit { Some(i) { at = i; } None { return; } }
+        cf: FnNode = a.fns.get(at);
+        if (cf.argCount != n + 1) { return; }                       // the closure's own state first
+        for k in 0..n {
+            pd: VarDeclNode = a.paramAt(cf, k + 1);
+            self.bindPart(bind, gReg.traitArgAt(tr, k), TypeRef { base: pd.kind, name: pd.structName });
+        }
+        self.bindPart(bind, gReg.traitArgAt(tr, n), TypeRef { base: cf.returnKind, name: cf.returnStruct });
     }
 
     // What an argument's type actually is. An `inout` parameter is passed `&v`, and the borrow
@@ -4363,9 +4762,9 @@ methods Checker {
             // A lent parameter (`inout t:T`) is passed as a borrow at every call site, so the
             // argument arrives as a ref whether it was written `&v` or came back from an `at()`
             // that already returned one. The borrow is the lend, not the type: T is what is
-            // behind it, or `take(outer.at(0))` binds `T = &Vec` and no bound on T can ever be
-            // met. Elsewhere the borrow form is deliberately kept (an `Iter<&T>` really does
-            // name the borrow) which is why this is decided here, where the parameter's
+            // behind it, or `take(outer.at(0))` would bind `T = &Vec` and no bound on T could
+            // ever be met. Elsewhere the borrow form is deliberately kept (an `Iter<&T>` really
+            // does name the borrow), which is why this is decided here, where the parameter's
             // convention is in hand, and not wherever two types are matched.
             if (p.conv == Conv.Inout && got == Lit.Ref) { got = Lit.Struct; }
             bind.put(nameOf(p.structName), TypeRef { base: got, name: arg.structName });
@@ -4383,7 +4782,7 @@ methods Checker {
         // a walk down two signatures: the results against each other and then each parameter
         // against its opposite number, and wherever the pattern has a type variable the argument
         // in that place is what it stands for. That is where `U` comes from (the type a mapping
-        // function decides and nothing else in the call mentions) and now also `T` when only the
+        // function decides and nothing else in the call mentions), and also `T` when only the
         // callback names it.
         if (p.kind == Lit.Fn) {
             if (arg.kind != Lit.Fn) { return; }
@@ -4406,7 +4805,7 @@ methods Checker {
             // `&T` names the parameter itself; `Vec<T>` (`inout` or not) names an instance
             // whose arguments are still parameters, and T is found by matching the two
             // instantiations against each other.
-            if (gReg.findRequest(nameOf(p.structName)) < 0 && !isTupleName(p.structName)) {
+            if (gReg.findRequestSym(p.structName) < 0 && !isTupleName(p.structName)) {
                 bind.put(nameOf(p.structName), TypeRef { base: Lit.Struct, name: arg.structName });
                 return;
             }
@@ -4433,8 +4832,8 @@ methods Checker {
             }
             return;
         }
-        pi: long = gReg.findRequest(nameOf(pat));
-        gi: long = gReg.findRequest(nameOf(got));
+        pi: long = gReg.findRequestSym(pat);
+        gi: long = gReg.findRequestSym(got);
         if (pi < 0 || gi < 0) { return; }
         pr: GRequest = gReg.requestAt(pi);
         gr: GRequest = gReg.requestAt(gi);
@@ -4486,13 +4885,14 @@ methods Checker {
         }
     }
 
+    // An expression checked where a value of type `want` is stored: a template literal is aimed
+    // at it (below), and a call whose callee is generic may read its type parameters from it.
+    // A macro call is expanded first, since what it produces is what gets aimed.
+    //
     // `Option.Some(v)` names the template, because a constructor cannot know which instance it
     // is building: `Some(3)` could be an `Option<long>` or an `Option<int>`. The type the value
     // is being used as settles it, which is why this is done where that type is known: a
     // declaration's annotation, an assignment's target, a return's declared type.
-    // An expression checked where a value of type `want` is stored: a template literal is aimed
-    // at it (below), and a call whose callee is generic may read its type parameters from it.
-    // A macro call is expanded first, since what it produces is what gets aimed.
     checkAimed &self inout a:Ast id:NodeId want:Sym -> VarType {
         if (id == NO_NODE) { return varType(Lit.Void, NO_SYM); }
         if (a.expr(id).op == Op.MacroCall) { self.spliceMacroCall(a, id); }
@@ -4506,10 +4906,10 @@ methods Checker {
     resolveTemplateLit &self inout a:Ast id:NodeId want:Sym -> void {
         if (id == NO_NODE || want == NO_SYM) { return; }
         e: Expr = a.expr(id);
-        // A call passes the target through to its arguments: `m: Option<long> = mapOption(
-        // Option.None, &dbl)` names no instance anywhere, and the declaration is the only thing
-        // that says which. Only an argument of the same template is aimed. Anything else the
-        // call's own parameters decide.
+        // A call passes the target through to its arguments:
+        // `m: Option<long> = mapOption(Option.None, &dbl)` names no instance anywhere, and the
+        // declaration is the only thing that says which. Only an argument of the same template is
+        // aimed; the call's own parameters decide anything else.
         if (e.op == Op.FunctionCall || e.op == Op.MethodCall) {
             p2: Payload = e.payload;
             c: long = -1;
@@ -4526,8 +4926,8 @@ methods Checker {
         at: long = -1;
         match p { Lit(l) { at = l; } _ { return; } }
         n: LitNode = a.lits.get(at);
-        if (gReg.findTemplate(nameOf(n.typeName)) < 0 && !self.aimSelfLit(at, n.typeName, want)) { return; }   // already an instance
-        if (gReg.findStruct(nameOf(want)) < 0) { return; }           // not stamped: nothing to aim at
+        if (gReg.findTemplateSym(n.typeName) < 0 && !self.aimSelfLit(at, n.typeName, want)) { return; }   // already an instance
+        if (gReg.findStructSym(want) < 0) { return; }           // not stamped: nothing to aim at
         n.typeName = want;
         a.lits.set(at, n);
         e.kind = Lit.Struct;
@@ -4540,8 +4940,8 @@ methods Checker {
     // is another instance of the same template, which is the one meant.
     aimSelfLit &self at:long have:Sym want:Sym -> bool {
         if (want == NO_SYM || want == have || !gSelfLits.has(at)) { return false; }
-        hr: long = gReg.findRequest(nameOf(have));
-        wr: long = gReg.findRequest(nameOf(want));
+        hr: long = gReg.findRequestSym(have);
+        wr: long = gReg.findRequestSym(want);
         return hr >= 0 && wr >= 0 && gReg.requestAt(hr).base == gReg.requestAt(wr).base;
     }
 
@@ -4552,7 +4952,7 @@ methods Checker {
     // which is what lets the rest of the compiler stay ignorant of tuples.
     aimTupleLit &self inout a:Ast id:NodeId want:Sym -> void {
         if (!isTupleName(want)) { return; }
-        si: long = gReg.findStruct(nameOf(want));
+        si: long = gReg.findStructSym(want);
         if (si < 0) { return; }
         e: Expr = a.expr(id);
         p: Payload = e.payload;
@@ -4561,8 +4961,8 @@ methods Checker {
         n: LitNode = a.lits.get(at);
         d: StructDef = gReg.structDef(si);
         if (n.initCount != d.fieldCount) {
-            failStr(format("a {}-element tuple where a {}-element one is wanted",
-                           n.initCount, d.fieldCount));
+            failStr(format("mismatched types: expected a {}-element tuple, found a {}-element tuple",
+                           d.fieldCount, n.initCount));
         }
         for k in 0..n.initCount {
             iv: InitNode = a.inits.get(n.firstInit + k);
@@ -4606,22 +5006,17 @@ methods Checker {
         at: long = -1;
         match p { Lit(l) { at = l; } _ { return; } }
         base: Sym = a.lits.get(at).typeName;
-        if (gReg.findTemplate(nameOf(base)) < 0) { return; }      // already an instance
-        r: long = gReg.findRequest(nameOf(want));
+        if (gReg.findTemplateSym(base) < 0) { return; }      // already an instance
+        r: long = gReg.findRequestSym(want);
         if (r < 0 || gReg.requestAt(r).base != base) { return; }  // a different template
         self.resolveTemplateLit(a, id, want);
     }
 
-    // A concrete value handed to a trait-typed parameter becomes a trait object there: the
-    // argument is wrapped in a `MakeTraitObj`, which lowering turns into the {data, vtable} pair.
-    // Done here rather than in the parser because it takes the callee's signature to know that
-    // the parameter is a trait at all.
-    // A fn-typed argument against a fn-typed parameter, on the one question a fn type exists to
-    // answer: `fn(Res)` lends its argument and `fn(sink Res)` takes it, so a callee of one shape
-    // cannot stand in a slot of the other, whichever way round, one end releases what the other
-    // already released. Only that disagreement is reported here; two fn types that differ in
-    // anything else are a mismatch this compiler does not yet diagnose at all, and inventing half
-    // of one would be worse than the silence.
+    // Each argument of a call against the parameter it lands in: the count (`checkArity`), two
+    // structs by name, and everything else by `typeFits`. A fn-typed argument against a fn-typed
+    // parameter is also asked the one question a fn type exists to answer: `fn(Res)` lends its
+    // argument and `fn(sink Res)` takes it, so a callee of one shape cannot stand in a slot of the
+    // other. Whichever way round, one end would release what the other already released.
     checkFnArgs &self inout a:Ast cn:CallNode fn:Sym base:long -> void {
         hit: Option<long> = self.fnAt.find(nameOf(fn));
         at: long = -1;
@@ -4637,13 +5032,13 @@ methods Checker {
                     if (self.readsTryLocal(a, a.argAt(cn, k))) {
                         self.refuseTryResidual(varType(got.kind, got.structName), varType(p.kind, p.structName));
                     }
-                    failStr(format("argument {} of {} is a {}, but the parameter '{}' is a {}",
-                                   base + k, nameOf(fn), nameOf(got.structName), nameOf(p.name), nameOf(p.structName)));
+                    failStr(format("mismatched types: expected `{}`, found `{}`\nnote: parameter `{}` of `{}` has type `{}`",
+                                   nameOf(p.structName), nameOf(got.structName), nameOf(p.name), nameOf(fn), nameOf(p.structName)));
                 }
                 if (p.kind == Lit.Fn && got.kind == Lit.Fn && !p.isVariadic
                     && fnSigsClashOnOwnership(got.structName, p.structName)) {
-                    failStr(format("argument {} of {} is a {} but the parameter is a {} — a fn type lends a struct argument unless it says `sink`, and the function pointed to must do the same",
-                                   base + k, nameOf(fn), nameOf(got.structName),
+                    failStr(format("mismatched types: expected `{}`, found `{}`\nnote: parameter `{}` of `{}` has type `{}`\nnote: a fn type lends a struct argument unless it says `sink`, and the function pointed to must do the same",
+                                   nameOf(p.structName), nameOf(got.structName), nameOf(p.name), nameOf(fn),
                                    nameOf(p.structName)));
                 }
                 // A variadic parameter is a run of arguments of its element type, and binding
@@ -4665,9 +5060,9 @@ methods Checker {
                     if (self.readsTryLocal(a, a.argAt(cn, k))) {
                         self.refuseTryResidual(varType(vk, vn), varType(p.kind, p.structName));
                     }
-                    failStr(format("argument {} of {} is a {}, but the parameter '{}' is a {}",
-                                   base + k, nameOf(fn), self.spellType(vk, vn),
-                                   nameOf(p.name), self.spellType(p.kind, p.structName)));
+                    failStr(format("mismatched types: expected `{}`, found `{}`\nnote: parameter `{}` of `{}` has type `{}`",
+                                   self.spellType(p.kind, p.structName), self.spellType(vk, vn),
+                                   nameOf(p.name), nameOf(fn), self.spellType(p.kind, p.structName)));
                 }
             }
             self.checkAnyArg(a, cn, f, fn, base, k);
@@ -4675,9 +5070,10 @@ methods Checker {
     }
 
     // An argument that lands in a `...any` run. `any` is a 24-byte box with a tag, and `boxAny`
-    // in the lowerer knows exactly six shapes to build one from; a value of any other type had
-    // its first word stored as if it were the whole thing. A `[u8]` is the case that shows it:
-    // sixteen bytes written as eight, and then the formatter read a length as a pointer.
+    // in the lowerer knows exactly six shapes to build one from; a value of any other type would
+    // have its first word stored as if it were the whole thing. A `[u8]` shows why that matters:
+    // sixteen bytes would be written as eight, and the formatter would read a length as a
+    // pointer.
     checkAnyArg &self inout a:Ast cn:CallNode f:FnNode fn:Sym base:long k:long -> void {
         if (f.argCount == 0) { return; }
         last: VarDeclNode = a.paramAt(f, f.argCount - 1);
@@ -4697,34 +5093,36 @@ methods Checker {
         }
         v: Expr = self.lentValue(a, arg);
         if (boxableAsAny(v.kind, v.structName)) { return; }
-        failStr(format("argument {} of {} is a {}, which `any` cannot carry — it holds an integer, a `str`, a pointer, or a value whose type implements `Display`",
-                       base + k, nameOf(fn), self.spellType(v.kind, v.structName)));
+        failStr(format("cannot pass `{}` as `any` in argument {} of `{}`\nnote: an `any` holds an integer, a `str`, a pointer, or a value whose type implements `Display`",
+                       self.spellType(v.kind, v.structName), base + k, nameOf(fn)));
     }
 
     // How many arguments the callee declared, against how many the call gives. A variadic last
     // parameter takes the rest, zero of them included, so it sets a floor rather than a count.
     //
-    // Nothing checked this before: a call with too few arguments read whatever the argument
-    // register happened to hold, and one with too many left the extras evaluated and dropped.
+    // Without this, a call with too few arguments would read whatever the argument register
+    // happened to hold, and one with too many would leave the extras evaluated and dropped.
     checkArity &self inout a:Ast cn:CallNode f:FnNode fn:Sym base:long -> void {
         want: long = f.argCount - base;
         if (want < 0) { return; }
         variadic: bool = want > 0 && a.paramAt(f, f.argCount - 1).isVariadic;
         if (variadic) {
             if (cn.argCount >= want - 1) { return; }
-            failStr(format("{} takes at least {} argument(s), and this call gives {}",
+            failStr(format("too few arguments to `{}`: expected at least {}, found {}",
                            nameOf(fn), want - 1, cn.argCount));
         }
         if (cn.argCount == want) { return; }
-        failStr(format("{} takes {} argument(s), and this call gives {}",
-                       nameOf(fn), want, cn.argCount));
+        which: str = "too many";
+        if (cn.argCount < want) { which = "too few"; }
+        failStr(format("{} arguments to `{}`: expected {}, found {}",
+                       which, nameOf(fn), want, cn.argCount));
     }
 
     // A type as a diagnostic should name it: a struct or a slice by its own name, a scalar by
     // its spelling. `typeName` alone answers "struct" for every struct there is.
     spellType &self k:Lit n:Sym -> str {
         if (n == NO_SYM) { return typeName(k); }
-        if (k == Lit.Struct || k == Lit.TraitObj) { return nameOf(n); }
+        if (k == Lit.Struct || k == Lit.TraitObj || k == Lit.Fn) { return nameOf(n); }   // a fn type by its key, `fn(Res)->long`
         if (k == Lit.Ref) { return keepString(format("&{}", nameOf(n))); }
         if (k == Lit.Slice) { return keepString(format("[{}]", nameOf(n))); }
         if (k == Lit.Ptr) { return keepString(format("*{}", nameOf(n))); }
@@ -4732,6 +5130,10 @@ methods Checker {
         return typeName(k);
     }
 
+    // A concrete value handed to a trait-typed parameter becomes a trait object there: the
+    // argument is wrapped in a `MakeTraitObj`, which lowering turns into the {data, vtable} pair.
+    // This is done here rather than in the parser because it takes the callee's signature to know
+    // that the parameter is a trait at all.
     boxTraitArgs &self inout a:Ast cn:CallNode fn:Sym -> void {
         hit: Option<long> = self.fnAt.find(nameOf(fn));
         at: long = -1;
@@ -4748,9 +5150,9 @@ methods Checker {
                 if (p.kind == Lit.TraitObj && isConcreteForTrait(got)) {
                     self.aimTraitObj(a, got.structName, p.structName);
                     if (!self.mayImplement(got.structName, p.structName)) {
-                        failStr(format("argument {} of {} is a {}, which does not implement {}",
-                                       base + k, nameOf(fn), self.spellType(Lit.Struct, got.structName),
-                                       self.spellType(Lit.TraitObj, p.structName)));
+                        failStr(format("`{}` does not implement `{}`\nnote: argument {} of `{}` is passed as a trait object of `{}`",
+                                       self.spellType(Lit.Struct, got.structName), self.spellType(Lit.TraitObj, p.structName),
+                                       base + k, nameOf(fn), self.spellType(Lit.TraitObj, p.structName)));
                     }
                     a.args.set(cn.firstArg + k, a.leafOf(Op.MakeTraitObj, Payload.Sub(arg),
                                                          Lit.TraitObj, p.structName));
@@ -4759,10 +5161,6 @@ methods Checker {
         }
     }
 
-    // `s.eq(other)` where `String` implements `Eq<str>` and `Eq<String>`. Each impl named its
-    // method after its own instantiation, so the candidates are found through the impls, and the
-    // one that fits is the one whose declared parameter is the type actually being passed. With a
-    // single candidate the argument settles nothing, and it is taken as written.
     // `x.m()` where `x`'s type implements a trait the module being checked owns (`trait Ord`
     // declared without `pub` here) and that trait has `m`: that implementation's method, whose
     // name carries the trait (`implFnName`). Several (two of this module's traits with one method
@@ -4796,7 +5194,7 @@ methods Checker {
         }
         if (count <= 1) { return found; }
         if (fits != NO_SYM) { return fits; }
-        failStr(format("{}.{} is ambiguous: more than one of this file's traits gives {} a '{}'",
+        failStr(format("`{}.{}` is ambiguous\nnote: more than one of this file's traits gives `{}` a method `{}`",
                        self.spellType(Lit.Struct, owner), nameOf(method), self.spellType(Lit.Struct, owner),
                        nameOf(method)));
         return found;
@@ -4804,9 +5202,9 @@ methods Checker {
 
     // `@(e)` in a quote, which the quoter wrote as `e.$splice()`. A Node is cloned, so one tree may
     // be spliced in several places; an integer, a `bool` or a `char` becomes `Node.Int(e)` and a
-    // `str` `Node.Str(e)`, the literal the macro's tree then holds (it used to be taken for a Node
-    // and spliced as garbage). What `e` is is read without typing it, so nothing is typed twice:
-    // a variable, a field of one, a literal. Anything else is typed in place and must be a Node.
+    // `str` `Node.Str(e)`, the literal the macro's tree then holds. What `e` is is read without
+    // typing it, so nothing is typed twice: a variable, a field of one, a literal. Anything else
+    // is typed in place and must be a Node.
     checkSplice &self inout a:Ast id:NodeId c:long cn:CallNode -> VarType {
         nodeSym: Sym = intern("ast::Node");
         t: VarType = self.placeType(a, cn.receiver);
@@ -4825,7 +5223,7 @@ methods Checker {
                                   argCount: cn.argCount, slot: cn.slot, callee: cn.callee, sigKey: cn.sigKey });
         got: VarType = self.checkExpr(a, id);
         if (got.kind != Lit.Struct || got.structName != nodeSym) {
-            failStr(format("`@(...)` in a quote splices a Node, or an integer, a bool or a str as a literal, and this is a {} -- a value spliced as a literal is read from a variable or a field: bind it to a local first",
+            failStr(format("cannot splice a value of type `{}` with `@(...)`\nnote: `@(...)` in a quote splices a `Node`, or an integer, a `bool` or a `str` as a literal, and a value spliced as a literal is read from a variable or a field\nhelp: bind it to a local first",
                            self.spellType(got.kind, got.structName)));
         }
         return got;
@@ -4851,7 +5249,7 @@ methods Checker {
         match e.payload { Field(f) { fd = a.fields.get(f); } _ { return none; } }
         b: VarType = self.placeType(a, fd.base);
         if ((b.kind != Lit.Struct && b.kind != Lit.Ref) || b.structName == NO_SYM) { return none; }
-        si: long = gReg.findStruct(nameOf(b.structName));
+        si: long = gReg.findStructSym(b.structName);
         if (si < 0) { return none; }
         fi: long = gReg.findFieldSym(gReg.structDef(si), fd.name);
         if (fi < 0) { return none; }
@@ -4872,18 +5270,18 @@ methods Checker {
         q: Sym = NO_SYM;
         // This file's own trait first, as a type of its own would be.
         if (self.currentModule != NO_SYM && !gReg.ownedTraits.isEmpty()) {
-            own: Sym = qualifiedName(nameOf(self.currentModule), nameOf(n));
-            if (gReg.findTrait(nameOf(own)) >= 0) { q = own; }
+            own: Sym = qualifiedSym(self.currentModule, n);
+            if (gReg.findTraitSym(own) >= 0) { q = own; }
         }
-        if (q == NO_SYM && gReg.findTrait(nameOf(n)) >= 0) { q = n; }
-        if (q == NO_SYM || gReg.hasStruct(nameOf(n)) || gReg.findEnum(nameOf(n)) >= 0) { return NO_SYM; }
+        if (q == NO_SYM && gReg.findTraitSym(n) >= 0) { q = n; }
+        if (q == NO_SYM || gReg.hasStructSym(n) || gReg.findEnumSym(n) >= 0) { return NO_SYM; }
         return q;
     }
 
     // Whether trait `tr` declares `m` without a receiver (a constructor: `new -> Self`). A trait
     // that declares no `m` at all is left to `traitMethodFor` to refuse.
     traitMethodIsStatic &self tr:Sym m:Sym -> bool {
-        ti: long = gReg.findTrait(nameOf(tr));
+        ti: long = gReg.findTraitSym(tr);
         if (ti < 0) { return false; }
         slot: long = gReg.methodSlot(gReg.traitDef(ti), nameOf(m));
         if (slot < 0) { return false; }
@@ -4894,10 +5292,10 @@ methods Checker {
     // never share a name with another's: `Registry.flatCarries`), so that is left to the ordinary
     // lookup, derives and all. NO_SYM leaves the target as it was.
     traitMethodFor &self inout a:Ast owner:Sym tr:Sym cn:CallNode -> Sym {
-        ti: long = gReg.findTrait(nameOf(tr));
+        ti: long = gReg.findTraitSym(tr);
         slot: long = gReg.methodSlot(gReg.traitDef(ti), nameOf(cn.name));
         if (slot < 0) {
-            failStr(format("{} has no method '{}'", lastComponentOf(nameOf(tr)), nameOf(cn.name)));
+            failStr(format("no method `{}` in trait `{}`", nameOf(cn.name), lastComponentOf(nameOf(tr))));
         }
         // The argument that decides between implementations of a trait with arguments: a
         // method's first after the receiver (its parameter 1), a static method's first.
@@ -4910,7 +5308,7 @@ methods Checker {
             i = gReg.firstImplOf(owner, tr);
         }
         if (i < 0) {
-            failStr(format("{} does not implement {}, so `{}.{}(...)` has nothing to call",
+            failStr(format("`{}` does not implement `{}`\nnote: `{}.{}(...)` calls that trait's method, so there is nothing to call",
                            self.spellType(Lit.Struct, owner), lastComponentOf(nameOf(tr)),
                            lastComponentOf(nameOf(tr)), nameOf(cn.name)));
         }
@@ -4978,7 +5376,7 @@ methods Checker {
         }
         names: String;
         for k in 0..traits.len() {
-            if (k > 0) { if (k + 1 == traits.len()) { names.pushStr(" and "); } else { names.pushStr(", "); } }
+            if (k > 0) { if (k + 1 == traits.len()) { names.pushStr("` and `"); } else { names.pushStr("`, `"); } }
             names.pushStr(lastComponentOf(nameOf(traits.get(k))));
         }
         // A static method is named by its trait with the type its result goes to.
@@ -4987,11 +5385,15 @@ methods Checker {
             how = format("`v: {} = {}.{}()`", self.spellType(Lit.Struct, owner),
                          lastComponentOf(nameOf(traits.get(0))), nameOf(m));
         }
-        failStr(format("{}.{} is ambiguous: {} each give {} a '{}' -- say which, as {}",
+        failStr(format("`{}.{}` is ambiguous\nnote: `{}` each give `{}` a method `{}`\nhelp: say which, as {}",
                        self.spellType(Lit.Struct, owner), nameOf(m), names, self.spellType(Lit.Struct, owner),
                        nameOf(m), how));
     }
 
+    // `s.eq(other)` where `String` implements `Eq<str>` and `Eq<String>`. Each impl named its
+    // method after its own instantiation, so the candidates are found through the impls, and the
+    // one that fits is the one whose declared parameter is the type actually being passed. With a
+    // single candidate the argument settles nothing, and it is taken as written.
     overload &self inout a:Ast owner:Sym method:Sym arg:NodeId -> Sym {
         only: Sym = NO_SYM;
         found: long = 0;
@@ -5028,8 +5430,8 @@ methods Checker {
             if (cn.argCount > 0 && self.paramFitsAt(a, cand, a.expr(a.argAt(cn, 0)), 0)) { return cand; }
         }
         if (found > 1) {
-            failStr(format("{} has {} static methods '{}', one per implementation of a parameterized trait, and the first argument does not say which",
-                           self.spellType(Lit.Struct, owner), found, nameOf(cn.name)));
+            failStr(format("`{}.{}` is ambiguous\nnote: `{}` has {} static methods `{}`, one per implementation of a parameterized trait, and the first argument does not say which",
+                           self.spellType(Lit.Struct, owner), nameOf(cn.name), self.spellType(Lit.Struct, owner), found, nameOf(cn.name)));
         }
         return only;
     }
@@ -5051,13 +5453,6 @@ methods Checker {
         return p.kind == arg.kind;
     }
 
-    // Which field of `owner` is a fn named `name`, or -1. A method wins over a field of the same
-    // name: a method is what the dot usually means, and only the absence of one asks this.
-    // The table a boxed value's vtable pointer names carries the trait instantiation, so boxing a
-    // closure into `Fn(long) -> long` needs an impl registered under exactly that. A closure's own
-    // is registered against the bare `FnN` -- enough for a bound, which asks only for the name --
-    // so this is where the precise one is added, and where a return type the body only implied
-    // meets the one the annotation states.
     // Whether a trait can be a vtable, and if not, why. Behind a trait object the receiver's
     // type is erased, and two shapes need it back: a method with no receiver has nothing to
     // dispatch on (there is no value to find the table from), and a method naming `Self` in its
@@ -5068,19 +5463,19 @@ methods Checker {
     // method is responsible, since that is what the author has to change.
     objectSafeProblem &self inout a:Ast trait:Sym -> str {
         if (trait == NO_SYM) { return ""; }
-        at: long = gReg.findTrait(nameOf(trait));
+        at: long = gReg.findTraitSym(trait);
         if (at < 0) { return ""; }
         t: TraitDef = gReg.traitDef(at);
         for k in 0..t.methodCount {
             sig: TraitMethodSig = gReg.traitMethodAt(t, k);
             if (sig.isStatic) {
-                return keepString(format("'{}' takes no receiver, so there is no value to find a table from",
+                return keepString(format("`{}` takes no receiver, so there is no value to find a table from",
                                          nameOf(sig.name)));
             }
             for i in 0..sig.paramCount {
                 p: VarDeclNode = a.decls.get(a.params.get(sig.firstParam + i));
                 if (p.structName != NO_SYM && nameOf(p.structName) == "Self") {
-                    return keepString(format("'{}' takes a `Self` parameter, which names a type the object has erased",
+                    return keepString(format("`{}` takes a `Self` parameter, which names a type the object has erased",
                                              nameOf(sig.name)));
                 }
             }
@@ -5092,15 +5487,20 @@ methods Checker {
     requireObjectSafe &self inout a:Ast trait:Sym -> void {
         why: str = self.objectSafeProblem(a, trait);
         if (why.len == 0) { return; }
-        failStr(format("'{}' cannot be a trait object: {} — it works as a bound, where the type is known",
+        failStr(format("the trait `{}` cannot be made into an object\nnote: {}\nhelp: use it as a bound, where the type is known",
                        nameOf(trait), why));
     }
 
+    // The table a boxed value's vtable pointer names carries the trait instantiation, so boxing a
+    // closure into `Fn(long) -> long` needs an impl registered under exactly that. A closure's own
+    // is registered against the bare `FnN`, which is enough for a bound (a bound asks only for the
+    // name), so this is where the precise one is added, and where a return type the body only
+    // implied meets the one the annotation states.
     aimTraitObj &self inout a:Ast concrete:Sym trait:Sym -> void {
         if (concrete == NO_SYM || trait == NO_SYM) { return; }
         // A value becoming an object of a trait it has no implementation of yet: its vtable is
         // made of the implementation a derive writes, or a generic type's conditional one.
-        if (gReg.hasDerives() && gReg.findTrait(nameOf(trait)) >= 0) { self.ensureImpl(a, concrete, trait, 0); }
+        if (gReg.hasDerives() && gReg.findTraitSym(trait) >= 0) { self.ensureImpl(a, concrete, trait, 0); }
         if (!self.fnNames.has(nameOf(methodName(concrete, intern("call"))))) { return; }
         tr: TraitRef = TraitRef { name: trait, firstArg: 0, argCount: 0 };
         if (gReg.implementsTrait(concrete, tr)) { return; }
@@ -5110,20 +5510,29 @@ methods Checker {
     }
 
     // Whether `concrete` implements `trait`, or might yet: an instance whose template has an
-    // implementation of it (a conditional one is stamped once its bounds are known to hold), a
-    // type not laid out yet. A value made into an object of a trait it does not implement used to
-    // reach the assembler as a vtable slot naming a method nobody defined
+    // implementation of it (a conditional one is stamped once its bounds are known to hold), or a
+    // type not laid out yet. A value made into an object of a trait it does not implement would
+    // otherwise reach the assembler as a vtable slot naming a method nobody defined
     // (`Mutex<BufWriter<Write>>` handed to a `Write` parameter).
     mayImplement &self concrete:Sym trait:Sym -> bool {
-        bare: Sym = intern(lastComponentOf(nameOf(trait)));
-        if (gReg.structImplements(nameOf(concrete), trait) || gReg.structImplements(nameOf(concrete), bare)) { return true; }
-        if (gReg.findStruct(nameOf(concrete)) < 0 || isClosureStruct(concrete)) { return true; }
-        r: long = gReg.findRequest(nameOf(concrete));
+        // An instance (`Iter_long`) is implemented under its base trait with arguments
+        // (`methods Range for Iter<long>`), and only that instantiation counts.
+        tn: Sym = trait;
+        inst: long = gReg.traitInstOf(trait);
+        if (inst >= 0) {
+            ref: TraitRef = gReg.traitInstRef(inst);
+            if (gReg.implementsTrait(concrete, ref)) { return true; }
+            tn = ref.name;
+        }
+        bare: Sym = intern(lastComponentOf(nameOf(tn)));
+        if (inst < 0 && (gReg.structImplements(nameOf(concrete), tn) || gReg.structImplements(nameOf(concrete), bare))) { return true; }
+        if (gReg.findStructSym(concrete) < 0 || isClosureStruct(concrete)) { return true; }
+        r: long = gReg.findRequestSym(concrete);
         if (r < 0) { return false; }
         base: Sym = gReg.requestAt(r).base;
         for i in 0..gReg.implCount() {
             im: TraitImplDef = gReg.implAt(i);
-            if (im.structName == base && (im.trait.name == trait || im.trait.name == bare)) { return true; }
+            if (im.structName == base && (im.trait.name == tn || im.trait.name == bare)) { return true; }
         }
         return false;
     }
@@ -5138,11 +5547,11 @@ methods Checker {
     }
 
     // Does a value of this type answer `call`? True for a closure struct, for a borrow of one,
-    // and for an `Fn` trait object -- the three shapes a callable value arrives in.
+    // and for an `Fn` trait object: the three shapes a callable value arrives in.
     callable &self v:VarType -> bool {
         if (v.structName == NO_SYM) { return false; }
         if (v.kind == Lit.TraitObj) {
-            at: long = gReg.findTrait(nameOf(v.structName));
+            at: long = gReg.findTraitSym(v.structName);
             if (at < 0) { return false; }
             return gReg.methodSlot(gReg.traitDef(at), "call") >= 0;
         }
@@ -5150,11 +5559,11 @@ methods Checker {
         return self.fnNames.has(nameOf(methodSymbol(v.structName, intern("call"))));
     }
 
-    // A field whose type answers `call` -- a closure a struct was built around. A method of that
+    // A field whose type answers `call`: a closure a struct was built around. A method of that
     // name wins, as it does for a fn-typed field.
     callableField &self owner:Sym name:Sym -> long {
         if (self.fnNames.has(nameOf(methodSymbol(owner, name)))) { return NOT_FOUND; }
-        at: long = gReg.findStruct(nameOf(owner));
+        at: long = gReg.findStructSym(owner);
         if (at < 0) { return NOT_FOUND; }
         d: StructDef = gReg.structDef(at);
         k: long = gReg.findFieldSym(d, name);
@@ -5164,9 +5573,11 @@ methods Checker {
         return k;
     }
 
+    // Which field of `owner` is a fn named `name`, or -1. A method wins over a field of the same
+    // name: a method is what the dot usually means, and only the absence of one asks this.
     fnField &self owner:Sym name:Sym -> long {
         if (self.fnNames.has(nameOf(methodSymbol(owner, name)))) { return NOT_FOUND; }
-        at: long = gReg.findStruct(nameOf(owner));
+        at: long = gReg.findStructSym(owner);
         if (at < 0) { return NOT_FOUND; }
         d: StructDef = gReg.structDef(at);
         k: long = gReg.findFieldSym(d, name);
@@ -5216,14 +5627,14 @@ methods Checker {
     }
 
     // A call through a trait object: the slot is written onto the call, and the answer is what
-    // the trait says the method returns, every implementation had to agree with it.
+    // the trait says the method returns, since every implementation had to agree with it.
     checkDispatch &self inout a:Ast c:long cn:CallNode trait:Sym -> VarType {
-        at: long = gReg.findTrait(nameOf(trait));
+        at: long = gReg.findTraitSym(trait);
         if (at < 0) { return varType(Lit.Void, NO_SYM); }
         t: TraitDef = gReg.traitDef(at);
         slot: long = gReg.methodSlot(t, nameOf(cn.name));
         if (slot < 0) {
-            failStr(format("{} has no method '{}'", nameOf(trait), nameOf(cn.name)));
+            failStr(format("no method `{}` in trait `{}`", nameOf(cn.name), nameOf(trait)));
         }
         sig: TraitMethodSig = gReg.traitMethodAt(t, slot);
         // An `inout` scalar the trait's signature lends: `&n`, or a forwarded `inout` scalar
@@ -5236,7 +5647,7 @@ methods Checker {
             if (p.conv != Conv.Inout || p.kind != Lit.Ref || !isInoutScalarName(p.structName)) { continue; }
             if (ae.op == Op.AddressOf) { self.holdLend(a, arg, p, cn.name, k); self.forgetScalarLend(arg); continue; }
             if (ae.op == Op.Deref && lentPlaceOf(a, arg) != NO_NODE) { a.setExpr(arg, a.expr(lentPlaceOf(a, arg))); continue; }
-            failStr(format("parameter {} of {}.{} is an `inout` scalar -- lend it with '&'", k, nameOf(trait), nameOf(cn.name)));
+            failStr(format("parameter {} of `{}.{}` is an `inout` scalar, and this argument is not lent\nhelp: lend it with `&`", k, nameOf(trait), nameOf(cn.name)));
         }
         a.calls.set(c, CallNode { name: cn.name, receiver: cn.receiver,
                                   firstArg: cn.firstArg, argCount: cn.argCount, slot: slot,
@@ -5245,45 +5656,95 @@ methods Checker {
     }
 
     // `p.x`: the field's declared type. The base must be an aggregate that has it.
+    //
+    // Every kind of base is answered here, including the ones with no fields at all. A base the
+    // checker typed and let through would reach the lowerer, where a fat pointer's word is chosen
+    // by name (`.len` is the second word, and any other name the first) and a struct's offset is
+    // looked up: `s.foo` on a `str` would read `.ptr`, and anything else would stop there with an
+    // internal error instead of a message about the program.
     checkField &self inout a:Ast f:long -> VarType {
         fn: FieldNode = a.fields.get(f);
         base: VarType = self.checkExpr(a, fn.base);
+        // A fixed array has no fields; its length is part of its type.
+        if (base.isArray) {
+            self.noField(fn.name, self.spellArrayOf(a, fn.base, base), "no fields\nhelp: an array's length is part of its type; a slice of it (`[..]`) has a `len`");
+        }
         // `str` and a slice are fat pointers with two fields of their own, not entries in the
         // struct table: the address of the bytes, and how many there are.
         if (base.kind == Lit.Str || base.kind == Lit.Slice) {
             // `.len` is a plain long and safe; `.ptr` is the raw base address, and a raw address
             // is a raw address however it was obtained.
             if (nameOf(fn.name) == "ptr") {
-                self.requireUnsafe("taking the raw base address of a str or a slice");
+                self.requireUnsafe("taking the raw base address of a `str` or a slice");
                 return varType(Lit.Ptr, base.structName);
             }
             if (nameOf(fn.name) == "len") { return varType(Lit.Long, NO_SYM); }
-            return varType(Lit.Void, NO_SYM);
+            self.noField(fn.name, spellTypeRef(TypeRef { base: base.kind, name: base.structName }), "fields `ptr`, `len`");
         }
         // `p.f` dereferences `p`.
         if (base.kind == Lit.Ptr) {
             self.requireUnsafe("accessing a field through a raw pointer");
         }
-        if (base.structName == NO_SYM) { return varType(Lit.Void, NO_SYM); }
-        at: long = gReg.findStruct(nameOf(base.structName));
-        if (at < 0) { return varType(Lit.Void, NO_SYM); }
+        // A type parameter (a template's body is checked only once it is stamped) and a type the
+        // checker could not work out (an error already reported, or a recovery) have nothing to
+        // judge against. Everything else that is not a laid-out struct has no fields at all.
+        if (base.kind == Lit.TypeVar || base.kind == Lit.Void) { return varType(Lit.Void, NO_SYM); }
+        if (base.structName == NO_SYM) {
+            if (!fieldless(base.kind)) { return varType(Lit.Void, NO_SYM); }
+            self.noField(fn.name, stringOf(typeName(base.kind)), "no fields");
+        }
+        at: long = gReg.findStructSym(base.structName);
+        if (at < 0) {
+            // Named, but not a struct: a trait object, an enum or a distinct type, a pointer to a
+            // scalar, a fn type. A struct named here and not laid out yet is a stamping round
+            // away from having its fields, and is left to that round.
+            if (!self.namesFieldless(base)) { return varType(Lit.Void, NO_SYM); }
+            if (base.kind == Lit.TraitObj) {
+                tn: String = spellTypeRef(TypeRef { base: base.kind, name: base.structName });
+                self.noField(fn.name, tn, "no fields\nhelp: a trait object is used through its methods");
+            }
+            self.noField(fn.name, spellTypeRef(TypeRef { base: base.kind, name: base.structName }), "no fields");
+        }
         d: StructDef = gReg.structDef(at);
         k: long = gReg.findFieldSym(d, fn.name);
-        // The struct is registered and has no such member. Answering `void` here is what let
-        // `p.nosuch` reach the lowerer, where `fieldOffset` had no answer either and gave 0 --
-        // a valid offset, the first field. The read came back as some other member's value.
+        // The struct is registered and has no such member. Typed `void`, `p.nosuch` would reach
+        // the lowerer, where `fieldOffset` has no answer either and gives 0, a valid offset (the
+        // first field's), so the read would come back as some other member's value.
         if (k < 0) {
-            failStr(format("{} has no field '{}' -- it has {}",
-                           nameOf(base.structName), nameOf(fn.name), fieldNamesOf(d)));
+            self.noField(fn.name, spellTypeName(nameOf(base.structName)), fieldNamesOf(d));
         }
         fd: FieldDef = gReg.fieldAt(d, k);
         // Whether the field is an array of that type travels with it. Without that, an index into
-        // an array field: `g.rows[1]`: had no element type to answer with and came back a plain
-        // long, which is not what `&g.rows[1]` lends.
+        // an array field (`g.rows[1]`) would have no element type to answer with and come back a
+        // plain long, which is not what `&g.rows[1]` lends.
         return VarType { kind: fd.kind, structName: fd.structName, isArray: fd.isArray };
     }
 
-    // `xs[i]`: the element type. An array or slice yields its element; a pointer its pointee.
+    // The refusal for a member a type does not have, in the one form every kind of base shares:
+    // the type as it is written, then what it does have (`fields `ptr`, `len``, `no fields`).
+    noField &self name:Sym ty:String have:str -> never {
+        failStr(format("no field `{}` on type `{}`\nnote: `{}` has {}", nameOf(name), ty, ty, have));
+    }
+
+    // A named type that is certainly not a struct still waiting to be laid out.
+    namesFieldless &self base:VarType -> bool {
+        if (base.kind == Lit.TraitObj || base.kind == Lit.Fn) { return true; }
+        n: Sym = base.structName;
+        return namesScalar(nameOf(n)) || gReg.findEnumSym(n) >= 0 || gReg.findTraitSym(n) >= 0;
+    }
+
+    // An array as it is written, `[long; 3]`, for a message. The length when the place says it,
+    // else the element type alone.
+    spellArrayOf &self inout a:Ast id:NodeId t:VarType -> String {
+        s: String;
+        s.push('[');
+        s.pushString(spellTypeRef(TypeRef { base: t.kind, name: t.structName }));
+        n: long = self.placeArrayLen(a, id);
+        if (n >= 0) { s.pushStr("; "); s.pushLong(n); }
+        s.push(']');
+        return s;
+    }
+
     // A value whose type implements `MustUse` may not be computed and thrown away.
     //
     // This is the one half of a `Result` that a library cannot provide. `Result<T, E>` is an
@@ -5296,8 +5757,8 @@ methods Checker {
         // An assignment is a use. It is the value's destination, not a discard.
         if (a.expr(id).op == Op.Assignment) { return; }
         if (!gReg.structImplements(nameOf(t.structName), intern("MustUse"))) { return; }
-        failStr(format("the result of this value is a {}, which is `MustUse` — it carries a failure the caller has to look at. Bind it (`r: {} = ...`) and check it, or say you are deliberately dropping it by binding to a name.",
-                       nameOf(t.structName), nameOf(t.structName)));
+        failStr(format("unused `{}` that must be used\nnote: `{}` implements `MustUse`, so it carries a failure the caller has to look at\nhelp: bind it (`r: {} = ...`) and check it, or bind it to a name to drop it deliberately",
+                       nameOf(t.structName), nameOf(t.structName), nameOf(t.structName)));
     }
 
     // A slice is a borrowed view. Storing through one is allowed exactly when the caller lent it
@@ -5316,7 +5777,7 @@ methods Checker {
         n = self.resolveVar(n);
         if (self.lookup(n).kind != Lit.Slice) { return; }
         if (self.paramConvOf(a, self.curFn, n) == Conv.Inout) { return; }
-        failStr(format("cannot assign through the slice '{}' — a slice is a read-only view unless it is an `inout` parameter; declare it `inout {}:[T]` and lend it with '&' at the call",
+        failStr(format("cannot assign through the slice `{}`\nnote: a slice is a read-only view unless it is an `inout` parameter\nhelp: declare it `inout {}:[T]` and lend it with `&` at the call",
                        nameOf(n), nameOf(n)));
     }
 
@@ -5337,9 +5798,9 @@ methods Checker {
         else { bt: VarType = self.lookup(self.resolveVar(ix.name)); if (!bt.isArray) { bk = bt.kind; } }
         if (bk != Lit.Str) { return; }
         who: Sym = self.indexBaseName(a, ix);
-        what: str = "this str";
-        if (who != NO_SYM) { what = keepString(format("the str '{}'", nameOf(who))); }
-        failStr(format("cannot assign to a byte of {}: a str is an immutable view of its bytes -- build the text in a String or a [u8] buffer",
+        what: str = "this `str`";
+        if (who != NO_SYM) { what = keepString(format("the `str` `{}`", nameOf(who))); }
+        failStr(format("cannot assign to a byte of {}\nnote: a `str` is an immutable view of its bytes\nhelp: build the text in a `String` or a `[u8]` buffer",
                        what));
     }
 
@@ -5403,6 +5864,7 @@ methods Checker {
         a.indexes.set(i, ix);
     }
 
+    // `xs[i]`: the element type. An array or slice yields its element; a pointer its pointee.
     checkIndex &self inout a:Ast id:NodeId i:long -> VarType {
         ix: IndexNode = a.indexes.get(i);
         recv: NodeId = ix.base;
@@ -5416,7 +5878,7 @@ methods Checker {
             recv = a.leafOf(Op.Lvalue, Payload.Name(q), base.kind, base.structName);
         }
         if (ix.index != NO_NODE) { self.checkExpr(a, ix.index); }
-        // A range's bounds are expressions like any other -- `body[..f(x)]` -- and one left
+        // A range's bounds are expressions like any other (`body[..f(x)]`), and one left
         // unchecked keeps the name it was written with, which resolves to nothing at link time.
         if (ix.sliceStart != NO_NODE) { self.checkExpr(a, ix.sliceStart); }
         if (ix.sliceEnd != NO_NODE) { self.checkExpr(a, ix.sliceEnd); }
@@ -5425,14 +5887,15 @@ methods Checker {
             // safe. A raw pointer knows nothing: `p[..n]` is the only way to build a {ptr, len}
             // from parts, and every later bounds check on that slice trusts the `n` given here,
             // which is the whole safety story of the form, and why it is the author's to tell.
-            if (base.kind == Lit.Ptr) {
+            // An array of pointers is an array, and knows its length like any other.
+            if (base.kind == Lit.Ptr && !base.isArray) {
                 // `[..]` takes its length from the declaration, and a pointer has none to give.
                 // Saying so beats producing a slice with a made-up length that every later bounds
                 // check would then trust.
                 if (ix.sliceEnd == NO_NODE) {
                     who: Sym = self.indexBaseName(a, ix);
                     if (who == NO_SYM) { who = intern("this expression"); }
-                    failStr(format("'{}' is a pointer and does not know how many elements it points at — write [..n] to say",
+                    failStr(format("cannot slice the pointer `{}` without a length\nnote: a pointer does not know how many elements it points at\nhelp: write `[..n]` to say how many",
                                    nameOf(who)));
                 }
                 self.requireUnsafe("building a slice from a pointer and a length");
@@ -5440,9 +5903,19 @@ methods Checker {
             }
             // Part of a `str` is a `str`: the same bytes, a shorter view.
             if (base.kind == Lit.Str && !base.isArray) { return varType(Lit.Str, NO_SYM); }
+            // A struct is no run of elements, whatever it holds: `v[..]` on a `Vec` would make a
+            // slice of `Vec`s over the Vec's own three words.
+            if ((base.kind == Lit.Struct || base.kind == Lit.Ref || base.kind == Lit.TraitObj) && !base.isArray) {
+                hint: str = "";
+                if (base.structName != NO_SYM && gReg.structImplements(nameOf(base.structName), intern("AsSlice"))) {
+                    hint = "\nhelp: write `.asSlice()` for its elements";
+                }
+                failStr(format("cannot slice a value of type `{}`{}", self.spellType(base.kind, base.structName), hint));
+            }
             // A slice's companion is its element's spelling. An array of a scalar, a `str` or a
-            // slice has none of its own, and a slice of it with none indexed as a `long`:
-            // `ss[..][2]` over a `[str; 3]` read the first word of the element as the element.
+            // slice has none of its own, and a slice of it with none would index as a `long`:
+            // `ss[..][2]` over a `[str; 3]` would read the first word of the element as the
+            // element.
             if (base.isArray && base.kind != Lit.Struct) {
                 return varType(Lit.Slice, intern(typeMangleName(base.kind, base.structName)));
             }
@@ -5451,7 +5924,7 @@ methods Checker {
         // An array of T indexes to a T: the element, not the block.
         if (base.isArray) { return varType(base.kind, base.structName); }
         // A `str` is `{ptr, len}` over bytes, so `s[i]` is the byte at `i`, bounds-checked as a
-        // `[u8]`'s element is. Typed `long`, it was read as the eight-byte word at `8 * i`.
+        // `[u8]`'s element is. Typed `long`, it would be read as the eight-byte word at `8 * i`.
         if (base.kind == Lit.Str) { return varType(Lit.U8, NO_SYM); }
         // `v[i]` on a struct is `Index::at`, the same call written by hand, so the element comes
         // back as a borrow and an owning one is read in place rather than copied out.
@@ -5589,6 +6062,23 @@ methods Checker {
             return d;
         }
         if (st.kind == StmtKind.With) { return self.initBlock(a, a.withs.get(st.at).body); }
+        // The handler can be entered from any point in the body, where nothing the body assigned
+        // can be counted on, so it starts from what was assigned before the statement. After it,
+        // what both the body and the handler assign is assigned, as after an `if` and its `else`.
+        if (st.kind == StmtKind.Recover) {
+            w: WhileNode = a.whiles.get(st.at);
+            entry: Vec<Sym>; meet: Vec<Sym>;
+            self.initSnapshot(&entry);
+            bodyExits: bool = self.initBlock(a, w.body);
+            if (!bodyExits) { self.initSnapshot(&meet); }
+            self.initRestore(&entry);
+            handlerExits: bool = self.initBlock(a, w.step);
+            if (bodyExits && handlerExits) { self.initRestore(&entry); return true; }
+            if (bodyExits) { return false; }
+            if (!handlerExits) { self.initIntersect(&meet); }
+            self.initRestore(&meet);
+            return false;
+        }
         if (st.kind == StmtKind.Asm) {
             nd: AsmNode = a.asms.get(st.at);
             for k in 0..nd.pieceCount {
@@ -5730,9 +6220,9 @@ methods Checker {
     // `&x`, `&x.f`, `&x[i]`. A lend (`lends`: safe code, or a lend position inside `unsafe`) hands
     // the place to a callee that may read it, so the local it is rooted in must hold something
     // already: lending a field of a local declared without a value is refused as reading it is
-    // (it once let `a: Attr; swapValues(&a.name, &self.attrName)` swap stack garbage into a live
-    // String). A raw address inside `unsafe` hands the slot to trusted code to fill, the
-    // `memcpy(&r as long, ...)` idiom, and counts as the assignment.
+    // (otherwise `a: Attr; swapValues(&a.name, &self.attrName)` would swap stack garbage into a
+    // live String). A raw address inside `unsafe` hands the slot to trusted code to fill (the
+    // `memcpy(&r as long, ...)` idiom), and counts as the assignment.
     initAddressOf &self inout a:Ast v:NodeId lends:bool -> void {
         root: Sym = self.initRootOf(a, v);
         if (root == NO_SYM) { self.initScanExpr(a, v); return; }
@@ -5792,8 +6282,7 @@ methods Checker {
     initRead &self inout a:Ast n:Sym -> void {
         if (!self.tracked.has(nameOf(n))) { return; }
         if (self.isAssigned(n)) { return; }
-        failStr(format("use of possibly-uninitialized variable '{}' in {}", nameOf(n),
-                       nameOf(a.fns.get(self.ownFn).name)));
+        failStr(format("use of possibly uninitialized variable `{}`", nameOf(n)));
     }
 
     // Every in-scope Drop local from `from` outward must hold something: its release is about
@@ -5802,8 +6291,8 @@ methods Checker {
         for k in from..self.initScope.len() {
             n: Sym = self.initScope.get(k);
             if (!self.isAssigned(n)) {
-                failStr(format("Drop-typed local '{}' in {} may be uninitialized at scope exit — its automatic release would free garbage; initialize it on every path",
-                               nameOf(n), nameOf(a.fns.get(self.ownFn).name)));
+                failStr(format("possibly uninitialized variable `{}` is released at the end of its scope\nnote: its type implements `Drop`, so the automatic release would free garbage\nhelp: initialize it on every path",
+                               nameOf(n)));
             }
         }
     }
@@ -5869,8 +6358,8 @@ methods Checker {
         if (gErrorCount > 0) { return; }
         for k in 0..n {
             st: Stmt = a.stmtAt(page, k);
-            // A dependency's body is not this compile's to rewrite -- unless it was checked here
-            // for the evaluator, which runs it as the ownership pass leaves it.
+            // A dependency's body is not this compile's to rewrite, unless it was checked here for
+            // the evaluator, which runs it as the ownership pass leaves it.
             if (st.kind == StmtKind.FunctionDef && !a.fns.get(st.at).isTemplate
                 && a.fns.get(st.at).body >= 0 && !isUnchecked(st.at)) {
                 gPos = a.stmtPos.get(a.stmtIdAt(page, k));
@@ -5883,16 +6372,12 @@ methods Checker {
     }
 
     // One function's match borrows (`whole` false) or its definite-initialization and ownership
-    // walks (`whole` true), under a recovery point as the typing is (`checkGuarded`): every
+    // walks (`whole` true), in the body of a `recover` as the typing is (`checkGuarded`): every
     // function's first error is reported, and the phase stops after the last function.
     ownGuarded &self inout a:Ast at:long whole:bool -> void {
         enterFn(a.fns.get(at).name);
         if (!canRecover()) { self.ownStep(a, at, whole); return; }
-        hit: long = 0;
-        unsafe { hit = armRecovery(); }
-        if (hit != 0) { return; }
-        self.ownStep(a, at, whole);
-        disarmRecovery();
+        unsafe { recover { self.ownStep(a, at, whole); } else { } }
     }
     ownStep &self inout a:Ast at:long whole:bool -> void {
         if (!whole) { self.borrowMatches(a, at); return; }
@@ -5906,24 +6391,34 @@ methods Checker {
     // the arm owns and releases at its end. That is right when the function owns the subject:
     // the store is a move, recorded on the subject's flag. When the subject is only borrowed (a
     // `&self`, an `inout` or `read` parameter, a `for r: &T` variable, a global, a field reached
-    // through one of those) there is no flag to record it on, and the arm released what the
-    // owner still held: a double release, or a live subtree freed under a tree walk. So there, a
+    // through one of those) there is no flag to record it on, and the arm would release what the
+    // owner still holds: a double release, or a live subtree freed under a tree walk. So there, a
     // binding of an owning payload is a borrow of the payload where it lies, as Rust binds
     // through a reference: the local becomes a `Ref` and its store takes the payload's address.
     // It owns nothing, so the arm's end releases nothing; it cannot be moved out
     // (`ownRejectMove` refuses a borrow that is not a parameter); writing through it writes the
     // matched value; and while the arm holds it, nothing else in the arm may write the matched
-    // value (`bmArmBlock`), since that could release the payload under it. A Copy payload is
-    // copied, as before: there is nothing to release twice.
+    // value (`bmArmBlock`), since that could release the payload under it.
+    //
+    // A payload that owns nothing has nothing to release twice, and a binding the arm only reads
+    // may stay a copy. One the arm writes through may not: the write would land in the copy and
+    // be lost. So where a write through a binding lands in someone else's value (`bmLending`: the
+    // subject is borrowed, and not a by-value parameter that is passed as a borrow only because the
+    // body reads it), no binding may be assigned as a whole (`bmPlainBinds`), and a struct binding
+    // becomes a borrow, as an owning one does, if the arm writes through it. Which methods write
+    // `self` is known only to the guard's write masks, so it decides (`gCopyBinds`).
     //
     // After convention inference, because a parameter a match takes a payload out of is a sink
     // and so owned, and before the ownership walk, which then meets an ordinary borrow local.
     borrowMatches &self inout a:Ast at:long -> void {
         f: FnNode = a.fns.get(at);
         self.bmLocals.clear();
+        if (self.bmOwnRead.len() > 0) { self.bmOwnRead.clear(); }
+        if (self.bmCopies.len() > 0) { self.bmCopies.clear(); }
         for k in 0..f.argCount {
             p: VarDeclNode = a.paramAt(f, k);
             self.bmLocals.put(nameOf(p.name), p.kind == Lit.Ref);
+            if (p.kind == Lit.Ref && p.conv == Conv.Read) { self.bmOwnRead.put(nameOf(p.name), true); }
         }
         self.bmBlock(a, f.body, at);
     }
@@ -5936,6 +6431,24 @@ methods Checker {
         return true;
     }
 
+    // Whether a write through a binding of `n`'s payload writes a value this function does not own:
+    // `n` is a borrow (an `inout` or `&T` parameter, a `&self`, a borrow local), a global, or a copy
+    // noted for the guard, which stands for the borrow it may become. A by-value parameter is the
+    // function's own value even where it arrives as a borrow because the body only reads it.
+    bmLending &self n:Sym -> bool {
+        if (self.bmCopies.len() > 0 && self.bmCopies.has(nameOf(n))) { return true; }
+        if (self.bmOwnRead.len() > 0 && self.bmOwnRead.has(nameOf(n))) { return false; }
+        return self.bmIsBorrow(n);
+    }
+
+    // The copy in `gCopyBinds` that `n` is, or -1.
+    bmCopyOf &self n:Sym -> long {
+        if (n == NO_SYM || self.bmCopies.len() == 0) { return -1; }
+        hit: Option<long> = self.bmCopies.find(nameOf(n));
+        match hit { Some(i) { return i; } None { } }
+        return -1;
+    }
+
     bmBlock &self inout a:Ast b:long fnAt:long -> void {
         if (b < 0) { return; }
         n: long = a.blockLen(b);
@@ -5945,7 +6458,10 @@ methods Checker {
             if (st.kind == StmtKind.VarDecl) {
                 d: VarDeclNode = a.decls.get(st.at);
                 self.bmLocals.put(nameOf(d.name), d.kind == Lit.Ref);
-                if (strStartsWith(nameOf(d.name), "$tup")) { self.bmDestructure(a, b, k); }
+                // A sibling scope's local of the same name as a copy is not that copy.
+                ci: long = self.bmCopyOf(d.name);
+                if (ci >= 0 && gCopyBinds.get(ci).decl != st.at) { self.bmCopies.remove(nameOf(d.name)); }
+                if (strStartsWith(nameOf(d.name), "$tup")) { self.bmDestructure(a, b, k, fnAt); }
             } else if (st.kind == StmtKind.If) {
                 c: long = st.at;
                 while (c >= 0) {
@@ -5958,6 +6474,9 @@ methods Checker {
                 self.bmForLoop(a, w.body);
                 self.bmBlock(a, w.body, fnAt);
                 if (w.step >= 0) { self.bmBlock(a, w.step, fnAt); }
+            } else if (st.kind == StmtKind.Recover) {
+                self.bmBlock(a, a.whiles.get(st.at).body, fnAt);
+                self.bmBlock(a, a.whiles.get(st.at).step, fnAt);
             } else if (st.kind == StmtKind.Loop || st.kind == StmtKind.Unsafe || st.kind == StmtKind.Block) {
                 self.bmBlock(a, a.blockStmts.get(st.at).body, fnAt);
             } else if (st.kind == StmtKind.With) {
@@ -5984,21 +6503,25 @@ methods Checker {
         d: VarDeclNode = a.decls.get(ds.at);
         if (a.expr(a.expr(asn).right).op == Op.AddressOf) { return; }    // already a borrow
         if (d.kind == Lit.Struct && !namedScalar(d.kind, d.structName)) {
-            self.bmRetype(a, ds.at, asn);
-            self.restampBlock(a, body, d.name);
+            borrowRetype(a, ds.at, asn);
+            restampBlock(a, body, d.name);
             self.bmLocals.put(nameOf(d.name), true);
             return;
         }
         if (forLends(ptr)) {
-            failStr(format("`for {} in &...` lends each element, which needs struct elements -- a {} is copied, so write `xs[i] = ...` to change one",
+            failStr(format("cannot lend the elements in `for {} in &...`\nnote: `for x in &xs` lends each element, which needs struct elements, and an element of type `{}` is copied\nhelp: write `xs[i] = ...` to change one",
                            nameOf(d.name), self.spellType(d.kind, d.structName)));
         }
     }
 
     bmMatch &self inout a:Ast b:long k:long fnAt:long -> void {
-        m: MatchNode = a.matches.get(a.stmtAt(b, k).at);
+        matchAt: long = a.stmtAt(b, k).at;
+        m: MatchNode = a.matches.get(matchAt);
         subj: Sym = m.scrutinee;
         borrowed: bool = self.bmIsBorrow(subj);
+        lending: bool = self.bmLending(subj);
+        copyOf: long = self.bmCopyOf(subj);   // the copy the subject is, which its bindings are read out of
+        matchPos: long = gPos;
         // The path the arms' borrows point into, which is what the arms may not write.
         held: Vec<Sym>;
         held.push(subj);
@@ -6019,17 +6542,35 @@ methods Checker {
                 root: Sym = self.ownPlaceRoot(a, src);
                 if (d.kind == Lit.Struct && gReg.needsDrop(d.structName)
                     && (explicit || (root != NO_SYM && self.bmIsBorrow(root)))) {
-                    self.bmRetype(a, ds.at, asn);
-                    self.restampBlock(a, b, subj);
+                    borrowRetype(a, ds.at, asn);
+                    restampBlock(a, b, subj);
                     self.bmLocals.put(nameOf(subj), true);
                     borrowed = true;
+                    lending = explicit || self.bmLending(root);
                     held.clear();
                     self.xPath.clear();
                     if (self.pathOf(a, src) > 0) { held.extend(self.xPath); }
+                } else if (d.kind == Lit.Struct && !gReg.needsDrop(d.structName) && !namedScalar(d.kind, d.structName)
+                           && root != NO_SYM && (explicit || self.bmLending(root))) {
+                    // A subject that owns nothing, read into a copy: a borrow of the place once
+                    // a binding of it is one.
+                    self.xPath.clear();
+                    if (self.pathOf(a, src) > 0) {
+                        gCopyBinds.push(CopyBind { name: subj, decl: ds.at, store: asn, body: b, subject: true,
+                                                   viaRef: false, parent: self.bmCopyOf(root), fnName: a.fns.get(fnAt).name,
+                                                   conflict: "", conflictPos: 0 });
+                        copyOf = gCopyBinds.len() - 1;
+                        self.bmCopies.put(nameOf(subj), copyOf);
+                        lending = true;
+                        held.clear();
+                        held.extend(self.xPath);
+                    }
                 }
             }
         }
         for j in 0..m.armCount {
+            // The bindings that stay copies unless the arm writes through them.
+            if (lending) { self.bmPlainBinds(a, m.firstArm + j, &held, copyOf, matchPos, fnAt); }
             arm: ArmNode = a.arms.get(m.firstArm + j);
             made: Vec<Sym>;           // the bindings this arm makes borrows
             stores: Vec<NodeId>;      // and the stores that take their addresses
@@ -6041,8 +6582,8 @@ methods Checker {
                     if (s < 0) { continue; }
                     di: long = a.stmtAt(arm.body, s).at;
                     asn: NodeId = a.exprStmts.get(a.stmtAt(arm.body, s + 1).at).value;
-                    self.bmRetype(a, di, asn);
-                    self.restampBlock(a, arm.body, nm);
+                    borrowRetype(a, di, asn);
+                    restampBlock(a, arm.body, nm);
                     made.push(nm);
                     stores.push(asn);
                 }
@@ -6050,19 +6591,247 @@ methods Checker {
             if (made.len() > 0) {
                 armPos: long = gPos;
                 self.bmArmBlock(a, arm.body, &held, &made, &stores, fnAt);
-                // Into a `var` global: what the arm calls may write it by name, which only the
-                // guard can tell (`ConstGuard.holdArms`).
-                if (held.len() > 0) {
-                    root: Sym = self.resolveVar(held.get(0));
-                    gi: long = gReg.findGlobal(nameOf(root));
-                    if (gi >= 0 && gReg.globalDef(gi).isVar && !self.locals.has(nameOf(root))) {
-                        gHeldArms.push(HeldArm { body: arm.body, global: root, pos: armPos,
-                                                 fnName: a.fns.get(fnAt).name, made: made.get(0) });
-                    }
-                }
+                self.bmHoldGlobal(&held, arm.body, armPos, fnAt, made.get(0), -1, a.fns.get(fnAt).name, false);
             }
             self.bmBlock(a, a.arms.get(m.firstArm + j).body, fnAt);
         }
+    }
+
+    // An arm holding a borrow into a `var` global: what it calls may write the global by name,
+    // which only the guard can tell (`ConstGuard.holdArms`). `copy` is the binding in `gCopyBinds`
+    // the arm holds only if the guard makes it a borrow, or -1.
+    bmHoldGlobal &self inout held:Vec<Sym> body:long pos:long fnAt:long made:Sym copy:long fnName:Sym destr:bool -> void {
+        if (held.len() == 0) { return; }
+        root: Sym = self.resolveVar(held.get(0));
+        gi: long = gReg.findGlobalSym(root);
+        if (gi < 0 || !gReg.globalDef(gi).isVar || self.locals.has(nameOf(root))) { return; }
+        // The fields under the global the arm borrows into, up to an element.
+        path: Vec<Sym>;
+        path.push(root);
+        for i in 1..held.len() {
+            if (charAt(nameOf(held.get(i)), 0) == '[') { path.push(intern("*")); break; }
+            path.push(held.get(i));
+        }
+        gHeldArms.push(HeldArm { body: body, global: root, pos: pos, fnName: fnName, made: made, path: path, copy: copy, destr: destr });
+    }
+
+    // The bindings of arm `armAt` of a match whose bindings write what someone else owns
+    // (`bmLending`), other than the owning ones (`bmMatch` makes those borrows). Each names the
+    // payload where it lies, so none may be given another value as a whole (`bmCopyWalk`). A
+    // struct one is a copy while the arm only reads it and a borrow of the payload where the arm
+    // writes through it, which the guard decides (`gCopyBinds`); so that a borrow is held to what
+    // one allows, what the arm does that `bmArmBlock` would refuse is found now and kept with it.
+    bmPlainBinds &self inout a:Ast armAt:long inout held:Vec<Sym> parent:long matchPos:long fnAt:long -> void {
+        arm: ArmNode = a.arms.get(armAt);
+        if (arm.bindCount == 0) { return; }
+        names: Vec<Sym>;
+        scalar: Vec<bool>;
+        decls: Vec<long>;
+        stores: Vec<NodeId>;
+        for i in 0..arm.bindCount {
+            nm: Sym = a.names.get(arm.firstBind + i);
+            if (nameOf(nm) == "_") { continue; }
+            s: long = bindingAt(a, arm.body, nm);
+            if (s < 0) { continue; }
+            d: VarDeclNode = a.decls.get(a.stmtAt(arm.body, s).at);
+            if (d.kind == Lit.Struct && gReg.needsDrop(d.structName)) { continue; }
+            names.push(nm);
+            scalar.push(d.kind != Lit.Struct || d.isArray || namedScalar(d.kind, d.structName));
+            decls.push(a.stmtAt(arm.body, s).at);
+            stores.push(a.exprStmts.get(a.stmtAt(arm.body, s + 1).at).value);
+        }
+        if (names.len() == 0) { return; }
+        self.bmCopyWalk(a, arm.body, 0, &names, &scalar, &stores, &held, armAt, false);
+        fnName: Sym = a.fns.get(fnAt).name;
+        for i in 0..names.len() {
+            if (scalar.get(i)) { continue; }
+            gCopyBinds.push(CopyBind { name: names.get(i), decl: decls.get(i), store: stores.get(i), body: arm.body,
+                                       subject: false, viaRef: false, parent: parent, fnName: fnName,
+                                       conflict: "", conflictPos: 0 });
+            ci: long = gCopyBinds.len() - 1;
+            self.bmCopies.put(nameOf(names.get(i)), ci);
+            made: Vec<Sym>;
+            made.push(names.get(i));
+            self.bmDry = ci;
+            self.bmArmBlock(a, arm.body, held, &made, &stores, fnAt);
+            self.bmDry = -1;
+            self.bmHoldGlobal(held, arm.body, matchPos, fnAt, names.get(i), ci, fnName, false);
+        }
+    }
+
+    // A binding in `names` assigned as a whole, or a scalar one lent to an `inout` parameter, which
+    // would assign it: refused, from statement `from` of block `b` on. The binding is the payload or
+    // element where it lies, and a variant's payload is replaced with the variant, an element by
+    // assigning it where the tuple lies. `inUnsafe`: inside `unsafe`, where `&n` of a scalar may be a
+    // raw address rather than a lend. `armAt` is the arm, for the message, or -1 for a destructure.
+    bmCopyWalk &self inout a:Ast b:long from:long inout names:Vec<Sym> inout scalar:Vec<bool> inout stores:Vec<NodeId>
+               inout held:Vec<Sym> armAt:long inUnsafe:bool -> void {
+        if (b < 0) { return; }
+        n: long = a.blockLen(b);
+        for k in from..n {
+            a.enterStmt(a.stmtIdAt(b, k));
+            st: Stmt = a.stmtAt(b, k);
+            if (st.kind == StmtKind.VarDecl) { self.bmCopyExpr(a, a.decls.get(st.at).init, names, scalar, stores, held, armAt, inUnsafe); }
+            else if (st.kind == StmtKind.Expr || st.kind == StmtKind.Call) {
+                self.bmCopyExpr(a, a.exprStmts.get(st.at).value, names, scalar, stores, held, armAt, inUnsafe);
+            }
+            else if (st.kind == StmtKind.Return) { self.bmCopyExpr(a, a.returns.get(st.at).value, names, scalar, stores, held, armAt, inUnsafe); }
+            else if (st.kind == StmtKind.If) {
+                c: long = st.at;
+                while (c >= 0) {
+                    nd: IfNode = a.ifs.get(c);
+                    self.bmCopyExpr(a, nd.cond, names, scalar, stores, held, armAt, inUnsafe);
+                    self.bmCopyWalk(a, nd.body, 0, names, scalar, stores, held, armAt, inUnsafe);
+                    c = nd.elseIf;
+                }
+            } else if (st.kind == StmtKind.While || st.kind == StmtKind.Recover) {
+                w: WhileNode = a.whiles.get(st.at);
+                self.bmCopyExpr(a, w.cond, names, scalar, stores, held, armAt, inUnsafe);
+                self.bmCopyWalk(a, w.body, 0, names, scalar, stores, held, armAt, inUnsafe);
+                if (w.step >= 0) { self.bmCopyWalk(a, w.step, 0, names, scalar, stores, held, armAt, inUnsafe); }
+            } else if (st.kind == StmtKind.Loop || st.kind == StmtKind.Block) {
+                self.bmCopyWalk(a, a.blockStmts.get(st.at).body, 0, names, scalar, stores, held, armAt, inUnsafe);
+            } else if (st.kind == StmtKind.Unsafe) {
+                self.bmCopyWalk(a, a.blockStmts.get(st.at).body, 0, names, scalar, stores, held, armAt, true);
+            } else if (st.kind == StmtKind.With) {
+                self.bmCopyWalk(a, a.withs.get(st.at).body, 0, names, scalar, stores, held, armAt, inUnsafe);
+            } else if (st.kind == StmtKind.Match) {
+                m: MatchNode = a.matches.get(st.at);
+                for i in 0..m.armCount {
+                    arm: ArmNode = a.arms.get(m.firstArm + i);
+                    self.bmCopyExpr(a, arm.test, names, scalar, stores, held, armAt, inUnsafe);
+                    self.bmCopyWalk(a, arm.body, 0, names, scalar, stores, held, armAt, inUnsafe);
+                }
+            } else if (st.kind == StmtKind.Destructure) {
+                self.bmCopyExpr(a, a.destructures.get(st.at).value, names, scalar, stores, held, armAt, inUnsafe);
+            }
+        }
+    }
+
+    bmCopyExpr &self inout a:Ast id:NodeId inout names:Vec<Sym> inout scalar:Vec<bool> inout stores:Vec<NodeId>
+               inout held:Vec<Sym> armAt:long inUnsafe:bool -> void {
+        if (id == NO_NODE) { return; }
+        // A leaf (a name, a literal) is neither a store nor a call, and has nothing under it.
+        lo: Op = a.exprs[id].op;
+        if (lo == Op.Lvalue || lo == Op.Literal || lo == Op.StringLit) { return; }
+        e: Expr = a.expr(id);
+        if (e.op == Op.Assignment && !nodeIn(stores, id)) {
+            x: Sym = self.convBareName(a, e.left);
+            if (x != NO_SYM && symIn(names, x)) { self.bmWholeWrite(a, x, names, scalar, stores, held, armAt, ""); }
+        }
+        self.bmCopyExpr(a, e.left, names, scalar, stores, held, armAt, inUnsafe);
+        self.bmCopyExpr(a, e.right, names, scalar, stores, held, armAt, inUnsafe);
+        p: Payload = e.payload;
+        match p {
+            Sub(v)   { self.bmCopyExpr(a, v, names, scalar, stores, held, armAt, inUnsafe); }
+            Field(f) { self.bmCopyExpr(a, a.fields.get(f).base, names, scalar, stores, held, armAt, inUnsafe); }
+            Index(i) {
+                ix: IndexNode = a.indexes.get(i);
+                self.bmCopyExpr(a, ix.base, names, scalar, stores, held, armAt, inUnsafe);
+                self.bmCopyExpr(a, ix.index, names, scalar, stores, held, armAt, inUnsafe);
+                self.bmCopyExpr(a, ix.sliceStart, names, scalar, stores, held, armAt, inUnsafe);
+                self.bmCopyExpr(a, ix.sliceEnd, names, scalar, stores, held, armAt, inUnsafe);
+            }
+            Call(c) {
+                cn: CallNode = a.calls.get(c);
+                self.bmScalarLends(a, cn, names, scalar, stores, held, armAt, inUnsafe);
+                self.bmCopyExpr(a, cn.receiver, names, scalar, stores, held, armAt, inUnsafe);
+                self.bmCopyExpr(a, cn.callee, names, scalar, stores, held, armAt, inUnsafe);
+                for k in 0..cn.argCount { self.bmCopyExpr(a, a.argAt(cn, k), names, scalar, stores, held, armAt, inUnsafe); }
+            }
+            Lit(l) {
+                ln: LitNode = a.lits.get(l);
+                self.bmCopyExpr(a, ln.rest, names, scalar, stores, held, armAt, inUnsafe);
+                for k in 0..ln.initCount {
+                    self.bmCopyExpr(a, a.inits.get(ln.firstInit + k).value, names, scalar, stores, held, armAt, inUnsafe);
+                }
+            }
+            _ { }
+        }
+    }
+
+    // `&n` of a scalar binding handed to a call: a lend to an `inout` scalar parameter, which may
+    // assign it. Anything else it can be is a raw address, which `unsafe` alone takes and answers
+    // for, so inside `unsafe` only a parameter known to be an `inout` scalar counts.
+    bmScalarLends &self inout a:Ast cn:CallNode inout names:Vec<Sym> inout scalar:Vec<bool> inout stores:Vec<NodeId>
+                  inout held:Vec<Sym> armAt:long inUnsafe:bool -> void {
+        for k in 0..cn.argCount {
+            ae: Expr = a.expr(a.argAt(cn, k));
+            if (ae.op != Op.AddressOf) { continue; }
+            x: Sym = NO_SYM;
+            match ae.payload { Sub(v) { x = self.convBareName(a, v); } _ { } }
+            if (x == NO_SYM) { continue; }
+            isScalar: bool = false;
+            for i in 0..names.len() { if (names.get(i) == x && scalar.get(i)) { isScalar = true; } }
+            if (!isScalar) { continue; }
+            at: long = self.fnNodeOf(cn.name);
+            base: long = 0;
+            if (cn.receiver != NO_NODE) { base = 1; }
+            lend: bool = !inUnsafe;
+            if (at >= 0 && base + k < a.fns.get(at).argCount) {
+                pd: VarDeclNode = a.paramAt(a.fns.get(at), base + k);
+                lend = pd.conv == Conv.Inout && pd.kind == Lit.Ref && isInoutScalarName(pd.structName);
+            }
+            if (lend) {
+                self.bmWholeWrite(a, x, names, scalar, stores, held, armAt,
+                                  keepString(format("\nnote: it is lent to `{}`, which may assign it through its `inout` parameter", nameOf(cn.name))));
+            }
+        }
+    }
+
+    // The same for a name a destructure bound, `x`: an element of a tuple, which is written where the
+    // tuple lies.
+    bmWholeElement &self inout a:Ast x:Sym inout names:Vec<Sym> inout stores:Vec<NodeId> inout held:Vec<Sym> note:str -> void {
+        elem: str = "";
+        for i in 0..names.len() {
+            if (names.get(i) != x) { continue; }
+            match a.expr(a.expr(stores.get(i)).right).payload {
+                Field(f) { elem = fieldSpelling(a.fields.get(f).name); }
+                _ { }
+            }
+        }
+        if (held.len() == 0 || charAt(nameOf(held.get(0)), 0) == '$') {
+            failStr(format("cannot assign to `{}`, a borrow of an element of the destructured tuple{}\nhelp: assign the element where the tuple lies, or replace the whole tuple",
+                           nameOf(x), note));
+        }
+        place: String;
+        for k in 0..held.len() {
+            c: str = nameOf(held.get(k));
+            if (k > 0 && !strStartsWith(c, "[")) { place.push('.'); }
+            place.pushStr(c);
+        }
+        failStr(format("cannot assign to `{}`, a borrow of an element of `{}`{}\nhelp: assign the element itself, `{}.{} = ...`, or replace the whole tuple",
+                       nameOf(x), place, note, place, elem));
+    }
+
+    // The refusal of a write to binding `x` as a whole. `note` is a line saying how, or "".
+    bmWholeWrite &self inout a:Ast x:Sym inout names:Vec<Sym> inout scalar:Vec<bool> inout stores:Vec<NodeId>
+                 inout held:Vec<Sym> armAt:long note:str -> void {
+        isScalar: bool = false;
+        for i in 0..names.len() { if (names.get(i) == x) { isScalar = scalar.get(i); } }
+        if (armAt < 0) { self.bmWholeElement(a, x, names, stores, held, note); }
+        what: str = "assign to its fields, or replace the variant";
+        if (isScalar) { what = "replace the variant instead"; }
+        // The variant as a constructor of its enum, the enum as the first binding's store reads it.
+        enumName: Sym = NO_SYM;
+        match a.expr(a.expr(stores.get(0)).right).payload {
+            Field(f) { enumName = a.expr(a.fields.get(f).base).structName; }
+            _ { }
+        }
+        ctor: String = format("{}.{}(...)", self.spellType(Lit.Struct, enumName), variantSpelling(a.arms.get(armAt).variant));
+        // The matched value as the source names it, when it is a place the source names.
+        if (held.len() == 0 || charAt(nameOf(held.get(0)), 0) == '$') {
+            failStr(format("cannot assign to `{}`, a borrow of the matched value's payload{}\nhelp: {} where the value lies, with `{}`",
+                           nameOf(x), note, what, ctor));
+        }
+        place: String;
+        for k in 0..held.len() {
+            c: str = nameOf(held.get(k));
+            if (k > 0 && !strStartsWith(c, "[")) { place.push('.'); }
+            place.pushStr(c);
+        }
+        failStr(format("cannot assign to `{}`, a borrow of the payload of `{}`{}\nhelp: {}: `{} = {}`",
+                       nameOf(x), place, note, what, place, ctor));
     }
 
     // An owned subject: an arm that binds an owning payload takes the value apart, and the
@@ -6086,7 +6855,7 @@ methods Checker {
             match p { Field(f) { base = a.expr(a.fields.get(f).base); found = true; } _ { } }
         }
         if (!found || discards == 0) { return; }
-        sd: long = gReg.findStruct(nameOf(base.structName));
+        sd: long = gReg.findStructSym(base.structName);
         if (sd < 0) { return; }
         def: StructDef = gReg.structDef(sd);
         ids: Vec<long>;
@@ -6123,89 +6892,169 @@ methods Checker {
     // Where binding `nm`'s declaration sits in the arm's prologue (its store is the statement
     // after it), when its payload owns something; -1 otherwise.
     bmOwningBinding &self inout a:Ast body:long nm:Sym -> long {
-        lim: long = a.blockLen(body) - 1;
-        for s in 0..lim {
-            st: Stmt = a.stmtAt(body, s);
-            if (st.kind == StmtKind.VarDecl && a.decls.get(st.at).name == nm) {
-                d: VarDeclNode = a.decls.get(st.at);
-                if (d.kind != Lit.Struct || !gReg.needsDrop(d.structName)) { return -1; }
-                if (a.stmtAt(body, s + 1).kind != StmtKind.Expr) { return -1; }
-                return s;
-            }
-        }
-        return -1;
+        s: long = bindingAt(a, body, nm);
+        if (s < 0) { return -1; }
+        d: VarDeclNode = a.decls.get(a.stmtAt(body, s).at);
+        if (d.kind != Lit.Struct || !gReg.needsDrop(d.structName)) { return -1; }
+        return s;
     }
 
     // `a, b = t;` where `t` is borrowed (a match binding through a borrow, a field of `&self`, a
     // global): the destructure (`$tupN: T; $tupN = t; a: A; a = $tupN.$0; ...`, at `k` in `b`)
     // binds borrows, as the match does, and moves nothing out. The hidden local becomes a borrow of
-    // `t`, and each name whose element owns something a borrow of that element. A Copy element is
-    // copied, as a match binding's is.
-    bmDestructure &self inout a:Ast b:long k:long -> void {
+    // `t`, and each name whose element owns something a borrow of that element. Where a write
+    // through a name lands in a value this function does not own (`bmLending`), the names follow
+    // the match's rule for a payload that owns nothing (`bmPlainBinds`): none is assigned as a
+    // whole, and one of a struct is a borrow of its element where the code after it writes through
+    // it, which the guard decides (`gCopyBinds`), so a tuple that owns nothing is a copy until then.
+    bmDestructure &self inout a:Ast b:long k:long fnAt:long -> void {
         n: long = a.blockLen(b);
         if (k + 1 >= n || a.stmtAt(b, k + 1).kind != StmtKind.Expr) { return; }
         d: VarDeclNode = a.decls.get(a.stmtAt(b, k).at);
-        if (d.kind != Lit.Struct || !gReg.needsDrop(d.structName)) { return; }
+        if (d.kind != Lit.Struct) { return; }
         asn: NodeId = a.exprStmts.get(a.stmtAt(b, k + 1).at).value;
         ae: Expr = a.expr(asn);
         if (ae.op != Op.Assignment) { return; }
         src: Expr = a.expr(ae.right);
         root: Sym = self.ownPlaceRoot(a, ae.right);
-        if (src.kind != Lit.Ref && (root == NO_SYM || !self.bmIsBorrow(root))) { return; }
-        if (src.kind == Lit.Ref) {
-            // Already a borrow: the hidden local is the same pointer.
-            asRef: VarDeclNode = d;
-            asRef.kind = Lit.Ref;
-            asRef.isArray = false;
-            asRef.count = 0;
-            asRef.isVariadic = false;
-            a.decls.set(a.stmtAt(b, k).at, asRef);
-            ae.kind = Lit.Ref;
-            ae.structName = d.structName;
-            a.setExpr(asn, ae);
-        } else { self.bmRetype(a, a.stmtAt(b, k).at, asn); }
-        self.restampFrom(a, b, k, d.name);
-        self.bmLocals.put(nameOf(d.name), true);
-        // The names: a declaration and its store each, reading `$tupN.$j`. Each is restamped
-        // from its own declaration on, not from the block's start: a block before it may have
-        // declared a value of the same name (`{ a: Res = ...; }` then `a, b = self.p;`), which
+        viaRef: bool = src.kind == Lit.Ref;
+        owning: bool = gReg.needsDrop(d.structName);
+        borrowed: bool = viaRef || (root != NO_SYM && self.bmIsBorrow(root));
+        lending: bool = viaRef || (root != NO_SYM && self.bmLending(root));
+        // An owning tuple's names are borrows wherever it is borrowed; one that owns nothing has
+        // only copies to decide on, and only where a write through them would land elsewhere: a
+        // place (a borrow a call returned of a tuple that owns nothing is a copy safe code cannot
+        // name the place of).
+        if ((owning && !borrowed) || (!owning && !lending)) { return; }
+        // The place the names are borrows into, which the code after them may not write; for a
+        // borrow a call returned (`v.at(i)`), all of what the call was lent (`v`).
+        held: Vec<Sym>;
+        self.xPath.clear();
+        if (self.pathOf(a, ae.right) > 0 || (viaRef && self.lentByCall(a, ae.right) > 0)) { held.extend(self.xPath); }
+        parent: long = -1;
+        if (owning) {
+            if (viaRef) {
+                // Already a borrow: the hidden local is the same pointer.
+                asRef: VarDeclNode = d;
+                asRef.kind = Lit.Ref;
+                asRef.isArray = false;
+                asRef.count = 0;
+                asRef.isVariadic = false;
+                a.decls.set(a.stmtAt(b, k).at, asRef);
+                ae.kind = Lit.Ref;
+                ae.structName = d.structName;
+                a.setExpr(asn, ae);
+            } else { borrowRetype(a, a.stmtAt(b, k).at, asn); }
+            restampFrom(a, b, k, d.name);
+            self.bmLocals.put(nameOf(d.name), true);
+        } else {
+            // A tuple that owns nothing, read into a copy: a borrow of the place once a name read
+            // out of it is one.
+            gCopyBinds.push(CopyBind { name: d.name, decl: a.stmtAt(b, k).at, store: asn, body: b, subject: true,
+                                       viaRef: viaRef, parent: self.bmCopyOf(root), fnName: a.fns.get(fnAt).name,
+                                       conflict: "", conflictPos: 0 });
+            parent = gCopyBinds.len() - 1;
+            self.bmCopies.put(nameOf(d.name), parent);
+        }
+        // The names: a declaration and its store each, reading `$tupN.$j`. Each owning one is
+        // restamped from its own declaration on, not from the block's start: a block before it may
+        // have declared a value of the same name (`{ a: Res = ...; }` then `a, b = self.p;`), which
         // the parser gives the same name, and that value is not a borrow.
+        names: Vec<Sym>;
+        scalar: Vec<bool>;
+        decls: Vec<long>;
+        stores: Vec<NodeId>;
+        made: Vec<Sym>;           // the owning names, borrows already
+        madeStores: Vec<NodeId>;
         j: long = k + 2;
         while (j + 1 < n && a.stmtAt(b, j).kind == StmtKind.VarDecl && a.stmtAt(b, j + 1).kind == StmtKind.Expr) {
             nd: VarDeclNode = a.decls.get(a.stmtAt(b, j).at);
             na: NodeId = a.exprStmts.get(a.stmtAt(b, j + 1).at).value;
             ne: Expr = a.expr(na);
-            if (ne.op != Op.Assignment || self.ownPlaceRoot(a, ne.right) != d.name) { return; }
+            if (ne.op != Op.Assignment || self.ownPlaceRoot(a, ne.right) != d.name) { break; }
             if (nd.kind == Lit.Struct && gReg.needsDrop(nd.structName)) {
-                self.bmRetype(a, a.stmtAt(b, j).at, na);
-                self.restampFrom(a, b, j, nd.name);
+                borrowRetype(a, a.stmtAt(b, j).at, na);
+                restampFrom(a, b, j, nd.name);
                 self.bmLocals.put(nameOf(nd.name), true);
+                made.push(nd.name);
+                madeStores.push(na);
             }
+            names.push(nd.name);
+            scalar.push(nd.kind != Lit.Struct || nd.isArray || namedScalar(nd.kind, nd.structName));
+            decls.push(a.stmtAt(b, j).at);
+            stores.push(na);
             j = j + 2;
         }
         // `_`'s blocks after them: through a borrow there is nothing to release, so each takes a
         // borrow of its element instead of the element.
-        while (j < n && a.stmtAt(b, j).kind == StmtKind.Block) {
+        while (owning && j < n && a.stmtAt(b, j).kind == StmtKind.Block) {
             ib: long = a.blockStmts.get(a.stmtAt(b, j).at).body;
-            if (a.blockLen(ib) != 2 || a.stmtAt(ib, 0).kind != StmtKind.VarDecl) { return; }
+            if (a.blockLen(ib) != 2 || a.stmtAt(ib, 0).kind != StmtKind.VarDecl) { break; }
             dd: VarDeclNode = a.decls.get(a.stmtAt(ib, 0).at);
-            if (!strStartsWith(nameOf(dd.name), "$discT")) { return; }
-            self.bmRetype(a, a.stmtAt(ib, 0).at, a.exprStmts.get(a.stmtAt(ib, 1).at).value);
-            self.restampBlock(a, ib, dd.name);
+            if (!strStartsWith(nameOf(dd.name), "$discT")) { break; }
+            borrowRetype(a, a.stmtAt(ib, 0).at, a.exprStmts.get(a.stmtAt(ib, 1).at).value);
+            restampBlock(a, ib, dd.name);
             j = j + 1;
         }
+        fnName: Sym = a.fns.get(fnAt).name;
+        pos: long = gPos;
+        // No name assigned as a whole, owning or not.
+        if (lending && names.len() > 0) {
+            self.bmCopyWalk(a, b, k + 2, &names, &scalar, &stores, &held, -1, false);
+            gPos = pos;
+        }
+        // While an owning name is a borrow of its element, the code after it may not write the
+        // tuple any other way, which could release the element under it: the match's rule for an
+        // arm (`bmArmBlock`), from the names on.
+        if (made.len() > 0) {
+            self.bmDestr = true;
+            self.bmArmFrom(a, b, k + 2, &held, &made, &madeStores, fnAt);
+            self.bmDestr = false;
+            self.bmHoldGlobal(&held, b, pos, fnAt, made.get(0), -1, fnName, true);
+            gPos = pos;
+        }
+        if (!lending || names.len() == 0) { return; }
+        // Each struct name that owns nothing noted.
+        for i in 0..names.len() {
+            nd: VarDeclNode = a.decls.get(decls.get(i));
+            if (scalar.get(i) || gReg.needsDrop(nd.structName)) { continue; }
+            gCopyBinds.push(CopyBind { name: names.get(i), decl: decls.get(i), store: stores.get(i), body: b,
+                                       subject: false, viaRef: false, parent: parent, fnName: fnName,
+                                       conflict: "", conflictPos: 0 });
+            ci: long = gCopyBinds.len() - 1;
+            self.bmCopies.put(nameOf(names.get(i)), ci);
+            one: Vec<Sym>;
+            one.push(names.get(i));
+            from: long = declIndex(a, b, decls.get(i));
+            self.bmDry = ci;
+            self.bmDestr = true;
+            self.bmArmFrom(a, b, from, &held, &one, &stores, fnAt);
+            self.bmDestr = false;
+            self.bmDry = -1;
+            self.bmHoldGlobal(&held, b, pos, fnAt, names.get(i), ci, fnName, true);
+        }
+        gPos = pos;
     }
 
-    // `v: T; v = <place>;` made `v: &T; v = &<place>;`. The uses of `v` follow by `restampBlock`.
-    bmRetype &self inout a:Ast declAt:long asn:NodeId -> void {
-        d: VarDeclNode = a.decls.get(declAt);
-        d.kind = Lit.Ref;
-        a.decls.set(declAt, d);
-        e: Expr = a.expr(asn);
-        e.right = a.leafOf(Op.AddressOf, Payload.Sub(e.right), Lit.Ref, d.structName);
-        e.kind = Lit.Ref;
-        e.structName = d.structName;
-        a.setExpr(asn, e);
+    // What a borrow call `id` returned is lent from, appended to `xPath`: its receiver's place, or
+    // its first argument's that has one (`v` for `v.at(i)`), the whole of it, since an element of
+    // what it holds may be anywhere in it. The answer is how many components were appended.
+    lentByCall &self inout a:Ast id:NodeId -> long {
+        e: Expr = a.expr(id);
+        if (e.op != Op.FunctionCall && e.op != Op.MethodCall) { return 0; }
+        match e.payload {
+            Call(c) {
+                cn: CallNode = a.calls.get(c);
+                n: long = self.pathOf(a, cn.receiver);
+                if (n > 0) { return n; }
+                for k in 0..cn.argCount {
+                    n = self.pathOf(a, a.argAt(cn, k));
+                    if (n > 0) { return n; }
+                }
+            }
+            _ { }
+        }
+        return 0;
     }
 
     // While an arm holds a borrow of the matched value's payload, the arm may write that payload
@@ -6213,9 +7062,13 @@ methods Checker {
     // it, or lending it mutably (an `inout` argument, a `&self` receiver), could release the
     // payload the borrow points at. The law of exclusivity, held for the arm rather than one call.
     bmArmBlock &self inout a:Ast b:long inout held:Vec<Sym> inout made:Vec<Sym> inout stores:Vec<NodeId> fnAt:long -> void {
-        if (b < 0) { return; }
+        self.bmArmFrom(a, b, 0, held, made, stores, fnAt);
+    }
+    // The same from statement `from` of block `b` on: what follows a destructure's names.
+    bmArmFrom &self inout a:Ast b:long from:long inout held:Vec<Sym> inout made:Vec<Sym> inout stores:Vec<NodeId> fnAt:long -> void {
+        if (b < 0 || from < 0) { return; }
         n: long = a.blockLen(b);
-        for k in 0..n {
+        for k in from..n {
             a.enterStmt(a.stmtIdAt(b, k));
             st: Stmt = a.stmtAt(b, k);
             if (st.kind == StmtKind.VarDecl) { self.bmArmExpr(a, a.decls.get(st.at).init, held, made, stores, fnAt); }
@@ -6231,7 +7084,7 @@ methods Checker {
                     self.bmArmBlock(a, nd.body, held, made, stores, fnAt);
                     c = nd.elseIf;
                 }
-            } else if (st.kind == StmtKind.While) {
+            } else if (st.kind == StmtKind.While || st.kind == StmtKind.Recover) {
                 w: WhileNode = a.whiles.get(st.at);
                 self.bmArmExpr(a, w.cond, held, made, stores, fnAt);
                 self.bmArmBlock(a, w.body, held, made, stores, fnAt);
@@ -6240,7 +7093,7 @@ methods Checker {
                 self.bmArmBlock(a, a.blockStmts.get(st.at).body, held, made, stores, fnAt);
             } else if (st.kind == StmtKind.With) {
                 w2: WithNode = a.withs.get(st.at);
-                if (self.bmHeldRoot(w2.name, held)) { self.bmWritten(a, nameOf(w2.name), made, fnAt, "held by `with`"); }
+                if (self.bmHeldRoot(w2.name, held)) { self.bmWritten(a, nameOf(w2.name), made, fnAt, "use `with` on"); }
                 self.bmArmBlock(a, w2.body, held, made, stores, fnAt);
             } else if (st.kind == StmtKind.Match) {
                 m: MatchNode = a.matches.get(st.at);
@@ -6260,11 +7113,16 @@ methods Checker {
         e: Expr = a.expr(id);
         if (e.op == Op.Assignment && !nodeIn(stores, id)) {
             x: Sym = self.convBareName(a, e.left);
-            if (x != NO_SYM && symIn(made, x)) {
-                failStr(format("cannot assign to '{}' in {}: it is a borrow of the matched value's payload — assign to its fields, or call a method on it",
-                               nameOf(x), nameOf(a.fns.get(fnAt).name)));
+            // (A copy's whole stores were refused already, by `bmCopyWalk`.)
+            if (x != NO_SYM && symIn(made, x) && self.bmDry < 0) {
+                if (self.bmDestr) {
+                    failStr(format("cannot assign to `{}`\nnote: it is a borrow of an element of the destructured tuple\nhelp: assign to its fields, or call a method on it",
+                                   nameOf(x)));
+                }
+                failStr(format("cannot assign to `{}`\nnote: it is a borrow of the matched value's payload\nhelp: assign to its fields, or call a method on it",
+                               nameOf(x)));
             }
-            if (self.bmOverlaps(a, e.left, held)) { self.bmWritten(a, self.bmPathText(), made, fnAt, "assigned to"); }
+            if (self.bmOverlaps(a, e.left, held)) { self.bmWritten(a, self.bmPathText(), made, fnAt, "assign to"); }
         }
         self.bmArmExpr(a, e.left, held, made, stores, fnAt);
         self.bmArmExpr(a, e.right, held, made, stores, fnAt);
@@ -6309,8 +7167,8 @@ methods Checker {
     // An argument lent mutably: an `inout` parameter or a trait object, as the per-call law has it.
     // `i` is -1 for the receiver. A `&self` receiver is lent mutably only if the method writes
     // `self`, which the guard's write masks decide once every body is settled: the call is noted
-    // here (`gSelfLends`) and refused there if it does. `e.clone()` in an arm holding `e`'s
-    // payload, with `e` a read-only parameter, was refused as a mutable lend.
+    // here (`gSelfLends`) and refused there if it does. Deciding it here would refuse `e.clone()`
+    // in an arm holding `e`'s payload, with `e` a read-only parameter, as a mutable lend.
     bmArmArg &self inout a:Ast at:long i:long arg:NodeId inout held:Vec<Sym> inout made:Vec<Sym> fnAt:long -> void {
         if (at < 0) { return; }
         f: FnNode = a.fns.get(at);
@@ -6322,10 +7180,10 @@ methods Checker {
         if (!self.bmOverlaps(a, arg, held)) { return; }
         if (i < 0 && p.kind == Lit.Ref && p.conv == Conv.Inout) {
             gSelfLends.push(SelfLend { callee: at, pos: gPos, fnName: a.fns.get(fnAt).name,
-                                       what: self.bmPathText(), made: made.get(0) });
+                                       what: self.bmPathText(), made: made.get(0), copy: self.bmDry, destr: self.bmDestr });
             return;
         }
-        self.bmWritten(a, self.bmPathText(), made, fnAt, "lent mutably");
+        self.bmWritten(a, self.bmPathText(), made, fnAt, "mutably lend");
     }
 
     bmHeldRoot &self n:Sym inout held:Vec<Sym> -> bool {
@@ -6349,9 +7207,29 @@ methods Checker {
         return self.pathText(Access { first: 0, count: self.xPath.len(), writes: true });
     }
 
+    // `how` is the verb: "assign to", "mutably lend", "use `with` on". For a copy the guard may
+    // make a borrow (`bmDry`), what would be refused is kept with it, said where it stands.
     bmWritten &self inout a:Ast what:str inout made:Vec<Sym> fnAt:long how:str -> void {
-        failStr(format("'{}' is {} in {} while a match arm holds '{}', a borrow of the matched value's payload — the write could release what '{}' points at; finish with the borrow first, or match on a clone",
-                       what, how, nameOf(a.fns.get(fnAt).name), nameOf(made.get(0)), nameOf(made.get(0))));
+        if (self.bmDry >= 0) {
+            c: CopyBind = gCopyBinds.get(self.bmDry);
+            if (c.conflict.len > 0) { return; }
+            if (self.bmDestr) {
+                c.conflict = keepString(format("cannot {} `{}` while `{}` borrows an element of it\nnote: the code after `{}` writes through it, which makes it a borrow of the element where it lies, and this write could replace the element under it\nhelp: finish with the borrow first, or destructure a clone",
+                                               how, what, nameOf(made.get(0)), nameOf(made.get(0))));
+            } else {
+                c.conflict = keepString(format("cannot {} `{}` while a match arm borrows `{}`\nnote: the arm writes through `{}`, which makes it a borrow of the matched value's payload, and this write could replace the payload under it\nhelp: finish with the borrow first, or match on a clone",
+                                               how, what, nameOf(made.get(0)), nameOf(made.get(0))));
+            }
+            c.conflictPos = gPos;
+            gCopyBinds.set(self.bmDry, c);
+            return;
+        }
+        if (self.bmDestr) {
+            failStr(format("cannot {} `{}` while `{}` borrows an element of it\nnote: `{}` is a borrow of the element where it lies, and the write could release what it points at\nhelp: finish with the borrow first, or destructure a clone",
+                           how, what, nameOf(made.get(0)), nameOf(made.get(0))));
+        }
+        failStr(format("cannot {} `{}` while a match arm borrows `{}`\nnote: `{}` is a borrow of the matched value's payload, and the write could release what it points at\nhelp: finish with the borrow first, or match on a clone",
+                       how, what, nameOf(made.get(0)), nameOf(made.get(0))));
     }
 
     // ─── the moved set ───────────────────────────────────────────────────────
@@ -6426,6 +7304,122 @@ methods Checker {
         return a.addStmt(StmtKind.If, a.ifs.len() - 1);
     }
 
+    // `if (__moved_<n> == 0) { <body> }`: what runs only while `n` still owns its value.
+    ownIfOwns &self inout a:Ast n:Sym body:Vec<long> -> long {
+        f: NodeId = a.leafOf(Op.Lvalue, Payload.Name(self.ownFlagName(n)), Lit.Int, NO_SYM);
+        z: NodeId = a.leaf(Op.Literal, Payload.Num(0), Lit.Int);
+        a.ifs.push(IfNode { cond: a.binary(Op.IsEqual, f, z, Lit.Int), body: a.addBlock(body), elseIf: -1 });
+        return a.addStmt(StmtKind.If, a.ifs.len() - 1);
+    }
+
+    // ─── whole arrays of a Drop type ─────────────────────────────────────────
+    //
+    // A fixed array whose elements own something is a value like a struct that does: stored
+    // whole it is MOVED. Its elements' bytes are copied, the destination's old elements released
+    // first, and the source becomes moved-from: its flag set, so its scope exit releases nothing,
+    // and any later read of it refused as a read of any moved value. Only a local array has a
+    // flag, so only a local array is a source; a field, an element, a global or a borrow is not
+    // (a partial move of an array field, or of one element, has nothing to record it on).
+
+    // The length of the whole array `id` names (a local, a global, a field), or -1.
+    ownWholeArray &self inout a:Ast id:NodeId -> long {
+        if (id == NO_NODE) { return -1; }
+        e: Expr = a.expr(id);
+        match e.payload {
+            Name(n) {
+                if (e.op != Op.Lvalue) { return -1; }
+                c: long = self.ownArrayCount(n);
+                if (c > 0) { return c; }
+                gi: long = gReg.findGlobalSym(n);
+                if (gi >= 0 && gReg.globalDef(gi).isArray) { return gReg.globalDef(gi).count; }
+            }
+            Field(f) {
+                if (e.op != Op.FieldAccess) { return -1; }
+                fd: FieldNode = a.fields.get(f);
+                be: Expr = a.expr(fd.base);
+                if (be.kind != Lit.Struct && be.kind != Lit.Ref) { return -1; }
+                si: long = gReg.findStructSym(be.structName);
+                if (si < 0) { return -1; }
+                d: StructDef = gReg.structDef(si);
+                fi: long = gReg.findFieldSym(d, fd.name);
+                if (fi < 0) { return -1; }
+                fdef: FieldDef = gReg.fieldAt(d, fi);
+                if (fdef.isArray) { return fdef.count; }
+            }
+            _ { }
+        }
+        return -1;
+    }
+
+    // A local array this function tracks: its length, or 0.
+    ownArrayCount &self n:Sym -> long {
+        k: long = self.scope.len();
+        while (k > 0) {
+            k = k - 1;
+            v: OwnLocal = self.scope.get(k);
+            if (v.name == n) { return v.count; }
+        }
+        return 0;
+    }
+
+    // The local array a whole-array store takes its elements from, refusing anything else.
+    ownArraySource &self inout a:Ast src:NodeId -> Sym {
+        e: Expr = a.expr(src);
+        match e.payload {
+            Name(n) { if (e.op == Op.Lvalue && self.ownArrayCount(n) > 0) { return n; } }
+            _ { }
+        }
+        failStr(format("cannot move a whole array of `{}` out of {}\nnote: only a local array is moved whole, since its flag records the move\nhelp: move the elements one at a time (`take`, `replace`, `swapValues`), or clone them",
+                       nameOf(e.structName), self.ownPlaceWords(a, src)));
+    }
+    // A place as a message names it: "the global `g`", "the field `f`", or "this place".
+    ownPlaceWords &self inout a:Ast id:NodeId -> str {
+        e: Expr = a.expr(id);
+        match e.payload {
+            Name(n) { if (gReg.findGlobalSym(n) >= 0) { return keepString(format("the global `{}`", lastComponentOf(nameOf(n)))); } }
+            Field(f) { return keepString(format("the field `{}`", fieldSpelling(a.fields.get(f).name))); }
+            _ { }
+        }
+        return "this place";
+    }
+
+    // `dst = src` of whole arrays of a Drop type: `dst`'s old elements released (a local's only
+    // while it owns them, its flag says), the bytes copied by the statement itself, `dst` owning
+    // again and `src` moved-from.
+    ownArrayStore &self inout a:Ast inout out:Vec<long> e:Expr stmt:long -> void {
+        sn: Sym = a.expr(e.left).structName;
+        self.ownScanUses(a, e.right);
+        src: Sym = self.ownArraySource(a, e.right);
+        dst: Sym = NO_SYM;
+        de: Expr = a.expr(e.left);
+        match de.payload { Name(n) { if (de.op == Op.Lvalue && self.ownArrayCount(n) > 0) { dst = n; } } _ { } }
+        if (dst == src) {
+            failStr(format("cannot assign `{}` to itself\nnote: a whole array of `{}` is moved, and a move into its own source would release what it takes",
+                           nameOf(src), nameOf(sn)));
+        }
+        count: long = self.ownWholeArray(a, e.left);
+        body: Vec<long>;
+        if (dst != NO_SYM) {
+            self.elemLoop(a, &body, OwnLocal { name: dst, structName: sn, count: count }, NO_NODE, true);
+            out.push(self.ownIfOwns(a, dst, body));
+        } else {
+            // A field of a value (`s.v = a`): released where it lies, and its owner must hold one.
+            self.ownScanUses(a, e.left);
+            if (self.ownPlaceRoot(a, e.left) == NO_SYM) {
+                failStr(format("cannot move a whole array of `{}` into this place\nnote: such an array is moved only into a local array, or into a field of a value this function reaches by name",
+                               nameOf(sn)));
+            }
+            self.elemLoop(a, &body, OwnLocal { name: NO_SYM, structName: sn, count: count }, e.left, true);
+            out.extend(body);
+        }
+        out.push(stmt);
+        if (dst != NO_SYM) {
+            self.ownUnmark(dst);
+            self.ownSetFlag(a, out, dst, 0);
+        }
+        self.ownMarkMoved(a, out, src);
+    }
+
     // ─── scope exits ─────────────────────────────────────────────────────────
 
     // Everything one scope holds, released innermost value first: the reverse of the order it
@@ -6434,15 +7428,35 @@ methods Checker {
         k: long = self.scope.len();
         while (k > from) {
             k = k - 1;
-            v: OwnLocal = self.scope.get(k);
-            if (v.count > 0) { self.elemLoop(a, out, v, NO_NODE, true); }
-            else if (self.hasPartial(v.name)) {
-                out.push(self.ownPartialDrop(a, v.name, v.name, v.structName));
-                // A loop may declare it again, with every field owned.
-                self.ownPartialReset(a, out, v.name);
-            }
-            else { out.push(self.ownGuardedDrop(a, v.name, v.name, v.structName)); }
+            self.ownRelease(a, out, self.scope.get(k));
         }
+    }
+    // One local's release, under its flag. Inside a `recover` body the flag is then set, so a
+    // `raise` later in the body does not have the handler release it a second time.
+    ownRelease &self inout a:Ast inout out:Vec<long> v:OwnLocal -> void {
+        if (v.count > 0) {
+            body: Vec<long>;
+            self.elemLoop(a, &body, v, NO_NODE, true);
+            out.push(self.ownIfOwns(a, v.name, body));
+        }
+        else if (self.hasPartial(v.name)) {
+            out.push(self.ownPartialDrop(a, v.name, v.name, v.structName));
+            // A loop may declare it again, with every field owned.
+            self.ownPartialReset(a, out, v.name);
+        }
+        else { out.push(self.ownGuardedDrop(a, v.name, v.name, v.structName)); }
+        if (self.ownRecover > 0) { self.ownSetFlag(a, out, v.name, 1); }
+    }
+
+    // Inside a `recover` body, the flag writes a statement's moves made (appended to `out` from
+    // `from` on) go before the statement itself, which sits at `at`: if a callee in it takes a
+    // value and then raises, the handler must not release that value again.
+    ownMovesFirst &self inout out:Vec<long> at:long from:long -> void {
+        if (self.ownRecover == 0 || from >= out.len()) { return; }
+        moves: Vec<long>;
+        for k in from..out.len() { moves.push(out.get(k)); }
+        while (out.len() > from) { out.pop(); }
+        for k in 0..moves.len() { out.insert(at + k, moves.get(k)); }
     }
     // The scope being closed.
     ownScopeDrops &self inout a:Ast inout out:Vec<long> -> void {
@@ -6453,7 +7467,7 @@ methods Checker {
         self.ownDropRange(a, out, 0);
     }
     // What a `break` or a `continue` leaves: out to and including the loop body's own scope,
-    // and no further, unlike a `return`, the code after the loop still owns the rest.
+    // and no further, since (unlike after a `return`) the code after the loop still owns the rest.
     ownLoopDrops &self inout a:Ast inout out:Vec<long> -> void {
         if (self.loopBase.len() == 0) { return; }
         self.ownDropRange(a, out, self.loopBase.last());
@@ -6528,6 +7542,8 @@ methods Checker {
         self.pmust.clear(); self.pmustLoop.clear(); self.pmustLoopBase.clear();
         self.pFlags.clear(); self.pHoles.clear(); self.pCond = 0;
         self.loopDepth = 0;
+        self.ownRecover = 0;
+        self.recLocals.clear(); self.recLocalsBase.clear(); self.recMoved.clear(); self.recMovedBase.clear();
         for k in 0..f.argCount {
             self.ownParams.put(nameOf(a.paramAt(f, k).name), true);
         }
@@ -6617,7 +7633,7 @@ methods Checker {
     // copy of what a store overwrites).
     ownPartialDrop &self inout a:Ast owner:Sym dropVar:Sym sn:Sym -> long {
         body: Vec<long>;
-        si: long = gReg.findStruct(nameOf(sn));
+        si: long = gReg.findStructSym(sn);
         if (si >= 0) {
             d: StructDef = gReg.structDef(si);
             k: long = d.fieldCount;
@@ -6710,8 +7726,9 @@ methods Checker {
             if (self.ownStmt(a, &out, a.stmts.get(id), id)) { diverged = true; }
             // A raw address taken of an owning local (`memcpy(&gone as long, p, n)`) is how trusted
             // code fills it, and it holds a value from here: released at its scope's end, as
-            // definite initialization already counts the `&x` as its assignment. Before, one
-            // declared without a value kept its "nothing to release" flag and was never dropped.
+            // definite initialization already counts the `&x` as its assignment. Otherwise one
+            // declared without a value would keep its "nothing to release" flag and never be
+            // dropped.
             if (self.addrFills.len() > 0) {
                 if (!diverged) {
                     for j in 0..self.addrFills.len() { self.ownSetFlag(a, &out, self.addrFills.get(j), 0); }
@@ -6732,10 +7749,11 @@ methods Checker {
 
     ownTrack &self n:Sym sn:Sym count:long -> void {
         self.scope.push(OwnLocal { name: n, structName: sn, count: count });
-        if (count == 0) {
-            self.dropOf.put(nameOf(n), sn);
-            self.dropDepth.put(nameOf(n), self.loopDepth);
-        }
+        if (self.ownRecover > 0) { self.recLocals.push(OwnLocal { name: n, structName: sn, count: count }); }
+        // An array's depth too: a whole-array move out of one declared outside a loop is refused
+        // inside it (`ownRepeatingMove`), as any owning local's is.
+        self.dropDepth.put(nameOf(n), self.loopDepth);
+        if (count == 0) { self.dropOf.put(nameOf(n), sn); }
     }
 
     ownStmt &self inout a:Ast inout out:Vec<long> st:Stmt id:long -> bool {
@@ -6747,20 +7765,29 @@ methods Checker {
             if (d.kind != Lit.Ref) { self.ownRejectMove(a, d.init, "assigned to a local"); }
             temps: Vec<Sym>;
             self.ownHoistTemps(a, out, &temps, d.init, false);
+            at: long = out.len();
             out.push(id);
             // Per declaration: the parser gives sibling declarations of one spelling one name, so
             // what a sibling scope moved (`e` handed on inside one loop body) says nothing about
-            // this value, which arrives owning or unassigned. Before, the earlier move stayed in
-            // the set and `e: Vec<long>; rows.push(e);` in a later loop was "use of moved value".
-            // Nor is a sibling's type this one's: a `long` named like an earlier owning value is
-            // not tracked (`ownTrack` below records this declaration when it owns).
+            // this value, which arrives owning or unassigned. Otherwise the earlier move would stay
+            // in the set, and `e: Vec<long>; rows.push(e);` in a later loop would be refused as a
+            // use of a moved value. Nor is a sibling's type this one's: a `long` named like an
+            // earlier owning value is not tracked (`ownTrack` below records this declaration when
+            // it owns).
             self.ownUnmark(d.name);
             self.ownPartialForget(d.name);
             self.fresh.remove(nameOf(d.name));
             self.dropOf.remove(nameOf(d.name));
             self.dropDepth.remove(nameOf(d.name));
             if (d.kind == Lit.Struct && gReg.needsDrop(d.structName)) {
-                if (d.isArray) {
+                if (d.isArray && d.count > 0 && d.init != NO_NODE && a.expr(d.init).op != Op.ArrayLit) {
+                    // `b: [T; N] = a`: the declaration's copy took `a`'s elements, so `b` owns
+                    // them and `a` is moved-from.
+                    src: Sym = self.ownArraySource(a, d.init);
+                    self.ownTrack(d.name, d.structName, d.count);
+                    self.ownFlagDecl(a, out, d.name, 0);
+                    self.ownMarkMoved(a, out, src);
+                } else if (d.isArray) {
                     // No flag: an element cannot be moved out (there is no per-element flag to
                     // record it), so every element is live at scope exit by construction, which
                     // holds only because every element is built here. An element type without
@@ -6773,11 +7800,13 @@ methods Checker {
                                                  count: d.count },
                                       NO_NODE, false);
                         self.ownTrack(d.name, d.structName, d.count);
+                        // Its flag, as any owning local's: a whole-array move sets it.
+                        self.ownFlagDecl(a, out, d.name, 0);
                     } else if (d.count > 0 && d.init == NO_NODE) {
                         // ...and leaving it alone silently is the one thing that must not happen:
                         // the array's elements would be released by nothing at all.
-                        failStr(format("array '{}' has element type '{}', which needs Drop but has no Default — every element must be constructible so the array can initialize all of them up front and drop all of them at scope exit; give it `methods {} for Default`",
-                                       nameOf(d.name), nameOf(d.structName), nameOf(d.structName)));
+                        failStr(format("`{}` does not implement `Default`\nnote: the elements of the array `{}` own something, so every one of them is built up front and released at the end of its scope\nhelp: give it `methods {} for Default`",
+                                       nameOf(d.structName), nameOf(d.name), nameOf(d.structName)));
                     }
                 } else {
                     self.ownTrack(d.name, d.structName, 0);
@@ -6789,7 +7818,9 @@ methods Checker {
                     }
                 }
             }
+            mv: long = out.len();
             self.ownApplyMoves(a, out, a.decls.get(st.at).init);
+            self.ownMovesFirst(out, at, mv);
             self.ownReleaseTemps(a, out, &temps);
             return false;
         }
@@ -6865,6 +7896,7 @@ methods Checker {
             out.push(id);
             return false;
         }
+        if (st.kind == StmtKind.Recover) { return self.ownRecoverStmt(a, out, st.at, id); }
         if (st.kind == StmtKind.Break || st.kind == StmtKind.Continue) {
             // A move carried here would be performed again next time round (`continue`), or
             // would leave the value moved and still named after the loop (`break`), and no
@@ -6884,17 +7916,23 @@ methods Checker {
             for k in 0..nd.pieceCount {
                 self.ownScanUses(a, a.asmPieces.get(nd.firstPiece + k).value);
             }
+            at: long = out.len();
             out.push(id);
+            mv: long = out.len();
             for k in 0..nd.pieceCount {
                 self.ownApplyMoves(a, out, a.asmPieces.get(nd.firstPiece + k).value);
             }
+            self.ownMovesFirst(out, at, mv);
             return nd.noReturn;
         }
         if (st.kind == StmtKind.Destructure) {
             ds: DestructureNode = a.destructures.get(st.at);
             self.ownScanUses(a, ds.value);
+            at: long = out.len();
             out.push(id);
+            mv: long = out.len();
             self.ownApplyMoves(a, out, ds.value);
+            self.ownMovesFirst(out, at, mv);
             for k in 0..ds.nameCount {           // each target now owns its part
                 t: Sym = a.names.get(ds.firstName + k);
                 if (self.dropOf.has(nameOf(t))) {
@@ -6968,7 +8006,7 @@ methods Checker {
         for k in 0..self.moved.len() {
             n: Sym = self.moved.get(k);
             if (self.ownRepeatingMove(n)) {
-                failStr(format("cannot move '{}' inside a loop (clone it instead)", nameOf(n)));
+                failStr(format("cannot move `{}` inside a loop\nnote: it lives outside the loop, so the move would repeat on the next turn, or leave it moved after the loop\nhelp: clone it instead", nameOf(n)));
             }
         }
     }
@@ -7107,8 +8145,11 @@ methods Checker {
         a.decls.push(VarDeclNode { name: t, kind: Lit.Bool, structName: NO_SYM,
                                    isArray: false, count: 0, conv: Conv.None, isVariadic: false,
                                    elemKind: Lit.Void, elemStruct: NO_SYM, init: e.left });
+        lat: long = pre.len();
         pre.push(a.addStmt(StmtKind.VarDecl, a.decls.len() - 1));
+        lmv: long = pre.len();
         self.ownApplyMoves(a, pre, e.left);
+        self.ownMovesFirst(pre, lat, lmv);
         // The right operand is read after the left's moves, which is when it runs.
         inner: Vec<long>;
         itemps: Vec<Sym>;
@@ -7117,9 +8158,12 @@ methods Checker {
         asn: NodeId = a.binary(Op.Assignment, a.leafOf(Op.Lvalue, Payload.Name(t), Lit.Bool, NO_SYM),
                                e.right, Lit.Bool);
         a.exprStmts.push(ExprStmtNode { value: asn });
+        rat: long = inner.len();
         inner.push(a.addStmt(StmtKind.Expr, a.exprStmts.len() - 1));
         self.pCond = self.pCond + 1;          // what the right operand moves, it moves on some paths
+        rmv: long = inner.len();
         self.ownApplyMoves(a, &inner, e.right);
+        self.ownMovesFirst(&inner, rat, rmv);
         self.pCond = self.pCond - 1;
         self.ownReleaseTemps(a, &inner, &itemps);
         test: NodeId = a.leafOf(Op.Lvalue, Payload.Name(t), Lit.Bool, NO_SYM);
@@ -7134,8 +8178,8 @@ methods Checker {
     // the value and one that does not leaves the value owning it. Nothing here records that: the
     // binding is an ordinary `v = subject.$V$k;` at the head of the arm, and the ordinary
     // payload-move rule on that store is what marks the subject and writes its flag. Recording it
-    // here, ahead of the walk, made that very store a read of a value ownership had already given
-    // away, and every program matching on a Drop payload was refused.
+    // here, ahead of the walk, would make that very store a read of a value ownership had already
+    // given away, and every program matching on a Drop payload would be refused.
     ownMatch &self inout a:Ast at:long -> void {
         m: MatchNode = a.matches.get(at);
         before: Vec<Sym>; uni: Vec<Sym>;
@@ -7161,6 +8205,80 @@ methods Checker {
             self.ownRestore(&uni);
             if (allDiverge) { self.pmust.extend(mustBefore); } else { self.pmust.extend(mustAcc); }
         }
+    }
+
+    // `recover { body } else { handler }`. The handler can be entered from any call in the body,
+    // so it starts with everything the body moved anywhere counted as possibly moved, which each
+    // value's flag settles at run time. The tracked locals the body declared are out of scope
+    // there, but they may hold something when a `raise` arrives: the handler first releases each
+    // one its flag says still owns. Those flags are set (to "nothing to release") ahead of the
+    // statement, so a `raise` before a declaration is reached finds nothing to release either.
+    // Afterwards the two paths meet as an `if` and its `else` do.
+    ownRecoverStmt &self inout a:Ast inout out:Vec<long> at:long id:long -> bool {
+        w: WhileNode = a.whiles.get(at);
+        before: Vec<Sym>; mustBefore: Vec<Sym>;
+        before.extend(self.moved);
+        mustBefore.extend(self.pmust);
+        self.ownRecover = self.ownRecover + 1;
+        self.recLocalsBase.push(self.recLocals.len());
+        self.recMovedBase.push(self.recMoved.len());
+        bodyExits: bool = self.ownBlock(a, w.body);
+        self.ownRecover = self.ownRecover - 1;
+        afterBody: Vec<Sym>; mustBody: Vec<Sym>;
+        afterBody.extend(self.moved);
+        mustBody.extend(self.pmust);
+
+        entry: Vec<Sym>;
+        entry.extend(before);
+        for k in self.recMovedBase.last()..self.recMoved.len() {
+            n: Sym = self.recMoved.get(k);
+            if (!symIn(entry, n)) { entry.push(n); }
+        }
+        self.ownRestore(&entry);
+        self.pmust.clear(); self.pmust.extend(mustBefore);
+        // The releases are made against the handler's starting state (which fields of a partly
+        // moved value may be gone), and set each flag, so a `raise` in the handler that reaches a
+        // `recover` further out does not release them again.
+        held: Vec<OwnLocal>;
+        for k in self.recLocalsBase.last()..self.recLocals.len() { held.push(self.recLocals.get(k)); }
+        releases: Vec<long>;
+        was: long = self.ownRecover;
+        self.ownRecover = 1;
+        k: long = held.len();
+        while (k > 0) { k = k - 1; self.ownRelease(a, &releases, held.get(k)); }
+        self.ownRecover = was;
+        handlerExits: bool = self.ownBlock(a, w.step);
+        hb: long = w.step;
+        first: long = a.stmtRuns.len();
+        a.stmtRuns.extend(releases);
+        for j in 0..a.blockLen(hb) { a.stmtRuns.push(a.stmtIdAt(hb, j)); }
+        a.blocks.set(hb, Block { firstStmt: first, stmtCount: a.stmtRuns.len() - first });
+
+        // What the body declares starts out owning nothing, as far as its handler can tell.
+        for j in 0..held.len() { self.ownFlagDecl(a, out, held.get(j).name, 1); }
+        self.recLocalsBase.pop();
+        self.recMovedBase.pop();
+        if (self.ownRecover == 0) { self.recLocals.clear(); self.recMoved.clear(); }
+        out.push(id);
+
+        if (bodyExits && handlerExits) {
+            self.ownRestore(&before);
+            self.pmust.clear(); self.pmust.extend(mustBefore);
+            return true;
+        }
+        if (bodyExits) { return false; }
+        if (handlerExits) {
+            self.ownRestore(&afterBody);
+            self.pmust.clear(); self.pmust.extend(mustBody);
+            return false;
+        }
+        mustAcc: Vec<Sym>;
+        mustAcc.extend(mustBody);
+        self.mustMeet(&mustAcc, true);
+        self.ownUnion(&afterBody);
+        self.ownRestore(&afterBody);
+        self.pmust.clear(); self.pmust.extend(mustAcc);
+        return false;
     }
 
     ownRestore &self inout snap:Vec<Sym> -> void {
@@ -7224,6 +8342,7 @@ methods Checker {
 
     ownMarkMoved &self inout a:Ast inout out:Vec<long> n:Sym -> void {
         if (self.ownIsMoved(n)) { return; }
+        if (self.ownRecover > 0) { self.recMoved.push(n); }
         if (self.isPartial(n)) {
             self.moved.push(n);
             self.stmtMoves = self.stmtMoves + 1;
@@ -7278,16 +8397,17 @@ methods Checker {
     // A move this machinery cannot describe. Every arm asks one question (after the value is
     // taken, what still believes it owns the resource?) and refuses where the answer cannot be
     // written down. A per-variable `__moved_` flag is the only place a move can be recorded, and
-    // these are the shapes that have no flag to record it on.
+    // these are the shapes that have no flag to record it on. `what` says how the value is moved
+    // ("returned", "handed to a parameter that takes it"), for the note: "it is <what>".
     ownRejectMove &self inout a:Ast id:NodeId what:str -> void {
         if (id == NO_NODE) { return; }
         e: Expr = a.expr(id);
         // A borrow names a value someone else owns. Copying it out (which is what moving a ref
         // expression would be) makes a second owner of one resource. That includes a borrowed
         // parameter (`&self`, `inout`): its caller kept the original and releases it, so a
-        // callee handing it on to a sink released it twice.
+        // callee handing it on to a sink would release it twice.
         if (e.kind == Lit.Ref && gReg.needsDrop(e.structName)) {
-            failStr(format("cannot move a {} out of a borrow ({}) — its owner would release it too; clone it, or take it out through the owner (pop, take)",
+            failStr(format("cannot move a value of type `{}` out of a borrow\nnote: it is {}, and its owner would release it too\nhelp: clone it, or take it out through the owner (`pop`, `take`)",
                            nameOf(e.structName), what));
         }
         if (e.kind != Lit.Struct || !gReg.needsDrop(e.structName)) { return; }
@@ -7297,8 +8417,8 @@ methods Checker {
                 // A global is nobody's to give away: it holds its value for the whole run, so
                 // what took it would release a resource the global still names, and the next
                 // reader (or the next taker) uses freed memory.
-                if (e.op == Op.Lvalue && gReg.findGlobal(nameOf(n)) >= 0) {
-                    failStr(format("cannot move the global '{}' out ({}) — it keeps naming the value, which would be released twice; borrow it with '&', clone it, or take it out with `take(&{})`",
+                if (e.op == Op.Lvalue && gReg.findGlobalSym(n) >= 0) {
+                    failStr(format("cannot move out of the global `{}`\nnote: it is {}, and the global keeps naming the value, which would be released twice\nhelp: borrow it with `&`, clone it, or take it out with `take(&{})`",
                                    nameOf(n), what, nameOf(n)));
                 }
             }
@@ -7306,8 +8426,8 @@ methods Checker {
                 // An element has no flag of its own, so a move out of one cannot be recorded,
                 // and behind a raw pointer the compiler never owned it to begin with.
                 if (a.indexes.get(i).rawPointerBase) { return; }
-                failStr(format("cannot move a Drop value out of an array element ({}) — the element would still be dropped with the array, releasing it twice; borrow it with '&', call a method on it, or clone it",
-                               what));
+                failStr(format("cannot move a value of type `{}` out of an element\nnote: it is {}, and what holds the element (the array, or the owner of the slice or vector) still releases it, so it would be released twice\nhelp: borrow it with `&`, clone it (`.clone()`), or take it out through its owner (`pop`, `removeAt`, `take`, `replace`, `swapValues`)",
+                               nameOf(e.structName), what));
             }
             Field(f) {
                 fn: FieldNode = a.fields.get(f);
@@ -7315,11 +8435,11 @@ methods Checker {
                 fld: str = fieldSpelling(fn.name);
                 owner: Sym = self.ownPlaceRoot(a, fn.base);
                 if (owner == NO_SYM || !self.dropOf.has(nameOf(owner))) {
-                    failStr(format("cannot move the Drop field '{}' out of a value this function does not own ({}) — its real owner would release it too; borrow it with '&', or clone it",
+                    failStr(format("cannot move the field `{}` out of a value this function does not own\nnote: it is {}, and its real owner would release it too\nhelp: borrow it with `&`, clone it (`.clone()`), or take it out through its owner (`take`, `replace`, `swapValues` on a place it lends you `inout`)",
                                    fld, what));
                 }
                 if (a.expr(fn.base).op != Op.Lvalue) {                 // `h.a.b`: only `h`'s fields are tracked
-                    failStr(format("cannot move the Drop field '{}' out of a nested field of '{}' ({}) — a move is tracked per field of a local, so only a direct field can be taken; clone it, or take the outer field first",
+                    failStr(format("cannot move the field `{}` out of a nested field of `{}`\nnote: it is {}, and a move is tracked per field of a local, so only a direct field can be taken\nhelp: clone it (`.clone()`), take the outer field first, or take it out with `take`, `replace` or `swapValues`",
                                    fld, nameOf(owner), what));
                 }
                 sn: Sym = intern(nameOf(self.dropOf.get(nameOf(owner))));
@@ -7327,7 +8447,7 @@ methods Checker {
                 // would hand it a value with a hole in it. The glue keeps the author's release
                 // under `$own`, which is what says there was one. (Rust's rule, E0509.)
                 if (self.fnNodeOf(internString(format("{}_drop$own", nameOf(sn)))) >= 0) {
-                    failStr(format("cannot move the field '{}' out of '{}' ({}) — {} implements Drop, whose `drop` must still run on the whole value, so it cannot be partly moved; clone the field, or give {} a method that takes the value apart",
+                    failStr(format("cannot move the field `{}` out of `{}`\nnote: it is {}, and `{}` implements `Drop`, whose `drop` must still run on the whole value, so it cannot be partly moved\nhelp: clone the field, or give `{}` a method that takes the value apart",
                                    fld, nameOf(owner), what, nameOf(sn), nameOf(sn)));
                 }
             }
@@ -7335,22 +8455,28 @@ methods Checker {
         }
     }
 
-    // An argument a parameter takes is moved like a stored or returned value, so a borrow there
-    // is refused as it is there. (An element or a borrowed value's field handed to a sink is the
-    // same double release and is not refused yet: `Vec.extendSlice` does it for every T.)
+    // An argument a parameter takes is moved like a stored or returned value, so every move a
+    // store refuses is refused here too: a borrow, a whole global, an element (of an array, a
+    // slice, a borrowed value), and a field of a value this function does not own or of a field.
+    // Each is a second owner of one resource: the callee releases it, and so does whoever still
+    // holds the place (`dst.push(xs[i])` with `xs: [String]` would leave two vectors sharing a
+    // buffer).
     ownRejectMoveArg &self inout a:Ast id:NodeId callee:Sym -> void {
         if (id == NO_NODE) { return; }
         e: Expr = a.expr(id);
         if (!gReg.needsDrop(e.structName)) { return; }
         if (e.kind == Lit.Ref) { self.ownRejectMove(a, id, "handed to a parameter that takes it"); return; }
-        // A whole global is refused here as everywhere else it would be moved.
-        if (e.kind == Lit.Struct && e.op == Op.Lvalue) {
-            match e.payload { Name(n) { self.ownRejectMove(a, id, "handed to a parameter that takes it"); } _ { } }
+        if (e.kind != Lit.Struct) { return; }
+        match e.payload {
+            Name(n) { self.ownRejectMove(a, id, "handed to a parameter that takes it"); }
+            Index(i) { self.ownRejectMove(a, id, "handed to a parameter that takes it"); }
+            Field(f) { self.ownRejectMove(a, id, "handed to a parameter that takes it"); }
+            _ { }
         }
     }
 
     dropFieldCount &self sn:Sym -> long {
-        at: long = gReg.findStruct(nameOf(sn));
+        at: long = gReg.findStructSym(sn);
         if (at < 0) { return 0; }
         d: StructDef = gReg.structDef(at);
         n: long = 0;
@@ -7379,6 +8505,12 @@ methods Checker {
                     if (self.stmtMoves > 0) { self.ownScanUses(a, v); }    // in order, as a call's
                     if (a.expr(v).op == Op.Lvalue && a.expr(v).kind == Lit.Struct) {
                         match a.expr(v).payload { Name(g) { self.ownRejectMove(a, v, "stored in a literal"); } _ { } }
+                    }
+                    // A whole array of a Drop type moved into the literal's field.
+                    if (a.expr(v).kind == Lit.Struct && gReg.needsDrop(a.expr(v).structName)
+                        && a.expr(v).op != Op.ArrayLit && self.ownWholeArray(a, v) > 0) {
+                        self.ownMarkMoved(a, out, self.ownArraySource(a, v));
+                        continue;
                     }
                     n: Sym = self.ownBareDropVar(a, v);
                     if (n != NO_SYM) { self.ownMarkMoved(a, out, n); }
@@ -7469,8 +8601,7 @@ methods Checker {
                     if (self.ownIsMoved(x)) { self.ownMovedUse(a, x); }
                     e2: Sym = self.partialEntry(x, fnode.name);
                     if (self.ownIsMoved(e2)) {
-                        failStr(format("use of moved field '{}.{}' in {}", nameOf(x), fieldSpelling(fnode.name),
-                                       nameOf(a.fns.get(self.ownFn).name)));
+                        failStr(format("use of moved value: `{}.{}`", nameOf(x), fieldSpelling(fnode.name)));
                     }
                     self.fresh.remove(nameOf(x));
                 } else { self.ownScanUses(a, fnode.base); }
@@ -7486,6 +8617,7 @@ methods Checker {
             Call(c) {
                 cn: CallNode = a.calls.get(c);
                 self.exclusivity(a, c);
+                if (cn.argCount >= 2 || (cn.argCount == 1 && cn.receiver != NO_NODE)) { self.moveWhileLent(a, cn); }
                 self.ownScanUses(a, cn.receiver);
                 self.ownScanUses(a, cn.callee);
                 for k in 0..cn.argCount { self.ownScanUses(a, a.argAt(cn, k)); }
@@ -7559,9 +8691,9 @@ methods Checker {
                         base = 1;
                         // A method whose `self` is by value consumes its receiver: `s + "x"` is
                         // `String.add`, which takes the string and hands back the grown one. A
-                        // temporary in that position is the callee's, so releasing it here frees
-                        // the buffer the answer is still using: `d + "a" + "b"` printed the
-                        // allocator's own free-list pointer out of the middle of the string.
+                        // temporary in that position is the callee's, so releasing it here would
+                        // free the buffer the answer is still using: `d + "a" + "b"` would print
+                        // the allocator's own free-list pointer out of the middle of the string.
                         self.ownHoistTemps(a, pre, temps, cn.receiver,
                                            !self.argConsumes(a, at, cn, 0));
                     }
@@ -7633,10 +8765,96 @@ methods Checker {
                     w: Access = x;
                     o: Access = y;
                     if (!x.writes) { w = y; o = x; }
-                    failStr(format("exclusivity violation in the call to {}: '{}' is lent mutably while '{}' is also accessed — clone one, or restructure the call",
-                                   nameOf(cn.name), self.pathText(w), self.pathText(o)));
+                    failStr(format("cannot lend `{}` mutably while `{}` is also used in the call to `{}`\nhelp: clone one of them, or restructure the call",
+                                   self.pathText(w), self.pathText(o), nameOf(cn.name)));
                 }
             }
+        }
+    }
+
+    // ─── a value moved into a call that also lends it ────────────────────────
+    //
+    // A parameter that takes its argument (a `sink`) owns it from the moment the call begins, and
+    // may release it before the call returns. So a value that owns something may not be moved into
+    // one parameter while it, or a place overlapping it, is lent to another, or to the receiver:
+    // the borrow would read what the callee released (`take(x, x)` with `take r:String sink
+    // s:String`, or `put(v, v.name)`). Only the lend made before the move is this check's: the move
+    // made first is the ownership walk's, which refuses what comes after it as a use of a moved
+    // value. Every kind of call: a direct one lends what its parameter does not take, a call
+    // through a fn value what its type does not mark `sink`, and a dispatch what its trait's
+    // method does not (`argConsumes`). An argument the call is not handed (`x.len()`) lends nothing
+    // across it; one that is a borrow a call returned (`v.at(0)`) lends what that call borrowed.
+    moveWhileLent &self inout a:Ast cn:CallNode -> void {
+        base: long = 0;
+        if (cn.receiver != NO_NODE) { base = 1; }
+        // Most calls move nothing that owns anything, and are done with here. A move to look at is
+        // an argument after the first that owns something; whether it is a move is asked below.
+        owning: bool = false;
+        for k in 0..cn.argCount {
+            if (base + k == 0) { continue; }
+            arg: NodeId = a.argAt(cn, k);
+            if (a.exprs[arg].kind == Lit.Struct && gReg.needsDrop(a.exprs[arg].structName)) { owning = true; break; }
+        }
+        if (!owning) { return; }
+        at: long = self.fnNodeOf(cn.name);
+        self.xPath.clear();
+        lent: Vec<Access>;
+        for i in 0..base + cn.argCount {
+            arg: NodeId = cn.receiver;
+            if (i >= base) { arg = a.argAt(cn, i - base); }
+            e: Expr = a.expr(arg);
+            if (self.argConsumes(a, at, cn, i)) {
+                if (lent.len() == 0 || e.kind != Lit.Struct || !gReg.needsDrop(e.structName)) { continue; }
+                first: long = self.xPath.len();
+                n: long = self.pathOf(a, arg);
+                if (n == 0) { continue; }
+                moved: Access = Access { first: first, count: n, writes: true };
+                for l in lent {
+                    if (self.pathsOverlap(l, moved)) {
+                        failStr(format("cannot move `{}` while `{}` is also lent in the call to `{}`\nnote: the parameter that takes `{}` may release it before the call returns, while the borrow is still in use\nhelp: clone one of them, or restructure the call",
+                                       self.pathText(moved), self.pathText(l), nameOf(cn.name), self.pathText(moved)));
+                    }
+                }
+                continue;
+            }
+            if (byAddressKind(e.kind) && !namedScalar(e.kind, e.structName)) { self.lentPlaces(a, arg, &lent); }
+        }
+    }
+
+    // The places an argument handed by address lends for the call, appended to `out` (their paths
+    // to `xPath`): the place it names; for a borrow a call returned, what that call was lent; for a
+    // closure, each capture.
+    lentPlaces &self inout a:Ast id:NodeId inout out:Vec<Access> -> void {
+        if (id == NO_NODE) { return; }
+        first: long = self.xPath.len();
+        n: long = self.pathOf(a, id);
+        if (n > 0) { out.push(Access { first: first, count: n, writes: false }); return; }
+        // Down to what the argument is made of: through `&`, a coercion to a trait object, a lent
+        // place's `*r`, a field, an element.
+        cur: NodeId = id;
+        while (cur != NO_NODE) {
+            e: Expr = a.expr(cur);
+            next: NodeId = NO_NODE;
+            match e.payload {
+                Sub(v)   { if (e.op == Op.AddressOf || e.op == Op.MakeTraitObj || lentPlaceOf(a, cur) != NO_NODE) { next = v; } }
+                Field(f) { next = a.fields.get(f).base; }
+                Index(i) { next = a.indexes.get(i).base; }
+                Call(c) {
+                    if (e.kind != Lit.Ref && e.kind != Lit.Slice) { return; }
+                    cn: CallNode = a.calls.get(c);
+                    self.lentPlaces(a, cn.receiver, out);
+                    for k in 0..cn.argCount { self.lentPlaces(a, a.argAt(cn, k), out); }
+                    return;
+                }
+                Lit(l) {
+                    ln: LitNode = a.lits.get(l);
+                    if (!isClosureStruct(ln.typeName)) { return; }
+                    for k in 0..ln.initCount { self.lentPlaces(a, a.inits.get(ln.firstInit + k).value, out); }
+                    return;
+                }
+                _ { }
+            }
+            cur = next;
         }
     }
 
@@ -7694,9 +8912,9 @@ methods Checker {
             e: Expr = a.expr(cur);
             p: Payload = e.payload;
             // A `&` and a coercion to a trait object are both views of what is under them, not
-            // values of their own. `MakeTraitObj` fell through to the `_` arm below and answered
-            // 0 ("an rvalue, aliasing nothing") so `both(s, s)` recorded no access at all and
-            // the mutable-lend rule `noteAccess` already had was never asked about it.
+            // values of their own. Left to the `_` arm below, a `MakeTraitObj` would answer 0 ("an
+            // rvalue, aliasing nothing"), so `both(s, s)` would record no access at all and the
+            // mutable-lend rule in `noteAccess` would never be asked about it.
             if (e.op == Op.AddressOf || e.op == Op.MakeTraitObj || lentPlaceOf(a, cur) != NO_NODE) {
                 inner: NodeId = NO_NODE;
                 match p { Sub(v) { inner = v; } _ { } }
@@ -7779,24 +8997,21 @@ methods Checker {
         return keepString(s);
     }
 
-    // Naming the function is not decoration: a move is decided from the callee's conventions,
-    // so the site that reads a moved value is rarely the site that was wrong about it.
+    // A read of a value, or of a field taken out of one, that this path has already handed on.
     ownMovedUse &self inout a:Ast n:Sym -> void {
         if (self.isPartial(n)) {
-            failStr(format("use of moved field '{}.{}' in {}", nameOf(self.partialOwner(n)),
-                           fieldSpelling(self.pField.get(nameOf(n))), nameOf(a.fns.get(self.ownFn).name)));
+            failStr(format("use of moved value: `{}.{}`", nameOf(self.partialOwner(n)),
+                           fieldSpelling(self.pField.get(nameOf(n)))));
         }
-        failStr(format("use of moved value '{}' in {}", nameOf(n),
-                       nameOf(a.fns.get(self.ownFn).name)));
+        failStr(format("use of moved value: `{}`", nameOf(n)));
     }
     // `x` as a whole after a field was taken out of it: moving it, lending it, calling a method.
     ownPartialUse &self inout a:Ast n:Sym -> void {
         for k in 0..self.moved.len() {
             m: Sym = self.moved.get(k);
             if (self.isPartial(m) && self.partialOwner(m) == n) {
-                failStr(format("use of partly moved value '{}' in {}: its field '{}' was moved out -- read the other fields one by one, or give '{}' a whole value again first",
-                               nameOf(n), nameOf(a.fns.get(self.ownFn).name),
-                               fieldSpelling(self.pField.get(nameOf(m))), nameOf(n)));
+                failStr(format("use of partly moved value: `{}`\nnote: field `{}` was moved out\nhelp: read the other fields one by one, or give `{}` a whole value again first",
+                               nameOf(n), fieldSpelling(self.pField.get(nameOf(m))), nameOf(n)));
             }
         }
     }
@@ -7804,7 +9019,7 @@ methods Checker {
     // ─── a store releases what it overwrites ─────────────────────────────────
     //
     // `x = v` where `x` already owns something: that something has to be released, or it leaks,
-    //  and after `v` is built, because `v` may read it (`x = x.clone()`). So the old value is
+    // and after `v` is built, because `v` may read it (`x = x.clone()`). So the old value is
     // saved to a temporary before the store and released after it. The temporary is a bitwise
     // copy of a handle; the store itself still writes in place.
 
@@ -7816,9 +9031,19 @@ methods Checker {
             // temporary to release too.
             self.ownScanUses(a, id);
             self.ownHoistTemps(a, out, &temps, id, true);
+            at: long = out.len();
             out.push(stmt);
+            mv: long = out.len();
             self.ownApplyMoves(a, out, id);
+            self.ownMovesFirst(out, at, mv);
             self.ownReleaseTemps(a, out, &temps);
+            return;
+        }
+        // A whole array of a Drop type: a move (`ownArrayStore`).
+        le: Expr = a.expr(e.left);
+        if (le.kind == Lit.Struct && gReg.needsDrop(le.structName) && a.expr(e.right).op != Op.ArrayLit
+            && (self.ownWholeArray(a, e.left) > 0 || self.ownWholeArray(a, e.right) > 0)) {
+            self.ownArrayStore(a, out, e, stmt);
             return;
         }
         // A later binding of the same arm reads the subject its first one already moved from:
@@ -7834,9 +9059,9 @@ methods Checker {
         // statement that brings a moved value back.
         target: Sym = self.ownBareDropVar(a, e.left);
         // `x.f = v` into a value that holds nothing yet, or was moved away whole: the store builds
-        // the value up again, and it is the owner that comes back (as before partial moves).
-        // That is sound only when `f` is all it owns: any other owning field would come back
-        // holding what was moved away (or nothing at all) and be released at the scope's end.
+        // the value up again, and it is the owner that comes back. That is sound only when `f` is
+        // all it owns: any other owning field would come back holding what was moved away (or
+        // nothing at all) and be released at the scope's end.
         if (target != NO_SYM && self.isPartial(target)) {
             ow: Sym = self.partialOwner(target);
             if (self.fresh.has(nameOf(ow)) || self.ownIsMoved(ow)) {
@@ -7844,7 +9069,7 @@ methods Checker {
                 if (self.dropFieldCount(osn) > 1) {
                     why: str = "was moved away";
                     if (self.fresh.has(nameOf(ow))) { why = "holds no value yet"; }
-                    failStr(format("cannot assign to the field '{}' of '{}': '{}' {}, and it owns other fields this store would not give back -- assign '{}' a whole value",
+                    failStr(format("cannot assign to the field `{}` of `{}`\nnote: `{}` {}, and it owns other fields this store would not give back\nhelp: assign `{}` a whole value",
                                    fieldSpelling(self.pField.get(nameOf(target))), nameOf(ow), nameOf(ow), why, nameOf(ow)));
                 }
                 target = ow;
@@ -7880,6 +9105,8 @@ methods Checker {
         old: Sym = NO_SYM;
         if (needed) { old = self.ownSaveOld(a, out, e.left, sd.structName); }
         if (needed && old == NO_SYM) { needed = false; }
+        // Inside a `recover` body the moves go first, as `ownMovesFirst` says why.
+        if (self.ownRecover > 0) { out.extend(moves); moves.clear(); }
         out.push(stmt);
         if (needed) {
             if (sd.guard == NO_SYM) { out.push(self.ownDropStmt(a, old, sd.structName)); }
@@ -8098,9 +9325,9 @@ methods Checker {
     //
     // Every struct parameter is either a borrow the callee only reads or a value it takes. An
     // unannotated one is a borrow unless the body writes it, takes its address, or hands the
-    // value on, and for a type that owns something, handing it on means the callee's release
-    // is somebody else's business now. Which it is, is what tells the ownership walk whether an
-    // argument is moved at a call.
+    // value on (for a type that owns something, handing it on makes its release somebody else's
+    // business). Which of the two it is tells the ownership walk whether an argument is moved at
+    // a call.
     //
     // A fixpoint, because a bare pass consumes only if that parameter turns out to consume; the
     // demotion is monotone, so it settles.
@@ -8158,6 +9385,12 @@ methods Checker {
                 self.enforceOne(a, st.at);
             }
         }
+        // And every `&f` a global holds (`gF: fn(Res)->long = &stash`), which no body reaches.
+        for k in 0..self.globalFnRefs.len() {
+            id: NodeId = self.globalFnRefs.get(k);
+            gPos = self.globalFnRefPos.get(k);
+            self.enforceFnRef(a, id, a.expr(id).structName);
+        }
     }
 
     // Every dependency function's parameters as its own compile left them: the convention, and
@@ -8171,13 +9404,13 @@ methods Checker {
             f: FnNode = a.fns.get(st.at);
             fi: long = fnFactOf(st.at);
             if (fi < 0) {
-                failStr(format("'{}' comes from a .klib that records nothing about it -- the archive is damaged or from a different compiler",
+                failStr(format("`{}` comes from a `.klib` that records nothing about it\nnote: the archive is damaged, or was built by a different compiler\nhelp: rebuild it",
                                nameOf(f.name)));
             }
             fact: FnFact = gFacts.fns.get(fi);
             if (fact.paramCount != f.argCount) {
-                failStr(format("'{}' has {} parameter(s) here but {} in its .klib -- the archive is stale",
-                               nameOf(f.name), f.argCount, fact.paramCount));
+                failStr(format("the `.klib` that declares `{}` is stale: the function has {} here, and {} in the archive\nhelp: rebuild it",
+                               nameOf(f.name), plural(f.argCount, "parameter"), fact.paramCount));
             }
             for j in 0..f.argCount {
                 at: long = a.params.get(f.firstArg + j);
@@ -8202,7 +9435,7 @@ methods Checker {
                 f: FnNode = a.fns.get(i);
                 if ((f.attrs & FN_PANIC) == 0) { continue; }
                 if (gPanicFn != NO_SYM && gPanicFn != f.name) {
-                    failStr(format("two functions are marked `@panic`: '{}' and '{}'", nameOf(gPanicFn), nameOf(f.name)));
+                    failStr(format("two functions are marked `@panic`: `{}` and `{}`", nameOf(gPanicFn), nameOf(f.name)));
                 }
                 gPanicFn = f.name;
             }
@@ -8210,17 +9443,45 @@ methods Checker {
         return gPanicFn;
     }
 
+    // The function a `recover` statement links and unlinks its record with: the one the program
+    // marks `@recover`, or NO_SYM when it marks none.
+    recoverTarget &self inout a:Ast -> Sym {
+        if (!gRecoverScanned) {
+            gRecoverScanned = true;
+            for i in 0..a.fns.len() {
+                f: FnNode = a.fns.get(i);
+                if ((f.attrs & FN_RECOVER) == 0) { continue; }
+                if (gRecoverFn != NO_SYM && gRecoverFn != f.name) {
+                    failStr(format("two functions are marked `@recover`: `{}` and `{}`", nameOf(gRecoverFn), nameOf(f.name)));
+                }
+                gRecoverFn = f.name;
+            }
+        }
+        return gRecoverFn;
+    }
+
     // What a declaration says beyond its signature, held once over the whole program: a raw
-    // syscall is `unsafe` (it may write anywhere), and one function at most is `@panic`.
+    // syscall is `unsafe` (it may write anywhere), and one function at most is `@panic`, and one
+    // `@recover`.
     holdDeclarations &self inout a:Ast -> void {
         for i in 0..a.fns.len() {
             f: FnNode = a.fns.get(i);
             if (builtinOf(f) == BI_SYSCALL && !f.isUnsafe) {
                 self.atFn(a, i);
-                failStr(stringOf("`builtin syscall` may write anywhere, so it is declared `unsafe`: `pub unsafe builtin syscall nr:long args:...long -> long;`"));
+                failStr(stringOf("`builtin syscall` must be declared `unsafe`\nnote: a raw syscall may write anywhere\nhelp: declare it as `pub unsafe builtin syscall nr:long args:...long -> long;`"));
+            }
+            if (isAtomicBuiltin(builtinOf(f)) && !f.isUnsafe) {
+                self.atFn(a, i);
+                failStr(format("`builtin {}` must be declared `unsafe`\nnote: an atomic reads or writes the word at the raw address it is handed\nhelp: declare it `pub unsafe builtin {} ...;`",
+                               lastComponentOf(nameOf(f.name)), lastComponentOf(nameOf(f.name))));
+            }
+            if (builtinOf(f) == BI_MEMCPY && !f.isUnsafe) {
+                self.atFn(a, i);
+                failStr(stringOf("`builtin memcpy` must be declared `unsafe`\nnote: it reads and writes the bytes at the raw addresses it is handed\nhelp: declare it as `pub unsafe builtin memcpy dst:long src:long n:long -> void;`"));
             }
         }
         self.panicTarget(a);
+        self.recoverTarget(a);
     }
 
     // Whether `name` never returns, as the settled program decided. What a package build writes
@@ -8252,11 +9513,11 @@ methods Checker {
             if (self.convCandidate(p) && p.conv == Conv.Read) {
                 fl: long = facts.get(k);
                 if ((fl & CONV_FORCED) != 0) {
-                    failStr(format("parameter '{}' of {} is declared `read` but the body writes it",
+                    failStr(format("parameter `{}` of `{}` is declared `read`, but the body writes it",
                                    nameOf(p.name), nameOf(f.name)));
                 }
                 if ((fl & CONV_GIVEN) != 0) {
-                    failStr(format("parameter '{}' of {} is declared `read` but the body moves it out",
+                    failStr(format("parameter `{}` of `{}` is declared `read`, but the body moves it out",
                                    nameOf(p.name), nameOf(f.name)));
                 }
             }
@@ -8275,107 +9536,7 @@ methods Checker {
         if (d.kind != Lit.Struct) { return; }
         d.kind = Lit.Ref;
         a.decls.set(at, d);
-        self.restampBlock(a, body, d.name);
-    }
-
-    // Statements `from` onward of block `b`: a name declared at `from` is used only after it.
-    restampFrom &self inout a:Ast b:long from:long n:Sym -> void {
-        for k in from..a.blockLen(b) { self.restampStmt(a, a.stmtAt(b, k), n); }
-    }
-
-    restampBlock &self inout a:Ast b:long n:Sym -> void {
-        for k in 0..a.blockLen(b) { self.restampStmt(a, a.stmtAt(b, k), n); }
-    }
-
-    restampStmt &self inout a:Ast st:Stmt n:Sym -> void {
-        if (st.kind == StmtKind.VarDecl) { self.restampExpr(a, a.decls.get(st.at).init, n); return; }
-        if (st.kind == StmtKind.Expr || st.kind == StmtKind.Call) {
-            self.restampExpr(a, a.exprStmts.get(st.at).value, n);
-            return;
-        }
-        if (st.kind == StmtKind.Return) { self.restampExpr(a, a.returns.get(st.at).value, n); return; }
-        if (st.kind == StmtKind.If) {
-            c: long = st.at;
-            while (c >= 0) {
-                nd: IfNode = a.ifs.get(c);
-                self.restampExpr(a, nd.cond, n);
-                self.restampBlock(a, nd.body, n);
-                c = nd.elseIf;
-            }
-            return;
-        }
-        if (st.kind == StmtKind.While) {
-            w: WhileNode = a.whiles.get(st.at);
-            self.restampExpr(a, w.cond, n);
-            self.restampBlock(a, w.body, n);
-            if (w.step >= 0) { self.restampBlock(a, w.step, n); }
-            return;
-        }
-        if (st.kind == StmtKind.Loop || st.kind == StmtKind.Unsafe || st.kind == StmtKind.Block) {
-            self.restampBlock(a, a.blockStmts.get(st.at).body, n);
-            return;
-        }
-        if (st.kind == StmtKind.With) { self.restampBlock(a, a.withs.get(st.at).body, n); return; }
-        if (st.kind == StmtKind.Match) {
-            m: MatchNode = a.matches.get(st.at);
-            for k in 0..m.armCount {
-                arm: ArmNode = a.arms.get(m.firstArm + k);
-                self.restampExpr(a, arm.test, n);
-                self.restampBlock(a, arm.body, n);
-            }
-            return;
-        }
-        if (st.kind == StmtKind.Asm) {
-            nd: AsmNode = a.asms.get(st.at);
-            for k in 0..nd.pieceCount {
-                self.restampExpr(a, a.asmPieces.get(nd.firstPiece + k).value, n);
-            }
-            return;
-        }
-        if (st.kind == StmtKind.Destructure) {
-            self.restampExpr(a, a.destructures.get(st.at).value, n);
-            return;
-        }
-    }
-
-    restampExpr &self inout a:Ast id:NodeId n:Sym -> void {
-        if (id == NO_NODE) { return; }
-        e: Expr = a.expr(id);
-        p: Payload = e.payload;
-        match p {
-            Name(x) {
-                if (e.op == Op.Lvalue && x == n && e.kind == Lit.Struct) {
-                    renamed: Expr = e;
-                    renamed.kind = Lit.Ref;
-                    a.setExpr(id, renamed);
-                }
-            }
-            Sub(v)   { self.restampExpr(a, v, n); }
-            Field(f) { self.restampExpr(a, a.fields.get(f).base, n); }
-            Index(i) {
-                ix: IndexNode = a.indexes.get(i);
-                self.restampExpr(a, ix.base, n);
-                self.restampExpr(a, ix.index, n);
-                self.restampExpr(a, ix.sliceStart, n);
-                self.restampExpr(a, ix.sliceEnd, n);
-            }
-            Call(c) {
-                cn: CallNode = a.calls.get(c);
-                self.restampExpr(a, cn.receiver, n);
-                self.restampExpr(a, cn.callee, n);
-                for k in 0..cn.argCount { self.restampExpr(a, a.argAt(cn, k), n); }
-            }
-            Lit(l) {
-                ln: LitNode = a.lits.get(l);
-                self.restampExpr(a, ln.rest, n);
-                for k in 0..ln.initCount {
-                    self.restampExpr(a, a.inits.get(ln.firstInit + k).value, n);
-                }
-            }
-            _ { }
-        }
-        self.restampExpr(a, e.left, n);
-        self.restampExpr(a, e.right, n);
+        restampBlock(a, body, d.name);
     }
 
     convCandidate &self p:VarDeclNode -> bool {
@@ -8383,9 +9544,9 @@ methods Checker {
         // A backed enum wears `Lit.Struct` only because the parser gives that kind to every named
         // type it does not otherwise recognise. Its values are its backing integer: there is
         // nothing in memory to borrow, and retyping it to `Ref` would leave the callee reading a
-        // pointer where an integer was passed. It is also what made `self.take(self.k)` read as
-        // `self` lent mutably while `self.k` was also accessed. One value being copied, not two
-        // views of it.
+        // pointer where an integer was passed. It would also make `self.take(self.k)` read as
+        // `self` lent mutably while `self.k` is also accessed, when it is one value being copied,
+        // not two views of it.
         if (p.structName != NO_SYM) {
             named: str = nameOf(p.structName);
             if (gReg.isEnumType(named) && !gReg.isSumType(named)) { return false; }
@@ -8468,7 +9629,7 @@ methods Checker {
             }
             return;
         }
-        if (st.kind == StmtKind.While) {
+        if (st.kind == StmtKind.While || st.kind == StmtKind.Recover) {
             w: WhileNode = a.whiles.get(st.at);
             self.convExpr(a, w.cond, facts);
             self.convBlock(a, w.body, facts);
@@ -8600,9 +9761,9 @@ methods Checker {
                     iv: InitNode = a.inits.get(ln.firstInit + k);
                     // A closure captures a struct by lending it for the call's duration, not by
                     // storing it: the body writes it only where it says so. Reading that `&` as
-                    // an ordinary one made every capturing closure demote the parameter it
-                    // captured to a sink, and a caller that used its own value afterwards was
-                    // then refused a second look at it.
+                    // an ordinary one would make every capturing closure demote the parameter it
+                    // captured to a sink, and a caller that used its own value afterwards would
+                    // then be refused a second look at it.
                     if (closure && a.expr(iv.value).op == Op.AddressOf) {
                         n: Sym = self.convLentName(a, iv.value);
                         if (n != NO_SYM) {
@@ -8668,7 +9829,7 @@ methods Checker {
             }
             return false;
         }
-        if (st.kind == StmtKind.While) {
+        if (st.kind == StmtKind.While || st.kind == StmtKind.Recover) {
             w: WhileNode = a.whiles.get(st.at);
             if (self.capWriteExpr(a, w.cond, field)) { return true; }
             if (self.capWriteBlock(a, w.body, field)) { return true; }
@@ -8743,6 +9904,8 @@ methods Checker {
                     cur = fn.base;
                 }
                 Index(i) { cur = a.indexes.get(i).base; }
+                // `*__cl.t = v`, a captured struct written whole (`lendWhole`).
+                Sub(v) { if (lentPlaceOf(a, cur) == NO_NODE) { return false; } cur = v; }
                 _ { return false; }
             }
         }
@@ -8758,6 +9921,7 @@ methods Checker {
         if (cn.receiver != NO_NODE) {
             base = 1;
             r: Sym = self.convBareName(a, cn.receiver);
+            if (r == NO_SYM) { r = self.fieldMoveOf(a, cn.receiver); }   // `h.r.consume()` gives `h` up
             if (r != NO_SYM && self.convGives(a, at, cn, 0)) { self.convMark(facts, r, CONV_GIVEN); }
         }
         for k in 0..cn.argCount {
@@ -8765,7 +9929,10 @@ methods Checker {
             n: Sym = self.convBareName(a, arg);
             // A parameter handed on by value takes the caller's own too: `feed s:Sink r:Res`
             // whose body writes `s.swallow(r)` cannot declare `r` read, and through a trait
-            // object the trait's signature is the only thing that says so.
+            // object the trait's signature is the only thing that says so. So does a field of it
+            // handed on (`eat(h.r)`), as a store of one does (`convGiven`): `h` must be the
+            // function's own for the field to be taken out of it.
+            if (n == NO_SYM) { n = self.fieldMoveOf(a, arg); }
             if (n != NO_SYM && self.convGives(a, at, cn, base + k)) { self.convMark(facts, n, CONV_GIVEN); }
             self.convExpr(a, arg, facts);
         }
@@ -8800,7 +9967,7 @@ methods Checker {
                     a.setExpr(arg, a.expr(lentPlaceOf(a, arg)));
                     continue;
                 }
-                failStr(format("parameter {} of {} is an `inout` scalar -- lend it with '&' (e.g. {}(&n))",
+                failStr(format("parameter {} of `{}` is an `inout` scalar, and this argument is not lent\nhelp: lend it with `&`, as in `{}(&n)`",
                                i, nameOf(f.name), nameOf(f.name)));
             }
             if (p.conv == Conv.Inout) {
@@ -8809,7 +9976,7 @@ methods Checker {
                 // `&x` to a parameter that reads is the borrow passing already is: the `&` goes.
                 // To one that takes the value it would lend what the callee then owns.
                 if (p.conv == Conv.Sink) {
-                    failStr(format("parameter {} of {} takes its argument (it is a `sink`), and '&' lends -- pass the value itself to hand it over, or clone it",
+                    failStr(format("cannot lend an argument to parameter {} of `{}`, which takes it\nnote: the parameter is a `sink`, and `&` lends\nhelp: pass the value itself to hand it over, or clone it",
                                    i, nameOf(f.name)));
                 }
                 self.dropLend(a, arg);
@@ -8836,7 +10003,7 @@ methods Checker {
                                            elemStruct: NO_SYM, init: NO_NODE };
             if (at >= 0 && base + k < a.fns.get(at).argCount) { p = a.paramAt(a.fns.get(at), base + k); }
             if (p.conv != Conv.Inout || p.kind != Lit.Ref || !isInoutScalarName(p.structName)) {
-                self.requireUnsafe("taking a raw address with '&'");
+                self.requireUnsafe("taking a raw address with `&`");
                 continue;
             }
             self.holdLend(a, arg, p, fn, base + k);
@@ -8854,8 +10021,8 @@ methods Checker {
         wn: Sym = want.name;
         if (!namedScalar(want.base, wn)) { wn = NO_SYM; }
         if (gk != want.base || gn != wn) {
-            failStr(format("argument {} of {} lends a {}, and the parameter '{}' is an `inout` {} -- a lend is of exactly the parameter's type",
-                           pos, nameOf(fn), self.spellType(gk, gn), nameOf(p.name), self.spellType(want.base, wn)));
+            failStr(format("mismatched types: expected `{}`, found `{}`\nnote: parameter `{}` of `{}` is `inout` with type `{}`, and a lend must be of exactly the parameter's type",
+                           self.spellType(want.base, wn), self.spellType(gk, gn), nameOf(p.name), nameOf(fn), self.spellType(want.base, wn)));
         }
     }
     forgetScalarLend &self arg:NodeId -> void {
@@ -8917,11 +10084,11 @@ methods Checker {
     // is the one other thing it may be, and only a mutable one: a read borrow lent onward as
     // `inout` would let the callee write through a promise that it would not.
     enforceInoutArg &self inout a:Ast arg:NodeId i:long callee:Sym -> void {
-        // A borrow a call returned: `take(xs.at(0))`, `f(m.get(k))`: is already the lend:
-        // docs/language.md says a returned `&T` may be written through and lent on within the
-        // expression it came from, and `names[1].pushStr("!")` does exactly that. Only a bare
-        // variable carries the read/inout distinction the check below enforces; a returned borrow
-        // is as mutable as the receiver it came out of was.
+        // A borrow a call returned (`take(xs.at(0))`, `f(m.get(k))`) is already the lend. The
+        // language lets a returned `&T` be written through and lent on within the expression it
+        // came from, and `names[1].pushStr("!")` does exactly that. Only a bare variable carries
+        // the read/inout distinction the check below enforces; a returned borrow is as mutable as
+        // the receiver it came out of was.
         e: Expr = a.expr(arg);
         if (e.kind == Lit.Ref) {
             p: Payload = e.payload;
@@ -8932,11 +10099,11 @@ methods Checker {
             t: Lit = a.expr(arg).kind;
             if (t == Lit.Ref || t == Lit.Slice) {
                 if (self.paramConvOf(a, self.enforceFn, n) == Conv.Inout) { return; }
-                failStr(format("'{}' is a read-only borrow — it can't be passed to the inout parameter {} of {}",
+                failStr(format("cannot lend `{}` mutably\nnote: it is a read-only borrow, and parameter {} of `{}` is `inout`",
                                nameOf(n), i, nameOf(callee)));
             }
         }
-        failStr(format("parameter {} of {} is inout — lend the value with '&' (e.g. {}(&x))",
+        failStr(format("parameter {} of `{}` is `inout`, and this argument is not lent\nhelp: lend it with `&`, as in `{}(&x)`",
                        i, nameOf(callee), nameOf(callee)));
     }
 
@@ -8996,7 +10163,7 @@ methods Checker {
         if (cn.slot < 0 || cn.receiver == NO_NODE || i == 0) { return false; }
         r: Expr = a.expr(cn.receiver);
         if (r.kind != Lit.TraitObj || r.structName == NO_SYM) { return false; }
-        at: long = gReg.findTrait(nameOf(r.structName));
+        at: long = gReg.findTraitSym(r.structName);
         if (at < 0) { return false; }
         t: TraitDef = gReg.traitDef(at);
         if (cn.slot >= t.methodCount) { return false; }
@@ -9009,9 +10176,9 @@ methods Checker {
     // The same question for a call through a fn value: a fn-typed local, or a fn-typed field.
     // There is no callee definition to read a convention out of; that is what makes the call
     // indirect. The pointer's own type is the whole answer, which is exactly why a fn type has to
-    // carry its parameters' conventions: a `sink` parameter takes the argument, anything else
-    // lends it, and a fn type keyed by its return alone could say neither. Without this the
-    // caller kept a value the callee had already released and released it a second time.
+    // carry its parameters' conventions: a `sink` parameter takes the argument, and anything else
+    // lends it. Without this, the caller would keep a value the callee had already released, and
+    // release it a second time.
     //
     // Only an aggregate moves. A scalar handed over is a scalar copied, whatever the word says.
     indirectConsumes &self cn:CallNode i:long -> bool {
@@ -9071,31 +10238,31 @@ methods Checker {
             // the exclusivity check take the fn type at its word. Whatever the type, not only
             // one that owns something.
             if (have == Conv.Inout) {
-                failStr(format("'&{}' — parameter {} is inout, and a fn type cannot lend a parameter to be written (its parameters are lent read-only or given with `sink`); take the value or a read borrow instead, or call '{}' directly",
-                               nameOf(fn), at, nameOf(fn)));
+                failStr(format("cannot use `&{}` as a fn value\nnote: parameter {} of `{}` is `inout`, and a fn type cannot lend a parameter to be written (its parameters are lent read-only or given with `sink`)\nhelp: take the value or a read borrow instead, or call `{}` directly",
+                               nameOf(fn), at, nameOf(fn), nameOf(fn)));
             }
             if (p.kind != Lit.Struct && p.kind != Lit.Ref) { continue; }
             if (!gReg.needsDrop(p.name)) { continue; }
             if ((p.conv == Conv.Sink) == (have == Conv.Sink)) { continue; }
             m: String;
-            m.pushStr("'&");
+            m.pushStr("`&");
             m.pushStr(nameOf(fn));
-            m.pushStr("' does not fit ");
+            m.pushStr("` does not fit `");
             m.pushStr(nameOf(key));
-            m.pushStr(": parameter ");
+            m.pushStr("`\nnote: parameter ");
             m.pushLong(at);
             m.pushStr(" is ");
             if (have == Conv.Sink) { m.pushStr("consumed"); } else { m.pushStr("borrowed"); }
-            m.pushStr(" by ");
+            m.pushStr(" by `");
             m.pushStr(nameOf(fn));
-            m.pushStr(" but the pointer type says ");
+            m.pushStr("`, but the pointer type says `");
             if (p.conv == Conv.Sink) { m.pushStr("sink"); } else { m.pushStr("read"); }
-            m.pushStr(" — declare the parameter ");
+            m.pushStr("`\nhelp: declare the parameter ");
             if (p.conv == Conv.Sink) { m.pushStr("`sink`"); } else { m.pushStr("`read`"); }
-            m.pushStr(", or change the pointer type to fn(");
+            m.pushStr(", or change the pointer type to `fn(");
             if (have == Conv.Sink) { m.pushStr("sink "); }
             m.pushStr(nameOf(p.name));
-            m.pushStr(", ...)");
+            m.pushStr(", ...)`");
             failStr(m);
         }
     }
@@ -9199,7 +10366,7 @@ methods Checker {
 
     // `if (self.$tag == <variant>) { <release> }` around a sum type's payload release.
     tagGuard &self inout a:Ast d:StructDef field:Sym st:long -> long {
-        at: long = gReg.findEnum(nameOf(d.name));
+        at: long = gReg.findEnumSym(d.name);
         if (at < 0) { return st; }
         ed: EnumDef = gReg.enumDef(at);
         for k in 0..ed.variantCount {
@@ -9231,9 +10398,6 @@ pub withName e:Expr n:Sym -> Expr {
     return out;
 }
 
-// A capture struct the parser desugared a closure literal into. The test is on the struct's own
-// name component: an instance parameterized by a closure -- `Keep<$closure0>`, mangled
-// `Keep_mod::$closure0` -- names one without being one, and a substring test would send it here.
 // A local the compiler declared rather than the author: a `with` guard, a `match`'s hidden
 // binding, a `for`'s iterator, a hoisted temporary. Every one is `$`-prefixed, and rules written
 // for what someone wrote should not be applied to what the desugars build.
@@ -9243,10 +10407,11 @@ pub isTempName n:Sym -> bool {
     return s.len > 0 && charAt(s, 0) == '$';
 }
 
-pub isClosureStruct n:Sym -> bool {
-    if (n == NO_SYM) { return false; }
-    return strStartsWith(lastComponentOf(nameOf(n)), "$closure");
-}
+// A capture struct the parser desugared a closure literal into, or an instance of a generic one.
+// The registry says so (`Registry.isClosureEnv`); the spelling cannot. An instance parameterized
+// by a closure (`Keep<$closure0>`, mangled `Keep_mod::$closure0`) names one without being one,
+// and a closure's own instance at a struct ends with that struct's name (`m::$closure0_7_m::P`).
+pub isClosureStruct n:Sym -> bool { return gReg.isClosureEnv(n); }
 
 // Does `==` on this operand mean a call rather than a machine comparison? Every value in memory
 // does (the hardware cannot compare a block of bytes) with one exception the kind alone cannot
@@ -9263,20 +10428,34 @@ pub comparedByCall t:VarType -> bool {
     return true;
 }
 
-// For a refusal about an operator on a distinct type: why it has none, and the two ways out.
+// What an operator on a borrow works on: the value it borrows. `w == "x"` with `w: &String` is
+// String's `Eq<str>`, `a < b` with two `&P` is P's `Ord`, `a + b` P's `Add<P>`; the call lends
+// the borrow on as the `&self` (or the argument) it already is. A borrow of a scalar is the
+// scalar; an `inout` scalar's lend is left as it is.
+pub underBorrow t:VarType -> VarType {
+    if (t.kind != Lit.Ref || t.structName == NO_SYM || t.isArray || isInoutScalarName(t.structName)) { return t; }
+    q: str = nameOf(t.structName);
+    if (namesScalar(q)) { return varType(scalarNamed(q), NO_SYM); }
+    return varType(Lit.Struct, t.structName);
+}
+
+// For a refusal about an operator on a distinct type: a `note:` line saying why it has none and
+// the two ways out, or "". It starts with a newline, so it goes right after the message's first
+// line, ahead of the `help:`.
 pub distinctHint t:VarType -> str {
     if (t.kind != Lit.Struct || !gReg.isDistinct(t.structName)) { return ""; }
     b: TypeRef = gReg.distinctOf(t.structName);
-    return keepString(format(" ({} is a distinct {}: it has an operator only where it implements the operator's trait -- or convert, `x as {}`)",
+    return keepString(format("\nnote: `{}` is a distinct `{}`, so it has an operator only where it implements the operator's trait, or once converted with `x as {}`",
                              nameOf(t.structName), typeMangleName(b.base, b.name), typeMangleName(b.base, b.name)));
 }
 
-// The `call` method a closure literal was desugared into. It is named off the capture struct, so
-// the struct's own test answers for it; the suffix keeps a struct declaration from matching.
+// The `call` method a closure literal was desugared into: `methodName(owner, call)` of a capture
+// struct, so the owner is the name less `_call`, and the registry answers for the owner.
 pub isClosureCall n:Sym -> bool {
     if (n == NO_SYM) { return false; }
-    last: str = lastComponentOf(nameOf(n));
-    return strStartsWith(last, "$closure") && strEndsWith(last, "_call");
+    s: str = nameOf(n);
+    if (!strEndsWith(s, "_call")) { return false; }
+    return gReg.isClosureEnv(symIfAny(strSlice(s, 0, s.len - 5)));
 }
 
 // The trait an arithmetic operator on an aggregate means, or "" for an operator that has none and
@@ -9322,8 +10501,8 @@ pub methodSymbol owner:Sym method:Sym -> Sym {
 // The macro itself runs in the evaluator, on its arguments: for a parameter of type `Node`
 // the argument's tree, quoted; for anything else, a value the compiler can compute.
 //
-// A macro can run only once its body and everything that body calls are checked -- the
-// evaluator reads typed trees -- so a function that invokes a macro not yet ready is held
+// A macro can run only once its body and everything that body calls are checked (the
+// evaluator reads typed trees), so a function that invokes a macro not yet ready is held
 // back and retried the next round, after the driver has stamped what the macro needs.
 
 methods Checker {
@@ -9370,18 +10549,18 @@ methods Checker {
             // round, so the macro runs on the next.
             if (isExternFn(at) || isLazyFn(at)) { self.ctNeed(a, f.name); }
             self.deferReason.clear();
-            self.deferReason.pushString(format("macro '{}' waits for '{}' to be checked", nameOf(m), nameOf(f.name)));
+            self.deferReason.pushString(format("macro `{}` waits for `{}` to be checked", nameOf(m), nameOf(f.name)));
             return false;
         }
         callees: Vec<Sym>;
         self.calleesIn(a, f.body, &callees);
         for k in 0..callees.len() {
             // A global the macro reads whose own initializer still holds a macro call
-            // (`gT: Vec<long> = vec![1, 2]`, held back until `vec!` can run): run now, the
-            // evaluator would meet the call unexpanded. It is expanded in a later round.
+            // (`gT: Vec<long> = vec![1, 2]`, held back until `vec!` can run). Run now, the
+            // evaluator would meet that call unexpanded, so the macro waits for a later round.
             if (strStartsWith(nameOf(callees.get(k)), "$unexpanded:")) {
                 self.deferReason.clear();
-                self.deferReason.pushString(format("macro '{}' waits for the global '{}' to be checked", nameOf(m),
+                self.deferReason.pushString(format("macro `{}` waits for the global `{}` to be checked", nameOf(m),
                                                    strSlice(nameOf(callees.get(k)), 12, nameOf(callees.get(k)).len - 12)));
                 return false;
             }
@@ -9390,10 +10569,10 @@ methods Checker {
                 Some(i) { if (!self.bodyReady(a, i, seen, m)) { return false; } }
                 None {
                     // No body by that name yet: a generic instance the driver has not stamped,
-                    // or something outside the program -- which the evaluator will refuse.
-                    if (gReg.findRequest(nameOf(callees.get(k))) >= 0 || self.isWanted(callees.get(k))) {
+                    // or something outside the program, which the evaluator will refuse.
+                    if (gReg.findRequestSym(callees.get(k)) >= 0 || self.isWanted(callees.get(k))) {
                         self.deferReason.clear();
-                        self.deferReason.pushString(format("macro '{}' waits for '{}' to be stamped", nameOf(m), nameOf(callees.get(k))));
+                        self.deferReason.pushString(format("macro `{}` waits for `{}` to be stamped", nameOf(m), nameOf(callees.get(k))));
                         return false;
                     }
                 }
@@ -9433,7 +10612,7 @@ methods Checker {
             }
             return;
         }
-        if (st.kind == StmtKind.While) {
+        if (st.kind == StmtKind.While || st.kind == StmtKind.Recover) {
             w: WhileNode = a.whiles.get(st.at);
             self.namesInExpr(a, w.cond, out, macros); self.namesIn(a, w.body, out, macros); self.namesIn(a, w.step, out, macros);
             return;
@@ -9461,12 +10640,12 @@ methods Checker {
         if (id == NO_NODE) { return; }
         e: Expr = a.expr(id);
         if (e.left != NO_NODE) { self.namesInExpr(a, e.left, out, macros); self.namesInExpr(a, e.right, out, macros); return; }
-        // A global a macro reads is initialized on that read, by its own initializer -- whose
-        // callees are then the macro's callees too.
+        // A global a macro reads is initialized on that read, by its own initializer, so that
+        // initializer's callees are the macro's callees too.
         if (e.op == Op.Lvalue && !macros) {
             match e.payload {
                 Name(n) {
-                    gi: long = gReg.findGlobal(nameOf(n));
+                    gi: long = gReg.findGlobalSym(n);
                     if (gi >= 0) {
                         g: GlobalDef = gReg.globalDef(gi);
                         if (g.init != NO_NODE && a.expr(g.init).op != Op.Literal && !self.initSeen.has(nameOf(n))) {
@@ -9518,13 +10697,13 @@ methods Checker {
         hit: Option<long> = self.fnAt.find(nameOf(q));
         mi: long = -1;
         match hit { Some(i) { mi = i; } None { } }
-        if (mi < 0 || !gReg.isMacro(q)) { failStr(format("'{}!' names no macro", nameOf(c.name))); }
+        if (mi < 0 || !gReg.isMacro(q)) { failStr(format("cannot find macro `{}!` in this scope", nameOf(c.name))); }
         f: FnNode = a.fns.get(mi);
         if (!self.macroRunnable(a, c.name)) {
-            failStr(format("macro '{}' is used before it can run -- declare it, and what it calls, ahead of this", nameOf(c.name)));
+            failStr(format("macro `{}` is used before it can run\nhelp: declare it, and what it calls, ahead of this use", nameOf(c.name)));
         }
         if (f.argCount != c.argCount) {
-            failStr(format("macro '{}' takes {} argument(s), {} given", nameOf(c.name), f.argCount, c.argCount));
+            failStr(format("wrong number of arguments to macro `{}`: expected {}, found {}", nameOf(c.name), f.argCount, c.argCount));
         }
         nodeSym: Sym = intern("ast::Node");
         self.ev.nodeSym = nodeSym;
@@ -9537,7 +10716,7 @@ methods Checker {
         } else if (self.curStmt >= 0) {
             st: Stmt = a.stmts.get(self.curStmt);
             if (st.kind == StmtKind.VarDecl) {
-                gi: long = gReg.findGlobal(nameOf(a.decls.get(st.at).name));
+                gi: long = gReg.findGlobalSym(a.decls.get(st.at).name);
                 if (gi >= 0) { self.ev.macroFile = gReg.globalDef(gi).file; self.ev.macroPkg = gReg.globalDef(gi).pkg; }
             }
         }
@@ -9552,19 +10731,19 @@ methods Checker {
                 built: NodeId = qt.quoteTree(a, arg);
                 self.checkExpr(a, built);
                 v: CtValue = self.ev.evalExpr(a, self.page, built);
-                if (self.ev.stopped) { failStr(format("macro '{}': the tree for '{}' could not be built: it met {}", nameOf(c.name), nameOf(p.name), self.ev.refusal)); }
+                if (self.ev.stopped) { failStr(format("macro `{}` cannot build the tree for its parameter `{}`: it met {}", nameOf(c.name), nameOf(p.name), self.ev.refusal)); }
                 vals.push(v);
             } else {
                 self.checkExpr(a, arg);
                 v: CtValue = self.ev.evalExpr(a, self.page, arg);
-                if (self.ev.stopped) { failStr(format("macro '{}' needs a value the compiler can compute for '{}': it met {}", nameOf(c.name), nameOf(p.name), self.ev.refusal)); }
+                if (self.ev.stopped) { failStr(format("macro `{}` needs a value the compiler can compute for `{}`: it met {}", nameOf(c.name), nameOf(p.name), self.ev.refusal)); }
                 vals.push(v);
             }
         }
         r: CtValue = self.ev.runMacro(a, self.page, mi, vals);
         // Ended by its own decision (an `exit`, a `refuse`): what it wrote is the error.
-        if (self.ev.stopped && self.ev.refused) { failStr(format("macro '{}' stopped: {}", nameOf(c.name), self.ev.refusal)); }
-        if (self.ev.stopped) { failStr(format("macro '{}' could not run: it met {}", nameOf(c.name), self.ev.refusal)); }
+        if (self.ev.stopped && self.ev.refused) { failStr(format("macro `{}` stopped: {}", nameOf(c.name), self.ev.refusal)); }
+        if (self.ev.stopped) { failStr(format("macro `{}` could not run: it met {}", nameOf(c.name), self.ev.refusal)); }
         return r;
     }
     macroReturnsNode &self inout a:Ast id:NodeId -> bool {
@@ -9590,7 +10769,7 @@ methods Checker {
         self.spliceMacroCall(a, id);
         return self.checkExpr(a, id);
     }
-    // Run the macro and put what it returned in the call's place -- not yet checked, so the
+    // Run the macro and put what it returned in the call's place, not yet checked, so the
     // caller may aim it at a destination first.
     spliceMacroCall &self inout a:Ast id:NodeId -> void {
         // An error while a macro runs leaves the evaluator mid-run: no going on past it.
@@ -9610,7 +10789,7 @@ methods Checker {
                                  structName: r.structName, isParen: false, payload: Payload.Num(r.bits) });
             return;
         }
-        failStr(format("macro '{}' returns a value of type {}; a macro returns a Node, or a number", nameOf(self.macroName(a, id)), typeName(r.kind)));
+        failStr(format("macro `{}` returns a value of type `{}`\nnote: a macro returns a `Node`, or a number", nameOf(self.macroName(a, id)), typeName(r.kind)));
     }
 
     // In statement position: a Node result is the statement(s) it describes, replacing the
@@ -9650,8 +10829,8 @@ methods Checker {
     ctNeed &self inout a:Ast n:Sym -> void {
         if (n == NO_SYM) { return; }
         key: str = nameOf(n);
-        // Reached by code that runs: only a lazy method needs anything done -- it is checked,
-        // and so compiled. A dependency's function is linked, not compiled.
+        // Reached by code that runs: only a lazy method needs anything done (it is checked, and
+        // so compiled). A dependency's function is linked, not compiled.
         if (self.walkRuntime) {
             if (self.rtSeen.has(key)) { return; }
             self.rtSeen.put(key, true);
@@ -9662,8 +10841,8 @@ methods Checker {
         if (self.ctSeen.has(key)) { return; }
         self.ctSeen.put(key, true);
         at: long = self.fnNodeOf(n);
-        // Not on the page yet -- a generic instance the next round stamps. `ctSeen` remembers
-        // it, and checking it walks it.
+        // Not on the page yet: a generic instance the next round stamps. `ctSeen` remembers it,
+        // and checking it walks it.
         if (at < 0) { return; }
         if (isLazyFn(at)) {
             if (!isExternReady(at)) { self.demandQ.push(at); }
@@ -9679,7 +10858,7 @@ methods Checker {
                 hit: Option<long> = self.stmtOfFn.find(key);
                 match hit { Some(sid) { self.deferredFns.push(sid); } None { } }
                 self.deferReason.clear();
-                self.deferReason.pushString(format("'{}' waits for the types its module names to be stamped", key));
+                self.deferReason.pushString(format("`{}` waits for the types its module names to be stamped", key));
                 return;
             }
             self.demandQ.push(at);
@@ -9696,7 +10875,7 @@ methods Checker {
         if (self.walkRuntime && self.rtSeen.has(nameOf(dn))) { return; }
         if (!self.walkRuntime && self.ctSeen.has(nameOf(dn))) { return; }
         self.ctNeed(a, dn);
-        at: long = gReg.findStruct(nameOf(s));
+        at: long = gReg.findStructSym(s);
         if (at < 0) { return; }
         d: StructDef = gReg.structDef(at);
         for k in 0..d.fieldCount {
@@ -9773,7 +10952,7 @@ methods Checker {
             }
             return;
         }
-        if (st.kind == StmtKind.While) {
+        if (st.kind == StmtKind.While || st.kind == StmtKind.Recover) {
             w: WhileNode = a.whiles.get(st.at);
             self.ctReachExpr(a, w.cond); self.ctReachBlock(a, w.body); self.ctReachBlock(a, w.step);
             return;
@@ -9915,8 +11094,8 @@ methods Checker {
 //
 // A trait may name a macro that writes its implementation for a type that has none:
 // `trait Encode derive deriveEncode { ... }`. Nothing here knows any particular trait. When the
-// walk needs `X: T` -- a method of T called on an X, a static one called on the type, an X made
-// into a T object -- and X has no implementation, one is had in this order:
+// walk needs `X: T` (a method of T called on an X, a static one called on the type, an X made
+// into a T object) and X has no implementation, one is found in this order:
 //
 //   1. a hand-written `methods X for T` (already registered: it always wins);
 //   2. X is an instance of a generic type whose template implements T under bounds X's
@@ -9971,7 +11150,7 @@ methods Checker {
         if (gReg.deriveMacroOf(tr) == NO_SYM) { return false; }
         // Something with a declaration to hand the macro: a struct, a sum type, or an enum of
         // named integers. A scalar has none.
-        if (gReg.findStruct(nameOf(owner)) < 0 && gReg.findEnum(nameOf(owner)) < 0) { return false; }
+        if (gReg.findStructSym(owner) < 0 && gReg.findEnumSym(owner) < 0) { return false; }
         if (isClosureCall(owner)) { return false; }
         self.stubDerive(a, owner, tr);
         return true;
@@ -9980,7 +11159,7 @@ methods Checker {
     // 0: `owner` is not an instance of a template implementing `tr`; 1: it is, and that
     // implementation is stamped for it now; 2: it is, and one of the block's bounds cannot be met.
     lateImpl &self inout a:Ast owner:Sym tr:Sym depth:long -> long {
-        ri: long = gReg.findRequest(nameOf(owner));
+        ri: long = gReg.findRequestSym(owner);
         if (ri < 0) { return 0; }
         r: GRequest = gReg.requestAt(ri);
         if (gReg.isPatternRequest(r) || r.instance != owner) { return 0; }
@@ -9993,7 +11172,7 @@ methods Checker {
         }
         if (found < 0) { return 0; }
         im: TraitImplDef = gReg.implAt(found);
-        ti: long = gReg.findTrait(nameOf(tr));
+        ti: long = gReg.findTraitSym(tr);
         if (ti < 0) { return 0; }
         td: TraitDef = gReg.traitDef(ti);
         args: Vec<TypeRef>;
@@ -10036,11 +11215,11 @@ methods Checker {
         return self.ensureImpl(a, t.name, tr, depth + 1);
     }
 
-    // `owner`'s implementation of `tr`, declared now with the trait's signatures -- the receiver
-    // as the trait takes it, `Self` as `owner` -- and registered, its bodies left to the macro.
+    // `owner`'s implementation of `tr`, declared now with the trait's signatures (the receiver
+    // as the trait takes it, `Self` as `owner`) and registered, its bodies left to the macro.
     // The stubs are not on the page until the macro has written them.
     stubDerive &self inout a:Ast owner:Sym tr:Sym -> void {
-        td: TraitDef = gReg.traitDef(gReg.findTrait(nameOf(tr)));
+        td: TraitDef = gReg.traitDef(gReg.findTraitSym(tr));
         fns: Vec<Sym>;
         carried: bool = gReg.flatCarries(owner, TraitRef { name: tr, firstArg: 0, argCount: 0 });
         for k in 0..td.methodCount {
@@ -10125,7 +11304,7 @@ methods Checker {
         self.currentModule = wasMod;
         at: long = self.fnNodeOf(q);
         if (at < 0 || !gReg.isMacro(q)) {
-            failStr(format("trait '{}' derives with '{}', which names no macro", nameOf(tr), nameOf(bare)));
+            failStr(format("trait `{}` derives with `{}`, which names no macro", nameOf(tr), nameOf(bare)));
         }
         return at;
     }
@@ -10141,16 +11320,16 @@ methods Checker {
         view: str = "";
         if (f.argCount == 1) { view = lastComponentOf(nameOf(a.paramAt(f, 0).structName)); }
         if (view != "Struct" && view != "Enum" && view != "Decl") {
-            failStr(format("'{}' derives '{}', and a derive macro takes one parameter: the type's declaration, a reflect::Struct, Enum or Decl", mn, tn));
+            failStr(format("derive macro `{}` for `{}` must take one parameter, the type's declaration\nnote: the parameter is a `reflect::Struct`, `reflect::Enum` or `reflect::Decl`", mn, tn));
         }
         if (f.returnKind != Lit.Struct || f.returnStruct != nodeSym) {
-            failStr(format("'{}' derives '{}', and a derive macro returns the Node of a methods block", mn, tn));
+            failStr(format("derive macro `{}` for `{}` must return a `Node`\nnote: a derive macro returns the `Node` of a methods block", mn, tn));
         }
         if (view == "Struct" && isEnum) {
-            failStr(format("{} does not implement '{}', and '{}' derives it for a struct only: {} is an enum{}", on, tn, mn, on, self.neededBy(job)));
+            failStr(format("`{}` does not implement `{}`\nnote: `{}` derives it for a struct only, and `{}` is an enum{}", on, tn, mn, on, self.neededBy(job)));
         }
         if (view == "Enum" && !isEnum) {
-            failStr(format("{} does not implement '{}', and '{}' derives it for an enum only: {} is a struct{}", on, tn, mn, on, self.neededBy(job)));
+            failStr(format("`{}` does not implement `{}`\nnote: `{}` derives it for an enum only, and `{}` is a struct{}", on, tn, mn, on, self.neededBy(job)));
         }
         p: VarDeclNode = a.paramAt(f, 0);
         self.ev.nodeSym = nodeSym;
@@ -10162,21 +11341,21 @@ methods Checker {
         r: CtValue = self.ev.runMacro(a, self.page, mi, vals);
         if (self.ev.stopped) {
             if (self.ev.refused) {
-                failStr(format("{} does not implement '{}', and '{}' refused to derive it: {}{}", on, tn, mn, self.ev.refusal, self.neededBy(job)));
+                failStr(format("`{}` does not implement `{}`, and `{}` refused to derive it: {}{}", on, tn, mn, self.ev.refusal, self.neededBy(job)));
             }
-            failStr(format("{} does not implement '{}', and '{}' could not derive it: it met {}{}", on, tn, mn, self.ev.refusal, self.neededBy(job)));
+            failStr(format("`{}` does not implement `{}`, and `{}` could not derive it: it met {}{}", on, tn, mn, self.ev.refusal, self.neededBy(job)));
         }
         addr: long = r.bits;
         got: str = self.ev.nodeVariant(addr);
         if (got != "MethodsDecl") {
-            failStr(format("'{}' derived '{}' for {} as a {}; a derive returns a methods block (a quote of `methods T for {}`)", mn, tn, on, got, tn));
+            failStr(format("derive macro `{}` returned a node of kind `{}` for the `{}` of `{}`\nnote: a derive returns a methods block (a quote of `methods T for {}`)", mn, got, tn, on, tn));
         }
         hdr: str = nameOf(self.ev.declOwner(addr));
         if (hdr != "Self" && hdr != on) {
-            failStr(format("'{}' was asked for the '{}' of {} and wrote methods for '{}'", mn, tn, on, hdr));
+            failStr(format("derive macro `{}` was asked for the `{}` of `{}`, and wrote methods for `{}`", mn, tn, on, hdr));
         }
         if (lastComponentOf(nameOf(self.ev.declTrait(addr))) != lastComponentOf(tn)) {
-            failStr(format("'{}' was asked for the '{}' of {} and wrote methods for trait '{}'", mn, tn, on, nameOf(self.ev.declTrait(addr))));
+            failStr(format("derive macro `{}` was asked for the `{}` of `{}`, and wrote methods for trait `{}`", mn, tn, on, nameOf(self.ev.declTrait(addr))));
         }
         self.ev.renames.clear();
         self.ev.macroSeq = self.ev.macroSeq + 1;
@@ -10188,8 +11367,8 @@ methods Checker {
         for k in 0..fns.len() {
             name: Sym = self.ev.fnDeclName(fns.get(k));
             slot: long = gReg.methodSlot(td, nameOf(name));
-            if (slot < 0) { failStr(format("'{}' wrote '{}' for {}, and '{}' declares no such method", mn, nameOf(name), on, tn)); }
-            if (done.get(slot)) { failStr(format("'{}' wrote '{}' for {} twice", mn, nameOf(name), on)); }
+            if (slot < 0) { failStr(format("derive macro `{}` wrote `{}` for `{}`, and `{}` declares no such method", mn, nameOf(name), on, tn)); }
+            if (done.get(slot)) { failStr(format("derive macro `{}` wrote `{}` for `{}` twice", mn, nameOf(name), on)); }
             done.set(slot, true);
             full: Sym = implFnName(job.owner, TraitRef { name: job.trait, firstArg: 0, argCount: 0 }, name);
             // Whose code it is, for an error inside it: the derive, needed where `job.pos` stands.
@@ -10207,7 +11386,7 @@ methods Checker {
         }
         for k in 0..td.methodCount {
             if (!done.get(k)) {
-                failStr(format("'{}' wrote no '{}' for {}, and '{}' declares it", mn, nameOf(gReg.traitMethodAt(td, k).name), on, tn));
+                failStr(format("derive macro `{}` wrote no `{}` for `{}`, and `{}` declares it", mn, nameOf(gReg.traitMethodAt(td, k).name), on, tn));
             }
         }
         for k in 0..made.len() { self.checkMadeStmt(a, made.get(k)); }
@@ -10225,13 +11404,14 @@ methods Checker {
             k = k + 1;
         }
         if (!same) {
-            failStr(format("'{}' wrote '{}' with a signature other than the one '{}' declares", mn, nameOf(want.name), tn));
+            failStr(format("derive macro `{}` wrote `{}` with a signature other than the one `{}` declares", mn, nameOf(want.name), tn));
         }
     }
 
+    // Which function needed the derive, as a `note:` line for the end of the message, or "".
     neededBy &self job:DeriveJob -> String {
         if (job.requester == NO_SYM) { return stringOf(""); }
-        return format(" (needed by '{}')", nameOf(job.requester));
+        return format("\nnote: needed by `{}`", nameOf(job.requester));
     }
 }
 

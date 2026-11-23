@@ -80,8 +80,8 @@ pub enum Op: int {
     Nameof,
     Splice,                         // `@x` inside a quote: the Node that `x` holds goes here; `Name(x)`
     // `name!(args)`: a call the compiler runs while checking, replacing it with what the macro
-    // returned -- a value, or a `Node` spliced in as code. Carries a `Call`. Never reaches the
-    // lowerer: the checker expands every one.
+    // returned (a value, or a `Node` spliced in as code). Carries a `Call`. It never reaches the
+    // lowerer, because the checker expands every one.
     MacroCall,
     Deref,                          // *p: load or store through a typed pointer
     Literal,
@@ -123,9 +123,8 @@ pub isComparison op:Op -> bool {
         || op == Op.IsGreaterOrEqual || op == Op.IsEqual || op == Op.IsNotEqual;
 }
 
-// What an expression node carries besides its operands. Discriminated the way the C++ variant was,
-// but by a tag rather than by which pointer is live: the payloads are all indices and symbols, so
-// this stays Copy.
+// What an expression node carries besides its operands. The payloads are all indices and symbols,
+// so this stays Copy.
 pub enum Payload {
     None,
     Num(long),                      // Literal: the value
@@ -172,7 +171,7 @@ pub struct IndexParts { index: NodeId, lo: NodeId, hi: NodeId, whole: bool }
 // its own: a fn-typed struct field, `t.apply(v)`. A named fn-typed local is reached by `name`;
 // everything else needs the expression, because there is nothing to look up.
 // `sigKey` is the signature an indirect call goes through, NO_SYM for a direct one. Such a call
-// has no callee definition to read a convention out of (that is what makes it indirect) so
+// has no callee definition to read a convention out of (that is what makes it indirect), so
 // what the pointer's own type promises is the only thing that says whether an argument is lent
 // or handed over. It is written down here, at the call, because the ownership walk runs long
 // after the expression that named the pointer left the checker's scope.
@@ -198,9 +197,9 @@ pub struct InitNode { name: Sym, value: NodeId }
 
 // A value's bytes as computed at compile time, and where inside them a word is a pointer. A
 // global's image is emitted at the global's own label; a heap block's image is emitted as a
-// labeled block of its own, which is what a pointer to it relocates to. The word at `offset` is
-// `delta` bytes past: the string literal spelled `target` (Str), the block `image` (Block), the
-// global named `target` (Global), or exactly the vtable or function labeled `target`.
+// labeled block of its own, which is what a pointer to it relocates to. The word at `offset`
+// points `delta` bytes past the string literal spelled `target` (Str), the block `image` (Block)
+// or the global named `target` (Global), or exactly at the vtable or function labeled `target`.
 pub enum RelocKind: int { Str, Block, Global, Vtable, Fn }
 pub struct ImageNode { firstByte: long, byteCount: long, firstReloc: long, relocCount: long, isBlock: bool }
 pub struct RelocNode { offset: long, kind: RelocKind, target: Sym, image: long, delta: long }
@@ -210,7 +209,11 @@ pub struct RelocNode { offset: long, kind: RelocKind, target: Sym, image: long, 
 pub enum StmtKind: int {
     FunctionDef, VarDecl, If, Loop, While, With, Unsafe, Return,
     Call, Expr, Asm, Destructure, Break, Continue, Match, StructDecl,
-    Block          // a bare nested block: its own scope, run once
+    Block,         // a bare nested block: its own scope, run once
+    // `recover { body } else { handler }`: a `raise` anywhere under the body resumes in the
+    // handler. Its node is a `WhileNode` with no condition, the body in `body` and the handler in
+    // `step`, so it lives in a side table every pass already copies, remaps and encodes.
+    Recover
 }
 
 // A statement is its kind plus one payload index, into whichever side table that kind uses. The
@@ -303,6 +306,9 @@ pub FN_INIT: long = 2;
 pub FN_FINI: long = 4;
 // `@panic`: what the code the compiler writes for a failed `assert!` calls with its message.
 pub FN_PANIC: long = 8;
+// `@recover`: what a `recover` statement calls to link its record into this thread's chain and
+// to unlink it again (`rec:long -> long`, answering the record it replaced).
+pub FN_RECOVER: long = 16;
 // `builtin name params -> T;`: a declaration whose body the compiler provides. Which primitive is
 // in the bits above `BUILTIN_SHIFT`, one of the `BI_` kinds.
 pub BUILTIN_SHIFT: long = 8;
@@ -310,6 +316,24 @@ pub BI_SYSCALL: long = 1;        // syscall(nr, args...) -> long: the `syscall` 
 pub BI_AT_COMPILE_TIME: long = 2; // atCompileTime() -> bool: true in the evaluator, false at run time
 pub BI_PARSE_EXPR: long = 3;     // parseExpr(src) -> Node: the compiler's parser, in a macro
 pub BI_EXIT: long = 4;           // exit(status) -> never: the `@fini` hooks, then exit_group
+// The atomics: one instruction each on an eight-byte word (`*long`), and the same six on a
+// four-byte one (`*int`, `BI_ATOMIC_32` past them). Which operation is `atomicOpOf`.
+pub BI_ATOMIC_LOAD: long = 5;       // atomicLoad(p) -> long: acquire, `mov`
+pub BI_ATOMIC_STORE: long = 6;      // atomicStore(p, v): release, `mov`
+pub BI_ATOMIC_STORE_SC: long = 7;   // atomicStoreSeqCst(p, v): sequentially consistent, `xchg`
+pub BI_ATOMIC_SWAP: long = 8;       // atomicSwap(p, v) -> long: the old value, `xchg`
+pub BI_ATOMIC_CAS: long = 9;        // atomicCas(p, expected, desired) -> long: the old value, `lock cmpxchg`
+pub BI_ATOMIC_ADD: long = 10;       // atomicAdd(p, delta) -> long: the old value, `lock xadd`
+pub BI_ATOMIC_32: long = 6;         // added to each of the six for its `*int` form
+pub isAtomicBuiltin bk:long -> bool { return bk >= BI_ATOMIC_LOAD && bk < BI_ATOMIC_LOAD + 2 * BI_ATOMIC_32; }
+// The operation of an atomic builtin, as one of the six eight-byte kinds.
+pub atomicOpOf bk:long -> long {
+    if (bk >= BI_ATOMIC_LOAD + BI_ATOMIC_32) { return bk - BI_ATOMIC_32; }
+    return bk;
+}
+// memcpy(dst, src, n): `n` bytes from `src` to `dst`, the two ranges apart; `rep movsb`, and a
+// write of the destination range alone, which is all the optimizer takes it to end.
+pub BI_MEMCPY: long = 17;
 pub builtinOf f:FnNode -> long { return f.attrs >> BUILTIN_SHIFT; }
 pub isNeverFn f:FnNode -> bool { return (f.attrs & FN_NEVER) != 0; }
 
@@ -362,7 +386,47 @@ methods Ast for Default {
     }
 }
 
+// How long every arena was at one moment: what a declaration the parser gives up on is cut back
+// to (`Ast.rewindTo`). Every node the declaration made was appended after it.
+pub struct AstMark {
+    exprs: long, indexes: long, calls: long, fields: long, lits: long, inits: long, args: long,
+    stmts: long, stmtPos: long, blocks: long, stmtRuns: long,
+    ifs: long, whiles: long, returns: long, blockStmts: long, withs: long, exprStmts: long,
+    destructures: long, names: long, arms: long, matches: long, asms: long, asmPieces: long,
+    decls: long, params: long, fns: long, structDecls: long,
+    images: long, imageBytes: long, relocs: long
+}
+
 methods Ast {
+    mark &self -> AstMark {
+        return AstMark { exprs: self.exprs.len(), indexes: self.indexes.len(), calls: self.calls.len(),
+                         fields: self.fields.len(), lits: self.lits.len(), inits: self.inits.len(),
+                         args: self.args.len(), stmts: self.stmts.len(), stmtPos: self.stmtPos.len(),
+                         blocks: self.blocks.len(), stmtRuns: self.stmtRuns.len(), ifs: self.ifs.len(),
+                         whiles: self.whiles.len(), returns: self.returns.len(),
+                         blockStmts: self.blockStmts.len(), withs: self.withs.len(),
+                         exprStmts: self.exprStmts.len(), destructures: self.destructures.len(),
+                         names: self.names.len(), arms: self.arms.len(), matches: self.matches.len(),
+                         asms: self.asms.len(), asmPieces: self.asmPieces.len(), decls: self.decls.len(),
+                         params: self.params.len(), fns: self.fns.len(),
+                         structDecls: self.structDecls.len(), images: self.images.len(),
+                         imageBytes: self.imageBytes.len(), relocs: self.relocs.len() };
+    }
+    rewindTo &self m:AstMark -> void {
+        self.exprs.truncate(m.exprs); self.indexes.truncate(m.indexes); self.calls.truncate(m.calls);
+        self.fields.truncate(m.fields); self.lits.truncate(m.lits); self.inits.truncate(m.inits);
+        self.args.truncate(m.args); self.stmts.truncate(m.stmts); self.stmtPos.truncate(m.stmtPos);
+        self.blocks.truncate(m.blocks); self.stmtRuns.truncate(m.stmtRuns); self.ifs.truncate(m.ifs);
+        self.whiles.truncate(m.whiles); self.returns.truncate(m.returns);
+        self.blockStmts.truncate(m.blockStmts); self.withs.truncate(m.withs);
+        self.exprStmts.truncate(m.exprStmts); self.destructures.truncate(m.destructures);
+        self.names.truncate(m.names); self.arms.truncate(m.arms); self.matches.truncate(m.matches);
+        self.asms.truncate(m.asms); self.asmPieces.truncate(m.asmPieces); self.decls.truncate(m.decls);
+        self.params.truncate(m.params); self.fns.truncate(m.fns);
+        self.structDecls.truncate(m.structDecls); self.images.truncate(m.images);
+        self.imageBytes.truncate(m.imageBytes); self.relocs.truncate(m.relocs);
+    }
+
     // ─── making nodes ────────────────────────────────────────────────────────
 
     addExpr &self e:Expr -> NodeId { self.exprs.push(e); return self.exprs.len() - 1; }
@@ -471,9 +535,9 @@ methods Ast {
         self.stmtPos.push(gPos);
         return self.stmts.len() - 1;
     }
-    // Work on statement `id` from here: it is where an error now is. Hands back where the work
-    // was, for the caller to return to when the statement is done. A statement with no position
-    // of its own leaves the enclosing one's in force.
+    // Makes statement `id` the current position, so an error from here on points at it, and
+    // returns the previous position for the caller to restore once it is done with the statement.
+    // A statement with no position of its own leaves the enclosing one's in force.
     enterStmt &self id:long -> long {
         was: long = gPos;
         p: long = self.stmtPos.get(id);
@@ -515,7 +579,7 @@ pub stmtArena k:StmtKind -> Arena {
     if (k == StmtKind.VarDecl) { return Arena.Decls; }
     if (k == StmtKind.If) { return Arena.Ifs; }
     if (k == StmtKind.Loop || k == StmtKind.Unsafe || k == StmtKind.Block) { return Arena.BlockStmts; }
-    if (k == StmtKind.While) { return Arena.Whiles; }
+    if (k == StmtKind.While || k == StmtKind.Recover) { return Arena.Whiles; }
     if (k == StmtKind.With) { return Arena.Withs; }
     if (k == StmtKind.Return) { return Arena.Returns; }
     if (k == StmtKind.Call || k == StmtKind.Expr) { return Arena.ExprStmts; }
@@ -624,8 +688,9 @@ pub mapFn<M: IdMap> x:FnNode inout m:M src:Ast -> FnNode {
                     body: m.id(src, Arena.Blocks, x.body), inferReturn: x.inferReturn, attrs: x.attrs };
 }
 
-// The enums a tree is made of decode as a range check: every value from the first variant to the
-// last is one (none of them skips a value), and the derived decoder would compare against each.
+// The enums a tree is made of decode with a range check. Every value from the first variant to
+// the last is a variant (none of these enums skips a value), whereas the derived decoder would
+// compare against each one in turn.
 local NO_VARIANT: str = "a value the enum has no variant for";
 methods Op for Decode {
     decode inp:&Decoder -> Op {
@@ -644,7 +709,7 @@ methods Lit for Decode {
 methods StmtKind for Decode {
     decode inp:&Decoder -> StmtKind {
         v: long = inp.getVarint();
-        if (v < 0 || v > StmtKind.Block as long) { inp.fail(NO_VARIANT); v = 0; }
+        if (v < 0 || v > StmtKind.Recover as long) { inp.fail(NO_VARIANT); v = 0; }
         return v as StmtKind;
     }
 }
@@ -739,7 +804,7 @@ pub hasBody f:FnNode -> bool { return f.body >= 0 || f.body == BODY_LAZY || f.bo
 // `*r` where `r` is a borrow (`Lit.Ref`): the place the borrow lends, not a raw pointer's target.
 // The checker writes one for a store to a lent place as a whole (`p = v` with `inout p`, `self = v`
 // in a `&self` method; `Checker.lendWhole`), so the store writes the caller's value; every pass
-// that follows a place to its root goes through one as it goes through a field. Answers `r`'s
+// that follows a place to its root goes through one as it goes through a field. Returns `r`'s
 // node, or NO_NODE for anything else, a raw pointer's `*p` included.
 pub lentPlaceOf inout a:Ast id:NodeId -> NodeId {
     if (id == NO_NODE) { return NO_NODE; }

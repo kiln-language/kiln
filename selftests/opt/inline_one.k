@@ -1,6 +1,6 @@
 // A function called from one place is copied there whatever its size (within a bound), so the
 // call is gone and what it computes folds into its caller.
-// ir-lacks: inline_one::main inline_one::big
+// ir-lacks: main inline_one::big
 struct B { x: long, y: long, z: long, w: long }
 big i:long -> B {
     a: long = i * 3 + 1;

@@ -1,0 +1,62 @@
+selftests/parse_cap_err.k:5:23: error: expected `;`, found `}`
+    5 | f1 -> long { return 1 }
+      |                       ^
+selftests/parse_cap_err.k:6:23: error: expected `;`, found `}`
+    6 | f2 -> long { return 2 }
+      |                       ^
+selftests/parse_cap_err.k:7:23: error: expected `;`, found `}`
+    7 | f3 -> long { return 3 }
+      |                       ^
+selftests/parse_cap_err.k:8:23: error: expected `;`, found `}`
+    8 | f4 -> long { return 4 }
+      |                       ^
+selftests/parse_cap_err.k:9:23: error: expected `;`, found `}`
+    9 | f5 -> long { return 5 }
+      |                       ^
+selftests/parse_cap_err.k:10:23: error: expected `;`, found `}`
+   10 | f6 -> long { return 6 }
+      |                       ^
+selftests/parse_cap_err.k:11:23: error: expected `;`, found `}`
+   11 | f7 -> long { return 7 }
+      |                       ^
+selftests/parse_cap_err.k:12:23: error: expected `;`, found `}`
+   12 | f8 -> long { return 8 }
+      |                       ^
+selftests/parse_cap_err.k:13:23: error: expected `;`, found `}`
+   13 | f9 -> long { return 9 }
+      |                       ^
+selftests/parse_cap_err.k:14:25: error: expected `;`, found `}`
+   14 | f10 -> long { return 10 }
+      |                         ^
+selftests/parse_cap_err.k:15:25: error: expected `;`, found `}`
+   15 | f11 -> long { return 11 }
+      |                         ^
+selftests/parse_cap_err.k:16:25: error: expected `;`, found `}`
+   16 | f12 -> long { return 12 }
+      |                         ^
+selftests/parse_cap_err.k:17:25: error: expected `;`, found `}`
+   17 | f13 -> long { return 13 }
+      |                         ^
+selftests/parse_cap_err.k:18:25: error: expected `;`, found `}`
+   18 | f14 -> long { return 14 }
+      |                         ^
+selftests/parse_cap_err.k:19:25: error: expected `;`, found `}`
+   19 | f15 -> long { return 15 }
+      |                         ^
+selftests/parse_cap_err.k:20:25: error: expected `;`, found `}`
+   20 | f16 -> long { return 16 }
+      |                         ^
+selftests/parse_cap_err.k:21:25: error: expected `;`, found `}`
+   21 | f17 -> long { return 17 }
+      |                         ^
+selftests/parse_cap_err.k:22:25: error: expected `;`, found `}`
+   22 | f18 -> long { return 18 }
+      |                         ^
+selftests/parse_cap_err.k:23:25: error: expected `;`, found `}`
+   23 | f19 -> long { return 19 }
+      |                         ^
+selftests/parse_cap_err.k:24:25: error: expected `;`, found `}`
+   24 | f20 -> long { return 20 }
+      |                         ^
+error: too many errors, stopping now
+20 errors generated.

@@ -1,11 +1,11 @@
-// `Result<T, E>` — a value, or the reason there isn't one. An ordinary two-parameter sum type,
+// `Result<T, E>`: a value, or the reason there isn't one. An ordinary two-parameter sum type,
 // so it costs max(sizeof(T), sizeof(E)) plus a tag and only the live arm is ever built; a
 // payload that owns something (`Result<File, long>`) is ordinary.
 //
 // The one thing it takes from the compiler is `MustUse` (core.k): discarding a Result is a
 // compile error, which is the half of an error type no library can enforce for itself.
 //
-// Accessors follow Option's split — `isOk`/`isErr` borrow, everything that yields a payload
+// Accessors follow Option's split: `isOk`/`isErr` borrow, everything that yields a payload
 // consumes, since a copy of an owning payload would be released twice:
 //
 //     if (r.isOk()) { v: T = r.unwrap(); }
@@ -18,11 +18,9 @@ pub enum Result<T, E> {
 
 methods Result<T, E> for MustUse { }
 
-// Reaching for the arm that does not exist is a caller bug, so it ends the program — after
-// saying which call did it, since the alternative is a SIGILL with nothing attached.
-local wrongArm what:str -> never {
-    panicState(what, "the result holds the other arm — use isOk, unwrapOr or a match");
-}
+// Reaching for the arm that does not exist is a caller bug, so it ends the program
+// with a message naming the call.
+local wrongArm what:str saw:str -> never { panicState(what, saw); }
 
 // What `?` does with a Result: an `Err` stops and is handed back as the caller's own Result.
 // `Err` is tested first everywhere, as `isBreak` does, so the second test can fold away.
@@ -36,14 +34,14 @@ methods Result<T, E> for Try<T, E> {
     }
     output self -> T {
         match self {
-            Err(_) { wrongArm("Result ?"); }
+            Err(_) { wrongArm("Result ?", "called on an Err value"); }
             Ok(v)  { return v; }
         }
     }
     residual self -> E {
         match self {
             Err(e) { return e; }
-            Ok(_)  { wrongArm("Result ?"); }
+            Ok(_)  { wrongArm("Result ?", "called on an Ok value"); }
         }
     }
     fromResidual e:E -> Result<T, E> { return Result.Err(e); }
@@ -63,7 +61,7 @@ methods Result<T, E> {
     unwrap self -> T {
         match self {
             Ok(v)  { return v; }
-            Err(_) { wrongArm("Result.unwrap"); }
+            Err(_) { wrongArm("Result.unwrap", "called on an Err value"); }
         }
     }
     // The same trap, saying what the caller expected instead of naming the call.
@@ -74,8 +72,8 @@ methods Result<T, E> {
         }
     }
 
-    // The total accessor. `alt` is consumed either way — released here when it is not needed —
-    // which is what makes an owning fallback safe to pass.
+    // Never traps. `alt` is consumed either way and released here when it is not used, so an
+    // owning fallback is safe to pass.
     unwrapOr self alt:T -> T {
         match self {
             Ok(v)  { return v; }
@@ -85,7 +83,7 @@ methods Result<T, E> {
 
     unwrapErr self -> E {
         match self {
-            Ok(_)  { wrongArm("Result.unwrapErr"); }
+            Ok(_)  { wrongArm("Result.unwrapErr", "called on an Ok value"); }
             Err(e) { return e; }
         }
     }
@@ -120,7 +118,7 @@ pub mapError<T, E, G, F: Fn(E) -> G> r:Result<T, E> f:F -> Result<T, G> {
 // A Result says why there is no value, an Option only that there isn't one, so converting is
 // discarding the reason or supplying it. All three consume, like every other accessor.
 
-// The value, discarding the error — including releasing whatever it owned.
+// The value, discarding the error and releasing whatever it owned.
 pub okOf<T, E> r:Result<T, E> -> Option<T> {
     match r {
         Ok(v)  { return Option.Some(v); }
@@ -138,7 +136,7 @@ pub errOf<T, E> r:Result<T, E> -> Option<E> {
 
 // An Option plus the reason its absence counts as a failure. `E` is inferred from `e`, and a
 // bare literal is an `int`, so a `Result<T, long>` needs `okOr(o, 22 as long)` or a typed
-// local — unlike `Result.Err(22)`, which is target-typed by what it is returned as.
+// local, unlike `Result.Err(22)`, which is target-typed by what it is returned as.
 pub okOr<T, E> o:Option<T> e:E -> Result<T, E> {
     match o {
         Some(v) { return Result.Ok(v); }

@@ -1,4 +1,4 @@
-// File paths, as text. Nothing here touches the filesystem — these answer questions about the
+// File paths, as text. Nothing here touches the filesystem. These answer questions about the
 // spelling of a path, and `file`/`dir` are what act on one.
 //
 //     dirOf("stdlib/sync.k")        // "stdlib"
@@ -6,8 +6,8 @@
 //     stemOf("stdlib/sync.k")       // "sync"
 //     extOf("stdlib/sync.k")        // "k"
 //
-// Everything here answers with a VIEW into the path it was given, so nothing allocates and this
-// module needs neither `String` nor `Vec`. Building a path — joining, normalizing, splitting —
+// Everything here answers with a view into the path it was given, so nothing allocates and this
+// module needs neither `String` nor `Vec`. Building a path (joining, normalizing, splitting)
 // is `pathbuf`, kept separate for that reason: `file` and `dir` include this one, so anything
 // added here is compiled into every program that opens a file.
 //
@@ -21,7 +21,7 @@ pub PATH_MAX: long = 4096;
 
 // Every path-taking syscall wants a NUL-terminated C string, but a `str` is a {ptr, len} pair
 // with no terminator. Copies the path and terminates it; returns the length written, or -1 when
-// it cannot be passed on as written — too long for `dst`, or holding a NUL of its own, which the
+// it cannot be passed on as written: too long for `dst`, or holding a NUL of its own, which the
 // kernel would read as the end. A caller answers -1 with ENAMETOOLONG rather than open a
 // different, shorter path than the one it was asked for.
 pkg toCPath path:str inout dst:[u8] -> long {
@@ -44,13 +44,13 @@ pub isAbsolute path:str -> bool { return isSep(charAt(path, 0)); }
 pub lastSep path:str -> long {
     i: long = path.len;
     while (i > 0) {
-        i = i - 1;
+        i -= 1;
         if (isSep(charAt(path, i))) { return i; }
     }
     return -1;
 }
 
-// The directory part — everything before the last separator, or "" if there is none. This is
+// The directory part: everything before the last separator, or "" if there is none. This is
 // also how you climb one level: the parent of a directory is the directory part of it, which is
 // why there is no second function for that.
 pub dirOf path:str -> str {
@@ -70,7 +70,7 @@ pub baseName path:str -> str {
 local extDot base:str -> long {
     j: long = base.len;
     while (j > 1) {
-        j = j - 1;
+        j -= 1;
         if (charAt(base, j) == '.') { return j; }
     }
     return -1;

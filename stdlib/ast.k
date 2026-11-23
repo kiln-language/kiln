@@ -6,14 +6,13 @@
 // macro) turns it back into code the compiler then checks and compiles exactly as if a person
 // had written it.
 //
-// It is a SERIALIZATION of the tree, not a handle into the compiler's own arena. A macro can
-// therefore never reach out and change the program it was called from -- it can only produce a
-// new piece, which is then spliced in under the compiler's control. That is what makes hygiene
-// enforceable, and it costs one copy per macro use, which is the right trade.
+// It is a copy of the tree, not a handle into the compiler's own arena, so a macro cannot change
+// the program it was called from. It can only produce a new piece, which the compiler splices in
+// itself. That keeps hygiene enforceable, at the cost of one copy per macro use.
 //
 // Every variant mirrors one shape the compiler's parser produces (see `4-parse/ast.k` in the
 // compiler); nothing here is a second design of the language's syntax. The compiler builds and
-// reads these by name — the variants, `newBox`, `nodeList`/`nameList` and their `with`/`done` —
+// reads these by name (the variants, `newBox`, `nodeList`/`nameList` and their `with`/`done`),
 // so renaming any of them is a change to the compiler too.
 #include <{core, vec, heap, panic, string, chars}>
 
@@ -55,7 +54,7 @@ pub enum Node {
     Nothing,                         // an absent piece: no `else`, no initializer, a bare `return`
     Block(Vec<Node>),
     ExprStmt(Box<Node>),
-    Let(str, str, Box<Node>),        // `name: T = init;` -- the type by its spelling; Nothing for no initializer
+    Let(str, str, Box<Node>),        // `name: T = init;`: the type by its spelling, Nothing for no initializer
     If(Box<Node>, Box<Node>, Box<Node>),   // condition, then-block, and the else: a Block, an If, or Nothing
     While(Box<Node>, Box<Node>),
     Return(Box<Node>),               // the value, or Nothing
@@ -180,7 +179,7 @@ pub builtin parseExpr src:str -> Node;
 
 // ─── reading raw text: what a `name![ ... ]` macro does with what it is handed ──────────────
 
-// The pieces between top-level commas -- outside every bracket and literal -- trimmed. A gap
+// The pieces between top-level commas (outside every bracket and literal), trimmed. A gap
 // between two commas is refused, naming the macro; a trailing comma is allowed, and nothing at
 // all is no pieces.
 pub splitTopLevel text:str who:str -> Vec<str> {
@@ -198,13 +197,13 @@ pub splitTopLevel text:str who:str -> Vec<str> {
             piece: str = strTrim(strSlice(text, start, i - start));
             if (piece.len == 0) {
                 if (c == ',') {
-                    msg: String = stringOf(who) + ": an element is missing between two commas";
+                    msg: String = stringOf(who) + ": empty element between commas";
                     unsafe { panic(msg.view()); }
                 }
             } else { out.push(piece); }
             start = i + 1;
         }
-        i = i + 1;
+        i += 1;
     }
     return out;
 }
@@ -231,8 +230,8 @@ pub takePrefix text:str count:long -> RawText {
     for x in parts { names.push(strTrim(x)); }
     return RawText { names: names, rest: strSlice(text, p + 1, text.len - p - 1) };
 }
-// `T:` at the front (`K, V:` for `count` 2) -- identifiers and one colon -- as the colon's
-// position, or -1. A `::` is a qualified name, not a prefix.
+// The colon's position when the text starts with identifiers and one colon (`T:`, or `K, V:`
+// for `count` 2), or -1. A `::` is a qualified name, not a prefix.
 pub typePrefixEnd s:str count:long -> long {
     i: long = 0;
     n: long = 0;
@@ -241,10 +240,10 @@ pub typePrefixEnd s:str count:long -> long {
         if (i >= s.len || !isIdentStart(charAt(s, i))) { return -1; }
         while (i < s.len && isIdentPart(charAt(s, i))) { i = i + 1; }
         while (i < s.len && isSpace(charAt(s, i))) { i = i + 1; }
-        n = n + 1;
+        n += 1;
         if (n < count) {
             if (i >= s.len || charAt(s, i) != ',') { return -1; }
-            i = i + 1;
+            i += 1;
         }
     }
     if (i >= s.len || charAt(s, i) != ':') { return -1; }
@@ -260,14 +259,14 @@ pub literalEnd s:str i:long -> long {
         c: long = charAt(s, j);
         if (c == '\\') { j = j + 2; continue; }
         if (c == q) { return j + 1; }
-        j = j + 1;
+        j += 1;
     }
     return s.len;
 }
 
 // The list builder a `quote` compiles to. A quote is an expression, and `{ v: Vec<Node>;
 // v.push(a); … v }` has no expression form; nor can a variadic carry an owning value out of its
-// slice. So a child list is a CHAIN: `nodeList().with(a).with(b).done()`, each `with` consuming
+// slice. So a child list is a chain: `nodeList().with(a).with(b).done()`, each `with` consuming
 // the builder and handing it back, which is expressible anywhere a value is.
 pub struct NodeList { items: Vec<Node> }
 pub nodeList -> NodeList { v: Vec<Node>; return NodeList { items: v }; }
@@ -283,7 +282,7 @@ methods NameList {
 }
 
 // A splice standing as a statement of a quoted block, `{ @x }`, adds to the list being built
-// whatever `x` holds: one Node, or every Node of a `Vec<Node>` in order -- which is how a macro
+// whatever `x` holds: one Node, or every Node of a `Vec<Node>` in order. That is how a macro
 // splices a run of statements it built in a loop. The parser cannot know which `x` is, so the
 // quote calls `add` and the argument's type picks the implementation.
 pub trait QuoteAdd<T> { add self x:&T -> NodeList; }

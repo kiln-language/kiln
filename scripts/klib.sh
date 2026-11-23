@@ -3,18 +3,25 @@
 #
 #   scripts/klib.sh [compiler] [--self] [--corpus]
 #
-# Always: a three-package program (util <- mid <- app, every one on stdlib) built into a scratch
-# cache, and the cache held to what it promises --
+# Every run builds a three-package program (util <- mid <- app, each on stdlib) into a scratch
+# cache and holds the cache to what it promises:
 #   fresh       a second build compiles nothing and does not relink
 #   change      editing util rebuilds util, mid and app, and leaves stdlib alone
 #   behaviour   a changed value in util reaches the program, through two packages, including as
 #               the length of a template instance mid stamps (`Ring<long, nums::BASE>`)
 #   leaf        editing app rebuilds app alone
-#   foreign     a cached archive of another format is rebuilt, not trusted
-#   damaged     a cached archive that is not one at all is rebuilt
-#   stale       loading a .klib beside one built against an older version of it is refused
-#   refused     a compile handed a foreign-format .klib refuses it
-#   corrupt     a compile handed a .klib whose body was changed refuses it (the header hashes the body)
+#   foreign     a cached archive of another format is rebuilt, not trusted, and the build says why
+#   damaged     a cached archive that is not one at all is rebuilt, with a note
+#   truncated, flipped, format
+#               a cached archive with the right key but cut short, with a byte of its body changed,
+#               or with its format number changed is rebuilt from source with a note saying why;
+#               the program linked from the cache afterwards prints what it did, and the metadata
+#               rebuilt is the one first built, byte for byte
+#   stalekey    a cached archive built against an older dependency is rebuilt (its key differs)
+#   stale       a compile handed a .klib built against an older version of one loaded beside it stops
+#   refused     a compile handed a foreign-format .klib stops, naming the file and why
+#   corrupt     a compile handed a .klib whose body was changed stops (the header hashes the body)
+#   nosource    a compile handed a .klib cut short stops: a compile has no source to rebuild from
 #   parsed      a dependent parses its own module and none of its dependencies' (it reads them parsed)
 #   diamond     two packages on one base, both stamping Vec<long>, a tuple, a fn type and base's generic,
 #               under a third that uses both: built, linked, run
@@ -30,6 +37,17 @@
 #               bounds check through one is removed
 #   positions   a refusal in a dependency's generic body, for a dependent's instance, names the
 #               dependency's file and line
+#   callbacks   a `for` over a `var` global calling a dependency's function that calls back (through
+#               a fn value, through a trait object) into a writer of the global is refused; one
+#               calling a dependency's function that calls nothing back is not
+#   hooks       `@init`/`@fini` in two packages run in order, built as packages and whole
+#   manifests   a file named by an absolute path outside any package is its own package; a
+#               manifest above the working directory claims the files below it
+#   open        a package's dispatch, fn value and by-value parameter stay open to what its
+#               dependents build: what only a whole-program build may close is left open
+#   bindings    a package's match binding and destructured name of a payload that owns nothing,
+#               handed to a dispatch or a fn value, are borrows: the dependent's implementation
+#               and function that write through them write the value they were bound from
 # --self:   the compiler's own tree built with `kilnc build`, and the result shown to compile
 #           main.k to exactly the assembly the whole-program compiler does
 # --corpus: every corpus program compiled as a package against stdlib.klib, run, and its output
@@ -131,7 +149,7 @@ r=$(build); s=$(echo "$r" | summary)
 cp "$CACHE/mid.klib" "$W/mid-old.klib"
 sed -i 's/pub BASE: long = 40;/pub BASE: long = 50;/' "$W/util/nums.k"
 r=$(build); s=$(echo "$r" | summary)
-[ "$("$W/app.bin")" = "102 100 6 54" ] && ok "behaviour: a value changed in util reaches app, a template's length too (102 100 6 54)" || bad "after changing BASE the program printed: $("$W/app.bin")"
+[ "$("$W/app.bin")" = "102 100 6 54" ] && ok "behaviour: a value changed in util reaches app, a template's length too (102 100 6 54)" || { bad "after changing BASE the program printed: $("$W/app.bin") (build: $s)"; echo "$r"; }
 
 echo "// app only" >> "$W/app/main.k"
 r=$(build); s=$(echo "$r" | summary)
@@ -144,8 +162,8 @@ msg=$("$C" --klib "$W/app/main.k" --extern stdlib="$CACHE/stdlib.klib" --extern 
 echo "$msg" | grep -q "(1 modules parsed, [1-9][0-9]* read from a .klib" && ok "parsed: a dependent parses its own module and none of its dependencies'" \
     || bad "a dependency's module was parsed: $(echo "$msg" | grep 'modules parsed')"
 
-# An archive whose metadata says another format: same bytes otherwise, so only the version line
-# can be what refuses it. The body is binary, so the digit is patched in place.
+# An archive whose metadata names another format but is otherwise the same bytes, so only the
+# version line can be what refuses it. The body is binary, so the digit is patched in place.
 T=$(mktemp -d)
 (cd "$T" && ar x "$ROOT/$CACHE/util.klib" kiln.meta && printf 0 | dd of=kiln.meta bs=1 seek=10 count=1 conv=notrunc 2>/dev/null \
     && head -c 12 kiln.meta | grep -q "^kiln-klib 0" && ar rcsD foreign.klib kiln.meta)
@@ -154,25 +172,77 @@ T=$(mktemp -d)
     && printf '\377' | dd of=kiln.meta bs=1 seek=$((n - 3)) count=1 conv=notrunc 2>/dev/null && ar rcsD ../corrupt.klib kiln.meta)
 cp "$T/foreign.klib" "$CACHE/util.klib"
 r=$(build); s=$(echo "$r" | summary)
-echo "$s" | grep -q "built:util" && ok "foreign: a cached archive of another format is rebuilt" || { bad "foreign-format archive was trusted: $s"; echo "$r"; }
+echo "$s" | grep -q "built:util" && echo "$r" | grep -qF 'note: rebuilding `util`: its cached .klib was written in another format (`kiln-klib 0`' \
+    && ok "foreign: a cached archive of another format is rebuilt, and the build says why" || { bad "foreign-format archive was trusted, or rebuilt without a note: $s"; echo "$r"; }
 
 echo "not an archive" > "$CACHE/mid.klib"
 r=$(build); s=$(echo "$r" | summary)
-echo "$s" | grep -q "built:mid" && ok "damaged: a cached file that is no archive is rebuilt" || { bad "damaged archive was trusted: $s"; echo "$r"; }
+echo "$s" | grep -q "built:mid" && echo "$r" | grep -qF 'note: rebuilding `mid`: its cached .klib is damaged (it is not an archive)' \
+    && ok "damaged: a cached file that is no archive is rebuilt, and the build says why" || { bad "damaged archive was trusted, or rebuilt without a note: $s"; echo "$r"; }
 
-# mid-old.klib was built against the util of before the BASE change; loading it beside today's
-# util is the inconsistency the recorded dependency keys exist to catch.
+# Archives whose key is right but whose bytes are not what the compile wrote, each rebuilt from
+# source with a note, and the program linked from what is in the cache afterwards (the executable
+# is removed, so the build has to link it) printing what it printed before. The metadata member
+# is found by its first line; a byte is changed in place, since the body is binary.
+metaAt() { grep -obUa 'kiln-klib ' "$1" | head -1 | cut -d: -f1; }
+flipByte() {
+    b=$(dd if="$1" bs=1 skip="$2" count=1 2>/dev/null | od -An -tu1 | tr -d ' ')
+    printf "\\$(printf %o $((255 - b)))" | dd of="$1" bs=1 seek="$2" count=1 conv=notrunc 2>/dev/null
+}
+want=$("$W/app.bin")
+rebuilt() {   # name, what the note must say
+    rm -f "$W/app.bin"
+    r=$(build); s=$(echo "$r" | summary)
+    if echo "$s" | grep -q "built:util" && echo "$r" | grep -qF "note: rebuilding \`util\`: its cached .klib $2" \
+        && [ "$("$W/app.bin" 2>&1)" = "$want" ]; then ok "$1: rebuilt, with a note, and the program built from the cache prints $want"
+    else bad "$1: $s; the program printed '$("$W/app.bin" 2>&1)'"; echo "$r"; fi
+}
+cp "$CACHE/util.klib" "$T/util-good.klib"
+size=$(stat -c%s "$CACHE/util.klib")
+truncate -s $((size - 1000)) "$CACHE/util.klib"
+rebuilt "truncated" "is damaged (it is cut short: member"
+m=$(metaAt "$CACHE/util.klib"); n=$(ar p "$CACHE/util.klib" kiln.meta | wc -c)
+flipByte "$CACHE/util.klib" $((m + n - 3))
+rebuilt "flipped" "is damaged (its body does not hash to what its header says)"
+m=$(metaAt "$CACHE/util.klib")
+printf 6 | dd of="$CACHE/util.klib" bs=1 seek=$((m + 10)) count=1 conv=notrunc 2>/dev/null
+rebuilt "format" 'was written in another format (`kiln-klib 6`; this compiler reads `kiln-klib 9`)'
+# The object names the scratch directory its assembly was in, which differs from run to run, so
+# the metadata is what is compared.
+[ "$(ar p "$CACHE/util.klib" kiln.meta | sha1sum)" = "$(ar p "$T/util-good.klib" kiln.meta | sha1sum)" ] \
+    && ok "rebuilt: the metadata rebuilt is the metadata first built, byte for byte" \
+    || bad "rebuilt: the metadata rebuilt differs from the metadata first built"
+# One built against another version of its dependency carries another key: the ordinary rebuild.
+cp "$W/mid-old.klib" "$CACHE/mid.klib"
+rm -f "$W/app.bin"
+r=$(build); s=$(echo "$r" | summary)
+echo "$s" | grep -q "built:mid" && [ "$("$W/app.bin" 2>&1)" = "$want" ] \
+    && ok "stalekey: a cached archive built against an older dependency is rebuilt, and the program prints $want" \
+    || { bad "stalekey: $s; the program printed '$("$W/app.bin" 2>&1)'"; echo "$r"; }
+
+# A compile handed a `.klib` it cannot use has no source to rebuild it from: it stops, naming the
+# file and why.
 msg=$("$C" --klib "$W/app/main.k" --extern stdlib="$CACHE/stdlib.klib" --extern util="$CACHE/util.klib" \
       --extern mid="$W/mid-old.klib" -o "$T/x.s" 2>&1)
-echo "$msg" | grep -q "stale" && ok "stale: a .klib built against an older dependency is refused" || bad "stale archive accepted: $msg"
+echo "$msg" | grep -qF "cannot use \`$W/mid-old.klib\` for package \`mid\`: it is stale (built against package \`util\`" \
+    && ok "stale: a compile handed a .klib built against an older dependency stops, naming it" || bad "stale archive accepted: $msg"
 
 msg=$("$C" --klib "$W/app/main.k" --extern stdlib="$CACHE/stdlib.klib" --extern util="$T/foreign.klib" \
       --extern mid="$CACHE/mid.klib" -o "$T/x.s" 2>&1)
-echo "$msg" | grep -q "is not a kiln-klib 4 archive" && ok "refused: a compile handed a foreign-format .klib refuses it" || bad "foreign archive accepted: $msg"
+echo "$msg" | grep -qF "cannot use \`$T/foreign.klib\` for package \`util\`: it was written in another format (\`kiln-klib 0\`" \
+    && ok "refused: a compile handed a foreign-format .klib stops, naming it" || bad "foreign archive accepted: $msg"
 
 msg=$("$C" --klib "$W/app/main.k" --extern stdlib="$CACHE/stdlib.klib" --extern util="$T/corrupt.klib" \
       --extern mid="$CACHE/mid.klib" -o "$T/x.s" 2>&1)
-echo "$msg" | grep -q "damaged .klib metadata" && ok "corrupt: a .klib whose body was changed is refused" || bad "corrupt archive accepted: $msg"
+echo "$msg" | grep -qF "cannot use \`$T/corrupt.klib\` for package \`util\`: it is damaged (its body does not hash to what its header says)" \
+    && ok "corrupt: a compile handed a .klib whose body was changed stops, naming it" || bad "corrupt archive accepted: $msg"
+
+n=$(stat -c%s "$T/corrupt.klib")
+head -c $((n / 2)) "$T/corrupt.klib" > "$T/half.klib"
+msg=$("$C" --klib "$W/app/main.k" --extern stdlib="$CACHE/stdlib.klib" --extern util="$T/half.klib" \
+      --extern mid="$CACHE/mid.klib" -o "$T/x.s" 2>&1)
+echo "$msg" | grep -qF "cannot use \`$T/half.klib\` for package \`util\`: it is damaged (it is cut short inside its metadata)" \
+    && ok "nosource: a compile handed a .klib cut short stops, naming it" || bad "a truncated archive was accepted: $msg"
 rm -rf "$T"
 
 # A diamond: left and right each build on base and use the same instances (Vec<long>, a tuple, a
@@ -426,7 +496,7 @@ r=$("$C" build "$W/uuse" --cache "$CACHE" -o "$W/uuse.bin" 2>&1)
 printf 'package ubad;\ndepend units ../units\n' > "$W/ubad/package.kiln"
 printf '#include <units::m>\nmain -> int { d: Meters = 5; return d.km() as int; }\n' > "$W/ubad/main.k"
 r=$("$C" build "$W/ubad" --cache "$CACHE" -o "$W/ubad.bin" 2>&1)
-echo "$r" | grep -q "a distinct type converts only by" && ok "distinct: read from a .klib, it still converts only by \`as\`" \
+echo "$r" | grep -qF 'a distinct type converts only with `as`' && ok "distinct: read from a .klib, it still converts only by \`as\`" \
     || bad "distinct from a .klib accepted a long: $r"
 
 # Two packages that each have a module `util` declaring `util::Foo`: the module stem is the
@@ -439,7 +509,7 @@ printf 'pub struct Foo { y: long }\npub twoY -> long { return 2; }\n' > "$W/two/
 printf 'package both;\ndepend one ../one\ndepend two ../two\n' > "$W/both/package.kiln"
 printf '#include <one::util>\n#include <two::util>\nmain -> int { return 0; }\n' > "$W/both/main.k"
 r=$("$C" build "$W/both" --cache "$CACHE" -o "$W/both.bin" 2>&1)
-echo "$r" | grep -q "declared by package 'one' and by package 'two'" && ok "stems: two packages each declaring util::Foo are refused, naming both" \
+echo "$r" | grep -qF 'declared by package `one` and by package `two`' && ok "stems: two packages each declaring util::Foo are refused, naming both" \
     || bad "two packages' util::Foo: $r"
 
 # A dependency's generic body that is wrong only for the instance a dependent asks for: the
@@ -451,12 +521,30 @@ printf 'pub struct Holder<T> { v: T }\nmethods Holder<T> {\n    first &self -> l
 printf 'package guse;\ndepend gdep ../gdep\n' > "$W/guse/package.kiln"
 printf '#include <gdep::shape>\nmain -> int {\n    h: Holder<long> = Holder { v: 3 };\n    return h.twice() as int;\n}\n' > "$W/guse/main.k"
 r=$("$C" build "$W/guse" --cache "$CACHE" -o "$W/guse.bin" 2>&1)
-echo "$r" | grep -q "gdep/shape.k:4:[0-9]*: Error: " && ok "positions: a dependency's generic body refused for a dependent's instance names the dependency's file and line" \
+echo "$r" | grep -q "gdep/shape.k:4:[0-9]*: error: " && ok "positions: a dependency's generic body refused for a dependent's instance names the dependency's file and line" \
     || bad "a refusal in a dependency's generic body: $r"
 
-# hooks: `@init`/`@fini` in two packages run in order -- a dependency's start before its
-# dependent's, the ends the other way round, stdout's flush (stdlib, read first) last of all --
-# the same from a package build as from a whole-program compile, under the same symbols.
+# A dependency's function calls back into the dependent's code, which writes the `var` global a
+# loop walks. The dependency's facts say what it calls back (a fn value, a trait's slot), and the
+# dependent's guard follows that into its own functions: before batch 9 a dependency's function
+# was taken to call nothing, and the loop read the block the write freed.
+mkdir -p "$W/cbdep" "$W/cbfn" "$W/cbtr" "$W/cbok"
+printf 'package cbdep;\n' > "$W/cbdep/package.kiln"
+printf 'pub trait Hook { run &self -> void; }\npub callIt f:fn()->void -> void { f(); }\npub fire h:Hook -> void { h.run(); }\npub plain n:long -> long { return n + 1; }\n' > "$W/cbdep/cb.k"
+for d in cbfn cbtr cbok; do printf 'package %s;\ndepend cbdep ../cbdep\n' $d > "$W/$d/package.kiln"; done
+printf '#include <stdlib::vec>\n#include <cbdep::cb>\nvar gV: Vec<long>;\ngrow -> void { gV.push(9); }\nmain -> int { gV.push(1); t: long = 0; for x in gV { callIt(&grow); t = t + x; } return t as int; }\n' > "$W/cbfn/main.k"
+printf '#include <stdlib::vec>\n#include <cbdep::cb>\nvar gV: Vec<long>;\nstruct G { n: long }\nmethods G for Hook { run &self -> void { gV.push(9); } }\nmain -> int { gV.push(1); t: long = 0; for x in gV { fire(G { n: 0 }); t = t + x; } return t as int; }\n' > "$W/cbtr/main.k"
+printf '#include <stdlib::vec>\n#include <cbdep::cb>\nvar gV: Vec<long>;\ngrow -> void { gV.push(9); }\nmain -> int { gV.push(1); t: long = 0; for x in gV { t = t + plain(x); } grow(); return t as int; }\n' > "$W/cbok/main.k"
+r1=$("$C" build "$W/cbfn" --cache "$CACHE" -o "$W/cbfn.bin" 2>&1)
+r2=$("$C" build "$W/cbtr" --cache "$CACHE" -o "$W/cbtr.bin" 2>&1)
+r3=$("$C" build "$W/cbok" --cache "$CACHE" -o "$W/cbok.bin" 2>&1); "$W/cbok.bin" >/dev/null 2>&1; rc=$?
+if echo "$r1" | grep -qF '`gV` is written by `callIt`' && echo "$r2" | grep -qF '`gV` is written by `fire`' && [ $rc = 2 ]; then
+    ok "callbacks: a dependency's fn-value and trait callbacks into a writer of a walked global are refused; a plain call is not"
+else bad "callbacks: fn value: $r1 / trait: $r2 / plain: exit $rc $r3"; fi
+
+# hooks: `@init`/`@fini` hooks in two packages run in order. A dependency's start hook runs before
+# its dependent's, the end hooks run the other way round, and stdout's flush (stdlib, read first)
+# runs last of all. A package build and a whole-program compile agree on the order and the symbols.
 mkdir -p "$W/hdep" "$W/happ"
 printf 'package hdep;\n' > "$W/hdep/package.kiln"
 printf '#include <stdlib::io>\npub var gOrder: long = 0;\n@init startDep -> void { gOrder = gOrder * 10 + 1; }\n@fini endDep -> void { println("end dep"); }\n' > "$W/hdep/first.k"
@@ -470,6 +558,110 @@ syms() { nm "$1" 2>/dev/null | awk '{print $NF}' | grep -v '\.end' | grep -E '\$
 [ "$hp" = "$want" ] && [ "$hw" = "$want" ] && [ "$(syms "$W/happ.bin")" = "$(syms "$W/happw.bin")" ] \
     && ok "hooks: @init/@fini across two packages run in order, the same built as packages and whole (symbols: $(syms "$W/happ.bin"))" \
     || bad "hooks: package build printed <$hp>, whole-program <$hw>, symbols <$(syms "$W/happ.bin")> vs <$(syms "$W/happw.bin")>"
+
+# manifests: a file is in the package whose manifest is above it in the filesystem, or in none.
+# Named by an absolute path outside any package, it is its own package wherever the compiler runs
+# (it was taken into this tree's `kiln`, the working directory's); a relative path that climbs out
+# of the working directory, and a file in it whose manifest is further up, find that manifest.
+# `--emit=pre` says which package each file was put in, on its `#file` line.
+T=$(mktemp -d)
+mkdir -p "$T/outer/inner" "$T/outer/other"
+printf 'package outer;\n' > "$T/outer/package.kiln"
+printf 'main -> int { return 0; }\n' > "$T/lone.k"
+cp "$T/lone.k" "$T/outer/other/x.k"; cp "$T/lone.k" "$T/outer/inner/y.k"
+pkgOf() { grep -F "#file \"$1\" " | awk '{print $NF}' | tr -d '"'; }
+p1=$("$C" "$T/lone.k" --emit=pre -o /dev/null 2>&1 | pkgOf "$T/lone.k")
+p2=$(cd "$T/outer/inner" && "$C" ../other/x.k --emit=pre -o /dev/null 2>&1 | pkgOf ../other/x.k)
+p3=$(cd "$T/outer/inner" && "$C" y.k --emit=pre -o /dev/null 2>&1 | pkgOf y.k)
+[ "$p1" = "$T/lone.k" ] && [ "$p2" = outer ] && [ "$p3" = outer ] \
+    && ok "manifests: an absolute path outside any package is its own; a manifest above the working directory is found" \
+    || bad "manifests: absolute path in <$p1>, ../other/x.k in <$p2>, y.k in <$p3> (want <$T/lone.k>, <outer>, <outer>)"
+rm -rf "$T"
+
+# open: what a whole-program build may conclude from seeing every call, a package may not, since a
+# dependent it cannot see calls in too. cdep's own code builds only one `Shape` (a `Sq`), takes the
+# address of only one `fn(long) -> long` (`inc`) and calls `bumpP` only with values built for the
+# call; seen whole, each of those calls would have one callee or fresh bytes. capp builds a `Circ`
+# as a `Shape`, hands `apply` its own `dbl`, and calls `bumpP` with a local it reads afterwards:
+# the dispatch has to reach capp's method, the fn value capp's function, and `bumpP` has to copy
+# what it writes rather than write capp's local.
+mkdir -p "$W/cdep" "$W/capp"
+printf 'package cdep;\n' > "$W/cdep/package.kiln"
+cat > "$W/cdep/shapes.k" <<'EOF'
+pub trait Shape { area &self -> long; }
+pub struct Sq { s: long }
+methods Sq for Shape { area &self -> long { return self.s * self.s; } }
+pub areaOf s:Shape -> long { return s.area(); }
+pub useSq -> long { q: Sq = Sq { s: 3 }; return areaOf(q); }
+pub struct Plain { a: long, b: long }
+pub bumpP p:Plain -> long { p.a = p.a + 1; return p.a + p.b; }
+pub selfUse -> long { return bumpP(Plain { a: 1, b: 2 }); }
+pub apply f:fn(long) -> long x:long -> long { return f(x); }
+inc x:long -> long { return x + 1; }
+pub viaInc -> long { return apply(&inc, 1); }
+EOF
+printf 'package capp;\ndepend cdep ../cdep\n' > "$W/capp/package.kiln"
+cat > "$W/capp/main.k" <<'EOF'
+#include <cdep::shapes>
+#include <stdlib::io>
+struct Circ { r: long }
+methods Circ for Shape { area &self -> long { return self.r * 3; } }
+dbl x:long -> long { return x * 2; }
+main -> int {
+    c: Circ = Circ { r: 5 };
+    p: Plain = Plain { a: 10, b: 20 };
+    t: long = bumpP(p) + bumpP(p) + p.a;
+    println("{} {} {} {} {} {}", areaOf(c), useSq(), t, selfUse(), apply(&dbl, 21), viaInc());
+    return 0;
+}
+EOF
+r=$("$C" build "$W/capp" --cache "$CACHE" -o "$W/capp.bin" 2>&1)
+out=$("$W/capp.bin" 2>&1)
+[ "$out" = "15 9 72 4 42 2" ] \
+    && ok "open: a package's dispatch, fn value and by-value parameter stay open to its dependents (15 9 72 4 42 2)" \
+    || { bad "open: printed '$out', wanted '15 9 72 4 42 2'"; echo "$r"; }
+
+# bindings: a binding of a payload that owns nothing is a copy where nothing writes through it, and
+# which methods write is decided by what the compile sees. bdep's arms hand theirs to a dispatch and
+# to a fn value, and bdep has no implementation of `Shifter` and addresses no function, so nothing it
+# sees writes them; but bapp's `Nudge` and `lift` do, compiled after. Each binding has to be a borrow
+# of the payload, or the writes land in copies.
+mkdir -p "$W/bdep" "$W/bapp"
+printf 'package bdep;\n' > "$W/bdep/package.kiln"
+cat > "$W/bdep/marks.k" <<'EOF'
+pub struct Pt { x: long, y: long }
+pub enum Mark { At(Pt), Dot(long) }
+pub struct Pair { tag: long, at: Pt }
+pub trait Shifter { shift &self p:&Pt -> void; }
+pub viaDispatch inout m:Mark s:Shifter -> void { match m { At(p) { s.shift(p); } _ { } } }
+pub viaFn inout m:Mark f:fn(Pt) -> void -> void { match m { At(p) { f(p); } _ { } } }
+pub viaPair inout q:(long, Pt) s:Shifter -> void { t, p = q; s.shift(p); }
+pub xOf m:Mark -> long { match m { At(p) { return p.x; } _ { } } return -1; }
+pub yOf m:Mark -> long { match m { At(p) { return p.y; } _ { } } return -1; }
+EOF
+printf 'package bapp;\ndepend bdep ../bdep\n' > "$W/bapp/package.kiln"
+cat > "$W/bapp/main.k" <<'EOF'
+#include <bdep::marks>
+#include <stdlib::io>
+struct Nudge { d: long }
+methods Nudge for Shifter { shift &self p:&Pt -> void { p.x = p.x + self.d; } }
+lift p:&Pt -> void { p.y = p.y + 7; }
+main -> int {
+    m: Mark = Mark.At(Pt { x: 1, y: 2 });
+    viaDispatch(&m, Nudge { d: 10 });
+    viaFn(&m, &lift);
+    q: (long, Pt) = (0, Pt { x: 5, y: 0 });
+    viaPair(&q, Nudge { d: 30 });
+    a, b = q;
+    println("{} {} {}", xOf(m), yOf(m), b.x);
+    return 0;
+}
+EOF
+r=$("$C" build "$W/bapp" --cache "$CACHE" -o "$W/bapp.bin" 2>&1)
+out=$("$W/bapp.bin" 2>&1)
+[ "$out" = "11 9 35" ] \
+    && ok "bindings: a package's binding handed to a dispatch or a fn value is a borrow its dependents write through (11 9 35)" \
+    || { bad "bindings: printed '$out', wanted '11 9 35'"; echo "$r"; }
 
 if [ $SELF = 1 ]; then
     echo "the compiler built from packages:"

@@ -1,16 +1,16 @@
-// What a trap should have said.
+// Panics: say what failed on stderr, then exit with SIGABRT's status.
 //
-// A failed bounds check, a missing key, an unwrapped `None` — every one of these used to be a
-// bare `ud2`, which reaches the shell as SIGILL and says nothing at all: not which check
-// failed, not with what value, not in which container. The program still dies, and still dies
-// immediately, but now it says why first.
+// Every runtime check in the containers ends here (a failed bounds check, a missing key, an
+// unwrapped `None`), and the message names the operation and the values involved.
 //
-// Self-contained on purpose. It formats its own numbers rather than calling `io`, because the
-// containers that need it (`vec`, `map`, `deque`, `pool`) sit below the formatter and must not
-// have to drag it in — and because a panic must work when nothing else is trustworthy: it
-// touches no allocator, no buffered sink, and no global.
+// Self-contained. It formats its own numbers instead of calling `io`, because the containers
+// that use it (`vec`, `map`, `deque`, `pool`) sit below the formatter and must not pull it in.
+// A panic also has to work when nothing else can be trusted, so it touches no allocator and no
+// buffered sink of its own. What it reads beyond its arguments is where io said stdout's held
+// bytes are (sys.k's `spillStdoutNow`), to write them before the message: into a file or a pipe
+// stdout buffers by the block, and what was printed before a crash should not be lost with it.
 //
-// The three entry points are known to the compiler by name: a call to one ends its path, so a
+// The compiler knows the three entry points by name: a call to one ends its path, so a
 // function whose last statement is a panic needs no `return` after it.
 #include <sys>
 
@@ -31,13 +31,13 @@ local emitLong v:long -> void {
     n: long = v;
     if (n > 0) { n = -n; }               // work in the negative domain: it reaches long's minimum
     loop {
-        i = i - 1;
+        i -= 1;
         buf[i] = ('0' - n % 10) as u8;
-        n = n / 10;
+        n /= 10;
         if (n == 0) { break; }
     }
     if (v < 0) {
-        i = i - 1;
+        i -= 1;
         buf[i] = '-';
     }
     emit(buf[i..] as str);
@@ -45,6 +45,7 @@ local emitLong v:long -> void {
 
 // Report `msg` and abort. `@panic`: what `assert!` calls when it fails.
 @panic pub panic msg:str -> never {
+    spillStdoutNow();
     emit("panic: ");
     emit(msg);
     emit("\n");
@@ -53,22 +54,24 @@ local emitLong v:long -> void {
 
 // The shape almost every container trap has: something was asked for a position it does not
 // have. `what` names the operation, so the line reads as e.g.
-//   panic: Vec.get: index 7 out of range, length 3
+//   panic: Vec.get: index 7 out of range for length 3
 pub panicIndex what:str i:long n:long -> never {
+    spillStdoutNow();
     emit("panic: ");
     emit(what);
     emit(": index ");
     emitLong(i);
-    emit(" out of range, length ");
+    emit(" out of range for length ");
     emitLong(n);
     emit("\n");
     sysExit(aborted);
 }
 
-// A value that was asked for the wrong thing — an unwrapped `None`, an `Err` read as `Ok`,
-// a stale handle. `what` names the operation, `saw` what was actually there.
-//   panic: Option.unwrap: called on None
+// An operation that cannot go ahead on the value it was given: an unwrapped `None`, an `Err`
+// read as `Ok`, a stale handle. `what` names the operation and `saw` says what was wrong.
+//   panic: Option.unwrap: called on a None value
 pub panicState what:str saw:str -> never {
+    spillStdoutNow();
     emit("panic: ");
     emit(what);
     emit(": ");

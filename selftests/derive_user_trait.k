@@ -1,11 +1,12 @@
-// `derive` is not about Encode: any trait may name a macro that writes its implementation for a
-// type that has none. Two traits written here, with their macros: `Weigh` (an instance method,
-// summed over every field, and over a sum type's tag and live payloads -- its macro takes a
-// `Decl`, so it gets either kind of type) and `Zero` (a static method building a value field by
-// field -- its macro takes a `Struct`). Needed four ways: a method call, a static call, a field
-// of a derived type (so one derive asks for the next), and a value made into a trait object. A
-// generic struct is derived per instance: `Pair<long, Inner>` is handed with its fields at their
-// concrete types. Exit 0 when every check holds, otherwise the number of the first that did not.
+// `derive` is not specific to Encode: any trait may name a macro that writes its implementation
+// for a type that has none. This test declares two traits with their macros. `Weigh` is an
+// instance method summed over every field, and over a sum type's tag and live payloads; its macro
+// takes a `Decl`, so it gets either kind of type. `Zero` is a static method that builds a value
+// field by field; its macro takes a `Struct`. The derives are asked for in four ways: a method
+// call, a static call, a field of a derived type (so one derive asks for the next), and a value
+// made into a trait object. A generic struct is derived per instance: `Pair<long, Inner>` is
+// handed over with its fields at their concrete types. Exit 0 when every check holds, otherwise
+// the number of the first that did not.
 #include <stdlib::ast>
 #include <stdlib::reflect>
 #include <stdlib::vec>

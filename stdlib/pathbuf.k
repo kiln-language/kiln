@@ -1,5 +1,5 @@
 // Building a path: the forms that allocate, split off from `path` (which only ever hands back a
-// view into what it was given). Same split as `str` and `String`, and for the same reason —
+// view into what it was given). Same split as `str` and `String`, and for the same reason:
 // `file` and `dir` include `path`, so every program that opens a file would otherwise compile
 // `String`, `Vec` and their dependencies whether or not it ever built a path.
 //
@@ -32,10 +32,10 @@ pub splitPath path:str -> Vec<str> {
     return out;
 }
 
-// Collapse `.` and `..` so a path spells the same directory however it was reached — which is
-// what lets a path be used as a map key without `a/../b` and `b` becoming two entries. A `..`
-// with nothing to cancel is kept, since dropping it would climb out of a relative path — except
-// at the root of an absolute path, which has no parent to climb to.
+// Collapse `.` and `..` so a path spells the same directory however it was reached, and can be
+// used as a map key without `a/../b` and `b` becoming two entries. A `..` with nothing to cancel
+// is kept, because dropping it would change where a relative path points. At the root of an
+// absolute path it is dropped, since the root has no parent.
 pub normalizePath path:str -> String {
     absolute: bool = isAbsolute(path);
     kept: Vec<str>;
@@ -50,7 +50,7 @@ pub normalizePath path:str -> String {
     }
     out: String;
     // An absolute path stays absolute. `splitPath` drops the empty component a leading separator
-    // makes, so the root has to be put back here — without it `/usr/lib` normalizes to `usr/lib`,
+    // makes, so the root has to be put back here. Without it `/usr/lib` normalizes to `usr/lib`,
     // which names a different directory and silently resolves against the working one.
     if (absolute) { out.push('/'); }
     for i in 0..kept.len() {

@@ -15,7 +15,7 @@ pub fillRandom inout buf:[u8] -> Result<long, long> {
         unsafe { n = syscall3(Syscall.Getrandom, buf.ptr + got, buf.len - got, 0); }
         if (n == -Errno.Intr) { continue; }
         if (n < 0) { return Result.Err(-n); }
-        got = got + n;
+        got += n;
     }
     return Result.Ok(got);
 }
@@ -48,11 +48,11 @@ methods Rng {
     next &self -> u64 {
         out: u64 = rotl(self.s1 * 5, 7) * 9;
         t: u64 = self.s1 << 17;
-        self.s2 = self.s2 ^ self.s0;
-        self.s3 = self.s3 ^ self.s1;
-        self.s1 = self.s1 ^ self.s2;
-        self.s0 = self.s0 ^ self.s3;
-        self.s2 = self.s2 ^ t;
+        self.s2 ^= self.s0;
+        self.s3 ^= self.s1;
+        self.s1 ^= self.s2;
+        self.s0 ^= self.s3;
+        self.s2 ^= t;
         self.s3 = rotl(self.s3, 45);
         return out;
     }
@@ -85,6 +85,6 @@ pub shuffle<T> inout v:Vec<T> inout r:Rng -> void {
     while (i > 0) {
         j: long = r.below(i + 1);
         v.swap(i, j);
-        i = i - 1;
+        i -= 1;
     }
 }

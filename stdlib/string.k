@@ -1,12 +1,12 @@
 // Strings you can build, compare and take apart.
 //
 // A `str` is a borrowed {ptr, len} view over bytes somebody else owns; `String` owns its bytes
-// and grows. `String.view` is `unsafe` because the view it hands out points into the buffer and
-// dangles if the String is dropped or grown while it is held. Little needs it: printing goes
-// through `Display`, appending through `Write`, and the search and comparison methods below take
-// a `str` argument and read the buffer internally. (A method cannot hand out the text as a
-// call-scoped borrow, `-> &str`, the way `Vec.at` hands out an element — see STDLIB_REVIEW.md —
-// so the views are taken inside this file and nowhere else has to.)
+// and grows. `String.view` is `unsafe` because the view points into the buffer and dangles if
+// the String is dropped or grown while it is held. Little needs it: printing goes through
+// `Display`, appending through `Write`, and the search and comparison methods below take a
+// `str` and read the buffer internally. A method cannot return the text as a call-scoped `&str`
+// the way `Vec.at` returns an element (see STDLIB_REVIEW.md), so the views are taken inside
+// this file and callers do not have to.
 //
 //     s: String;                       // Default: empty, no allocation
 //     s.pushStr("total: ");
@@ -15,9 +15,8 @@
 #include <{core, cmp, heap, mem, bytes, fmt, option, chars, vec}>
 
 // ─── str readers ─────────────────────────────────────────────────────────────
-// Free functions, kept as the names they have always had; the trait implementations below
-// answer to the same three. All are safe: a sub-view of a `str` the caller already holds
-// lives exactly as long as it does.
+// Free functions, alongside the trait implementations below that do the same three things. All
+// are safe: a sub-view of a `str` the caller already holds lives as long as that `str` does.
 
 // Same TEXT.
 pub strEq a:str b:str -> bool { return bytesEqual(a as [u8], b as [u8]); }
@@ -25,13 +24,13 @@ pub strEq a:str b:str -> bool { return bytesEqual(a as [u8], b as [u8]); }
 // Lexicographic by bytes, then by length. Negative / zero / positive.
 pub strCmp a:str b:str -> int { return bytesCompare(a as [u8], b as [u8]); }
 
-// FNV-1a over the CONTENTS — what a str-keyed table needs. Hashing the header would hash the
+// FNV-1a over the contents, which is what a str-keyed table needs. Hashing the header would hash the
 // address, so two equal strings in different places would never match.
 pub strHash s:str -> long { return hashBytes(s as [u8]); }
 
-// A `str` compares, orders and hashes BY ITS CONTENT. Nothing else would be defensible: two
-// equal strings at different addresses are equal, and a table that disagreed would lose them.
-// These are what make `a == b`, `sort(&v)` and `HashMap<str, V>` mean what they read as.
+// A `str` compares, orders and hashes by content, so two equal strings at different addresses
+// are equal and find each other in a table. `a == b`, `sort(&v)` and `HashMap<str, V>` all go
+// through these.
 methods str for Eq<str> { eq  &self other:str -> bool { return strEq(self, other); } }
 methods str for Ord     { cmp &self other:str -> int  { return strCmp(self, other); } }
 methods str for Hash    { hash &self -> u64 { return strHash(self) as u64; } }
@@ -46,8 +45,9 @@ pub strEndsWith s:str suffix:str -> bool {
 }
 
 // Byte index of the first occurrence at or after `from`, or nothing. Finds the needle's first
-// byte with a plain scan and compares the rest only there: the needles this is for are short,
-// and Boyer-Moore's preprocessing pass only pays back on long ones.
+// byte with `bytesIndexOf`'s word scan and compares the whole needle only there: the needles
+// this is for are short, and Boyer-Moore's preprocessing pass only pays back on long ones. The
+// scan stops where the needle would no longer fit.
 pub strFindFrom s:str needle:str from:long -> Option<long> {
     start: long = from;
     if (start < 0) { start = 0; }
@@ -55,13 +55,16 @@ pub strFindFrom s:str needle:str from:long -> Option<long> {
         if (start > s.len) { return Option.None; }
         return Option.Some(start);
     }
-    hay: [u8] = s as [u8];
-    pat: [u8] = needle as [u8];
     last: long = s.len - needle.len;
-    i: long = bytesIndexOf(hay, pat[0], start);
-    while (i >= 0 && i <= last) {
+    if (start > last) { return Option.None; }
+    hay: [u8] = s as [u8];
+    heads: [u8] = hay[..last + 1];                   // where a match can begin
+    pat: [u8] = needle as [u8];
+    first: u8 = pat[0];
+    i: long = bytesIndexOf(heads, first, start);
+    while (i >= 0) {
         if (bytesEqual(hay[i..i + pat.len], pat)) { return Option.Some(i); }
-        i = bytesIndexOf(hay, pat[0], i + 1);
+        i = bytesIndexOf(heads, first, i + 1);
     }
     return Option.None;
 }
@@ -69,12 +72,14 @@ pub strFind s:str needle:str -> Option<long> { return strFindFrom(s, needle, 0);
 
 pub strFindLast s:str needle:str -> Option<long> {
     if (needle.len > s.len) { return Option.None; }
+    if (needle.len == 0) { return Option.Some(s.len); }
     hay: [u8] = s as [u8];
     pat: [u8] = needle as [u8];
+    first: u8 = pat[0];
     i: long = s.len - needle.len;
     while (i >= 0) {
-        if (bytesEqual(hay[i..i + pat.len], pat)) { return Option.Some(i); }
-        i = i - 1;
+        if (hay[i] == first && bytesEqual(hay[i..i + pat.len], pat)) { return Option.Some(i); }
+        i -= 1;
     }
     return Option.None;
 }
@@ -126,14 +131,19 @@ pub strTrimSet s:str set:str -> str {
 // ─── splitting ───────────────────────────────────────────────────────────────
 // The pieces are views INTO `s`, so nothing is copied and every one dies when `s` does.
 
-// Split on a single byte, keeping empty pieces: `strSplit("a,,b", ',')` is three.
+// Split on a single byte, keeping empty pieces: `strSplit("a,,b", ',')` is three. The
+// separators are found with `bytesIndexOf`'s word scan; a `sep` outside 0..255 is no byte, so
+// it never matches and the whole string is the one piece.
 pub strSplit s:str sep:long -> Vec<str> {
     out: Vec<str>;
     start: long = 0;
-    for i in 0..s.len {
-        if (charAt(s, i) == sep) {
+    if (sep >= 0 && sep <= 255) {
+        hay: [u8] = s as [u8];
+        i: long = bytesIndexOf(hay, sep as u8, 0);
+        while (i >= 0) {
             out.push(strSlice(s, start, i - start));
             start = i + 1;
+            i = bytesIndexOf(hay, sep as u8, start);
         }
     }
     out.push(strSlice(s, start, s.len - start));
@@ -155,8 +165,8 @@ pub strSplitOn s:str sep:str -> Vec<str> {
     }
 }
 
-// Every line, without its terminator. Unlike `strSplit`, a trailing newline does NOT produce a
-// final empty line — a file's line count is then what an editor would show. A CR before the
+// Every line, without its terminator. Unlike `strSplit`, a trailing newline does not produce a
+// final empty line, so a file's line count is then what an editor would show. A CR before the
 // newline is left on the line, so a tool that writes its input back out does not silently
 // convert CRLF to LF.
 pub splitLines body:str -> Vec<str> {
@@ -168,7 +178,7 @@ pub splitLines body:str -> Vec<str> {
 
 // ─── parsing ─────────────────────────────────────────────────────────────────
 
-// An optional sign then digits of `base` (2..36; letters either case), and nothing else — no
+// An optional sign then digits of `base` (2..36; letters either case), and nothing else: no
 // whitespace skipping, no `0x`, and no partial parse that reports success for a prefix.
 // Refuses rather than wraps: a value outside `long` is nothing.
 pub parseLongBase s:str base:long -> Option<long> {
@@ -177,15 +187,20 @@ pub parseLongBase s:str base:long -> Option<long> {
     c0: long = charAt(s, 0);
     if (c0 == '-' || c0 == '+') { neg = c0 == '-'; i = 1; }
     if (i >= s.len || base < 2 || base > 36) { return Option.None; }   // empty, or a sign alone
-    // Accumulate NEGATIVELY: the negative range is one larger, so long's minimum parses too.
+    // Accumulate negatively: the negative range is one larger, so long's minimum parses too.
+    // `cutoff` is the most negative value that can take another digit without passing the
+    // limit (division rounds toward zero, so cutoff * base >= limit), worked out once so a digit
+    // costs a multiply and two compares rather than a division.
     limit: long = -9223372036854775807 - 1;
+    cutoff: long = limit / base;
     v: long = 0;
     while (i < s.len) {
         d: long = digitVal(charAt(s, i), base);
-        if (d < 0) { return Option.None; }
-        if (v < (limit + d) / base) { return Option.None; }   // v * base - d would pass the limit
-        v = v * base - d;
-        i = i + 1;
+        if (d < 0 || v < cutoff) { return Option.None; }
+        v = v * base;
+        if (v < limit + d) { return Option.None; }             // v - d would pass the limit
+        v = v - d;
+        i += 1;
     }
     if (neg) { return Option.Some(v); }
     if (v == limit) { return Option.None; }                   // 2^63 has no positive twin
@@ -220,7 +235,7 @@ methods String for Write {
         if (len <= 0) { return 0; }
         self.reserve(len);
         unsafe { memcpy(self.buf as long + self.len, ptr, len); }
-        self.len = self.len + len;
+        self.len += len;
         return len;
     }
 }
@@ -258,16 +273,16 @@ methods String {
     truncate &self n:long -> void { if (n >= 0 && n < self.len) { self.len = n; } }
 
     push &self c:char -> void {
-        self.reserve(1);
+        if (self.len == self.cap) { self.reserve(1); }
         unsafe { self.buf[self.len] = c as u8; }
-        self.len = self.len + 1;
+        self.len += 1;
     }
     // `c`, `n` times: padding, rules, indentation.
     pushRepeated &self c:char n:long -> void {
         if (n <= 0) { return; }
         self.reserve(n);
         unsafe { memset(self.buf as long + self.len, c as long, n); }
-        self.len = self.len + n;
+        self.len += n;
     }
     pushStr &self s:str -> void {
         if (s.len > 0) { unsafe { self.write(s.ptr, s.len); } }
@@ -280,7 +295,7 @@ methods String {
     }
     // A number appended in decimal, without going through the formatter's spec parsing. `{}`
     // through `writeTo` is the general way; this is the one a builder assembling text in a loop
-    // wants, and it is also what an `inout String` parameter can call — a borrow does not
+    // wants, and it is also what an `inout String` parameter can call, since a borrow does not
     // convert to the `Write` trait object `putLong` takes.
     pushLong &self v:long -> void {
         scratch: [u8; LONG_TEXT_MAX];
@@ -296,7 +311,7 @@ methods String {
     // The last byte, removed; nothing if the String is empty.
     pop &self -> Option<char> {
         if (self.len == 0) { return Option.None; }
-        self.len = self.len - 1;
+        self.len -= 1;
         unsafe { return Option.Some(self.buf[self.len] as char); }
     }
 
@@ -308,7 +323,7 @@ methods String {
     // growing it (any push, any write) leaves the view on freed or stale bytes.
     unsafe view &self -> str { return self.buf[..self.len] as str; }
 
-    // Search and prefix tests without exposing the buffer — the reason `view` is rarely needed.
+    // Search and prefix tests without exposing the buffer, which is why `view` is rarely needed.
     startsWith &self prefix:str -> bool { unsafe { return strStartsWith(self.view(), prefix); } }
     endsWith   &self suffix:str -> bool { unsafe { return strEndsWith(self.view(), suffix); } }
     contains   &self needle:str -> bool { unsafe { return strContains(self.view(), needle); } }
@@ -317,7 +332,7 @@ methods String {
     slice      &self from:long n:long -> str { unsafe { return strSlice(self.view(), from, n); } }
 }
 
-// `==` compares CONTENTS, against either right-hand type: `Eq<str>` covers every literal
+// `==` compares contents, against either right-hand type: `Eq<str>` covers every literal
 // (`s == "while"`), `Eq<String>` two built values. Two distinct implementations of one trait,
 // and the operand picks. `Ord` and `Hash` agree with it, so a String is a map key and sorts.
 methods String for Eq<str> {
@@ -325,6 +340,11 @@ methods String for Eq<str> {
 }
 methods String for Eq<String> {
     eq &self other:String -> bool { unsafe { return strEq(self.view(), other.view()); } }
+}
+// The literal on the left, `"while" == s`: the same comparison, so which side the String is on
+// never decides whether the code compiles.
+methods str for Eq<String> {
+    eq &self other:String -> bool { unsafe { return strEq(self, other.view()); } }
 }
 methods String for Ord {
     cmp &self other:String -> int { unsafe { return strCmp(self.view(), other.view()); } }
@@ -341,10 +361,10 @@ pub stringOf s:str -> String {
 }
 
 // ─── `+` ────────────────────────────────────────────────────────────────────
-// `a + b` APPENDS. The left operand is taken by value, so this is the same buffer coming back
-// out, grown — not a new one — and `a + b + c` costs one allocation's worth of growth rather than
-// two whole strings. `a` is moved by the call, so using it afterwards is a compile error, which is
-// exactly the property that makes reusing its buffer safe.
+// `a + b` appends. The left operand is taken by value, so the result is the same buffer grown in
+// place, and `a + b + c` costs one allocation's worth of growth instead of two new strings. The
+// call moves `a`, so using it afterwards is a compile error, and that is why reusing its buffer
+// is safe.
 //
 // There is deliberately no `Add` for `str`: two views have nowhere to put the result, so
 // `"a" + "b"` stays an error rather than quietly allocating.
@@ -358,7 +378,7 @@ methods String for Add<String> {
 // ─── format ─────────────────────────────────────────────────────────────────
 // `format` is `println` that answers with a String instead of writing to stdout: same
 // placeholders, same arguments, same `Display` impls. One allocation's worth of growth, not one
-// per piece — the String IS the sink, so the formatter appends straight into it.
+// per piece: the String is the sink, so the formatter appends straight into it.
 pub format fmt:str rest:...any -> String {
     s: String;
     // `writeArgs`, not `writeTo`: `rest` is already a collected `[any]`, and handing that to a

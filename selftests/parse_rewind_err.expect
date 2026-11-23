@@ -1,0 +1,8 @@
+selftests/parse_rewind_err.k:13:18: error: expected an expression, found `;`
+   13 |     return p.a + ;
+      |                  ^
+selftests/parse_rewind_err.k:23:40: error: unexpected end of file in a macro declaration
+   23 | macro broken e:long -> long { return e;
+      |                                        ^
+note: a macro needs a body
+2 errors generated.

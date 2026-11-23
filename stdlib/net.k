@@ -137,12 +137,12 @@ methods Ipv6Addr for Display {
         while (i < 8) {
             if (i == bestAt) {
                 putStr(w, "::");
-                i = i + bestLen;
+                i += bestLen;
                 continue;
             }
             if (i > 0 && i != bestAt + bestLen) { putStr(w, ":"); }
             putHex(w, self.segment(i) as u64);
-            i = i + 1;
+            i += 1;
         }
     }
 }
@@ -326,7 +326,7 @@ local hexGroups s:str inout out:[long] at:long v4Ok:bool -> long {
                     if (at + n + 2 > 8) { return -1; }
                     out[at + n] = (v4.bits as long) >> 16;
                     out[at + n + 1] = (v4.bits as long) & 0xffff;
-                    n = n + 2;
+                    n += 2;
                 }
                 Err(e) { return -1; }
             }
@@ -341,7 +341,7 @@ local hexGroups s:str inout out:[long] at:long v4Ok:bool -> long {
             v = v * 16 + d;
         }
         out[at + n] = v;
-        n = n + 1;
+        n += 1;
     }
     return n;
 }
@@ -463,6 +463,7 @@ pub lookupHost host:str -> Result<Vec<IpAddr>, long> {
         out.push(IpAddr.V4(Ipv4Addr.localhost()));
         out.push(IpAddr.V6(Ipv6Addr.localhost()));
     }
+    if (out.len() == 0) { dnsLookup(host, &out); }
     if (out.len() == 0) { return Result.Err(Errno.NoEnt); }
     return Result.Ok(out);
 }
@@ -645,7 +646,7 @@ local sendAll fd:long ptr:long len:long -> long {
         n: long = sendRaw(fd, ptr + off, len - off);
         if (n < 0) { if (off > 0) { return off; } return n; }
         if (n == 0) { return off; }
-        off = off + n;
+        off += n;
     }
     return off;
 }
@@ -671,8 +672,7 @@ local connectOne a:SocketAddr timeoutNs:long -> Result<TcpStream, long> {
     raw: [u8; 28];
     len: long = toRaw(a, &raw[..]);
     if (timeoutNs > 0) {
-        nb: Result<long, long> = setNonblock(fd, true);
-        if (nb.isErr()) { return Result.Err(nb.unwrapErr()); }
+        _ = setNonblock(fd, true)?;
     }
     r: long = 0;
     unsafe { r = syscall3(Syscall.Connect, fd, &raw as long, len); }
@@ -696,8 +696,7 @@ local connectOne a:SocketAddr timeoutNs:long -> Result<TcpStream, long> {
     }
     if (r < 0) { return Result.Err(-r); }
     if (timeoutNs > 0) {
-        nb: Result<long, long> = setNonblock(fd, false);
-        if (nb.isErr()) { return Result.Err(nb.unwrapErr()); }
+        _ = setNonblock(fd, false)?;
     }
     return Result.Ok(s);
 }
@@ -738,7 +737,7 @@ methods TcpStream {
             unsafe { n = recvRaw(self.fd, buf.ptr + got, buf.len - got, 0); }
             if (n < 0) { return Result.Err(-n); }
             if (n == 0) { return Result.Err(0); }
-            got = got + n;
+            got += n;
         }
         return Result.Ok(got);
     }
@@ -823,7 +822,7 @@ methods UnixStream {
             unsafe { n = recvRaw(self.fd, buf.ptr + got, buf.len - got, 0); }
             if (n < 0) { return Result.Err(-n); }
             if (n == 0) { return Result.Err(0); }
-            got = got + n;
+            got += n;
         }
         return Result.Ok(got);
     }
@@ -1032,4 +1031,88 @@ methods UdpSocket {
     intoRawFd self -> long { fd: long = self.fd as long; self.fd = -1; return fd; }
     unsafe fromRawFd fd:long -> UdpSocket { return UdpSocket { fd: fd as int }; }
     close &self -> void { closeFd(self.fd); self.fd = -1; }
+}
+
+// DNS (RFC 1035): ask the nameservers of /etc/resolv.conf over UDP for `host`'s IPv4 addresses
+// (A), then IPv6 (AAAA) if it has none; two seconds per server.
+local dnsLookup host:str inout out:Vec<IpAddr> -> void {
+    conf: Result<String, long> = readFileString("/etc/resolv.conf");
+    if (conf.isErr()) { return; }
+    servers: Vec<Ipv4Addr>;
+    text: String = conf.unwrap();
+    all: str = "";
+    unsafe { all = text.view(); }
+    lines: Vec<str> = strSplit(all, '
+');
+    for line in lines {
+        words: Vec<str> = splitBlank(line);
+        if (words.len() >= 2 && strEq(words.get(0), "nameserver")) {
+            ip: Result<IpAddr, AddrParseError> = parseIp(words.get(1));
+            match ip { Ok(a) { match a { V4(v) { servers.push(v); } _ {} } } Err(e) {} }
+        }
+    }
+    qtypes: [long; 2] = [1, 28];
+    for qt in qtypes {
+        for ns in servers {
+            s: Result<UdpSocket, long> = UdpSocket.bind("0.0.0.0:0");
+            if (s.isErr()) { continue; }
+            sock: UdpSocket = s.unwrap();
+            _ = sock.setReadTimeout(Option.Some(2 * NS_PER_SECOND));
+            if (sock.connect(SocketAddrV4 { ip: ns, port: 53 }).isErr()) { continue; }
+            id: long = (host.len * 7919 + qt * 131) & 0xFFFF;
+            q: [u8; 300];
+            n: long = 0;
+            hdr: [long; 12] = [id >> 8, id & 255, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0];   // recursion desired, one question
+            for h in hdr { q[n] = h as u8; n += 1; }
+            hb: [u8] = host as [u8];
+            start: long = 0;
+            for i in 0..(hb.len + 1) {
+                if (i == hb.len || hb[i] == '.') {
+                    if (i - start > 63 || n + i - start + 6 > 300) { return; }
+                    q[n] = (i - start) as u8; n += 1;
+                    for k in start..i { q[n] = hb[k]; n += 1; }
+                    start = i + 1;
+                }
+            }
+            q[n] = 0; q[n + 1] = 0; q[n + 2] = qt as u8; q[n + 3] = 0; q[n + 4] = 1;
+            n += 5;
+            if (sock.send(q[..n]).isErr()) { continue; }
+            r: [u8; 1500];
+            got: Result<long, long> = sock.recv(&r[..]);
+            if (got.isErr()) { continue; }
+            m: long = got.unwrap();
+            if (m < 12 || ((r[0] as long) << 8 | (r[1] as long)) != id) { continue; }
+            an: long = (r[6] as long) << 8 | (r[7] as long);
+            // past the header and the question, then each answer
+            at: long = 12;
+            at = skipName(r[..m], at) + 4;
+            for k in 0..an {
+                at = skipName(r[..m], at);
+                if (at + 10 > m) { break; }
+                ty: long = (r[at] as long) << 8 | (r[at + 1] as long);
+                len: long = (r[at + 8] as long) << 8 | (r[at + 9] as long);
+                at += 10;
+                if (at + len > m) { break; }
+                if (ty == 1 && len == 4) { out.push(IpAddr.V4(Ipv4Addr.of(r[at] as long, r[at + 1] as long, r[at + 2] as long, r[at + 3] as long))); }
+                if (ty == 28 && len == 16) {
+                    segs: [long; 8];
+                    for i in 0..8 { segs[i] = (r[at + 2 * i] as long) << 8 | (r[at + 2 * i + 1] as long); }
+                    out.push(IpAddr.V6(Ipv6Addr.fromSegments(segs[..])));
+                }
+                at += len;
+            }
+            if (out.len() > 0) { return; }
+        }
+    }
+}
+// Past a (possibly compressed) domain name in a DNS message.
+local skipName b:[u8] at:long -> long {
+    i: long = at;
+    while (i < b.len) {
+        l: long = b[i] as long;
+        if (l == 0) { return i + 1; }
+        if ((l & 0xC0) == 0xC0) { return i + 2; }
+        i += l + 1;
+    }
+    return i;
 }

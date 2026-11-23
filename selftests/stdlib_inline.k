@@ -1,5 +1,5 @@
-// The heap-free containers sized by a length parameter — FixedString<N>, InlineVec<T, N>,
-// RingBuffer<T, N> — and the number buffers sized to exactly what a number prints as. Exits 0
+// The heap-free containers sized by a length parameter (FixedString<N>, InlineVec<T, N>,
+// RingBuffer<T, N>) and the number buffers sized to exactly what a number prints as. Exits 0
 // when every check holds, otherwise the number of the first one that did not.
 #include <stdlib::io>
 #include <stdlib::fixedstring>

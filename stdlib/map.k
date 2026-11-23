@@ -1,20 +1,20 @@
-// HashMap<K, V> — open-addressed with linear probing.
+// HashMap<K, V>: open-addressed with linear probing.
 //
 // Open addressing rather than chaining: no per-entry allocation, and a probe walks forward
 // through contiguous memory instead of chasing pointers. Capacity is a power of two so the
 // bucket index is a mask, and the table rehashes once it is three-quarters full, past which
 // probe sequences get long fast.
 //
-// A removed slot becomes a TOMBSTONE, not an empty one, so a probe can still walk past it to a
+// A removed slot becomes a tombstone, not an empty one, so a probe can still walk past it to a
 // key inserted after the collision. Tombstones count toward the load factor, so a churn-heavy
 // table rehashes and cleans them out.
 //
 // Three parallel typed arrays rather than one array of {state, key, value}: no padding
 // questions between a K and a V of different sizes, and a probe walks a byte-per-slot state
-// array — 64 slots per cache line — instead of striding over whole entries.
+// array (64 slots per cache line) instead of striding over whole entries.
 //
-// HOW KEYS ARE COMPARED. The key type answers for itself: `Hash` gives the bucket and `==`
-// decides a match, so `str` keys work — they hash and compare by CONTENT, where hashing the
+// How keys are compared. The key type answers for itself: `Hash` gives the bucket and `==`
+// decides a match, so `str` keys work: they hash and compare by content, where hashing the
 // bytes of the {ptr, len} header would have made two equal strings at different addresses miss
 // each other. A scalar compares natively and a plain struct derives its `==`, so neither has
 // anything to write.
@@ -25,10 +25,10 @@
 //     println("{}", m.getOr(99, -1));   // absent -> the fallback
 //     f: Option<long> = m.find(2);      // absent -> None
 //
-//     names: HashMap<str, long>;        // and this one now means what it reads as
+//     names: HashMap<str, long>;        // str keys compare by content
 //     names.put("gamma", 3);
 //
-// And written as a literal, `map![k => v, ...]` -- see the macro at the end of this file:
+// And written as a literal, `map![k => v, ...]` (the macro is at the end of this file):
 //
 //     ranks: HashMap<str, long> = map!["gamma" => 3, "delta" => 4];
 //     none:  HashMap<str, long> = map![];
@@ -45,15 +45,21 @@ local enum Probe {
     NoRoom              // no capacity at all, or every slot walked without finding either
 }
 
-// One byte per slot: a probe stops at Empty, walks past Tomb, compares at Full. Empty is 0 so
-// a fresh state array is a zero fill.
-local enum SlotState: u8 { Empty, Full, Tomb }
+// One byte per slot: a probe stops at an empty one, walks past a tombstone, and at a full one
+// compares keys. A full slot's byte is 0x80 with the top seven bits of its key's hash below it,
+// so the keys are compared only when those match: a different key is passed over 127 times in
+// 128 without calling its `==`, which for a `str` key is a byte compare. Empty is 0 so a fresh
+// state array is a zero fill.
+local SLOT_EMPTY: u8 = 0;
+local SLOT_TOMB: u8 = 1;
+local slotTag h:u64 -> u8 { return ((h >> 57) as u8) | 128; }
+local isFullSlot s:u8 -> bool { return s >= 128; }
 
-// The bound sits on the STRUCT, not on the methods block, so a key type without `Hash` is
-// refused where it is named — a block-level bound would instead quietly drop every method and
+// The bound sits on the struct, not on the methods block, so a key type without `Hash` is
+// refused where it is named. A block-level bound would instead quietly drop every method and
 // report a missing `put` much later.
 pub struct HashMap<K: Hash, V> {
-    states: *u8,    // cap bytes, one SlotState per slot
+    states: *u8,    // cap bytes: SLOT_EMPTY, SLOT_TOMB, or a full slot's hash tag
     keys:   *K,     // cap keys
     vals:   *V,     // cap values
     cap:    long,   // 0, or a power of two
@@ -65,7 +71,7 @@ pub struct HashMap<K: Hash, V> {
 // as a Vec because a call has one variadic; the values are it.
 pub mapOf<K: Hash, V: Copy> sink keys:Vec<K> vals:...V -> HashMap<K, V> {
     m: HashMap<K, V>;
-    if (keys.len() != vals.len) { panic("mapOf: as many keys as values"); }
+    if (keys.len() != vals.len) { panic("mapOf: keys and values have different lengths"); }
     m.reserve(vals.len);
     while (keys.len() > 0) {
         i: long = keys.len() - 1;
@@ -95,8 +101,8 @@ methods HashMap<K, V> for Drop {
     }
 }
 
-// Any key and value type. An entry is reached in place -- `m[k]`, `keyAt(i)`, `valAt(i)` are
-// borrows -- and moved in by `put`; only the accessors that hand out a COPY (`get`, `getOr`,
+// Any key and value type. An entry is reached in place (`m[k]`, `keyAt(i)`, `valAt(i)` are
+// borrows) and moved in by `put`; only the accessors that hand out a copy (`get`, `getOr`,
 // `find`) ask for `Copy`, further down.
 methods HashMap<K, V> {
     len     &self -> long { return self.count; }
@@ -107,7 +113,7 @@ methods HashMap<K, V> {
     // slots that are not occupied.
     occupied &self i:long -> bool {
         if (i < 0 || i >= self.cap) { return false; }
-        unsafe { return self.states[i] == SlotState.Full; }
+        unsafe { return isFullSlot(self.states[i]); }
     }
     // The first live slot after `i`, or -1 when there is none: `nextSlot(-1)` is the first. The
     // walk without testing every empty slot by hand:
@@ -119,40 +125,42 @@ methods HashMap<K, V> {
         if (j < 0) { j = 0; }
         while (j < self.cap) {
             if (self.occupied(j)) { return j; }
-            j = j + 1;
+            j += 1;
         }
         return -1;
     }
     keyAt &self i:long -> &K {
-        if (!self.occupied(i)) { panicIndex("HashMap.keyAt: slot is not occupied", i, self.cap); }
+        if (!self.occupied(i)) { panicState("HashMap.keyAt", "slot is empty"); }
         unsafe { return self.keys[i]; }
     }
     valAt &self i:long -> &V {
-        if (!self.occupied(i)) { panicIndex("HashMap.valAt: slot is not occupied", i, self.cap); }
+        if (!self.occupied(i)) { panicState("HashMap.valAt", "slot is empty"); }
         unsafe { return self.vals[i]; }
     }
 
     // A tombstone seen on the way is remembered and preferred over the empty slot the walk
     // ends at, so repeated insert/remove of one key reuses its slot instead of drifting.
-    probe &self k:K -> Probe {
+    probe &self k:K -> Probe { return self.probeHash(k, k.hash()); }
+    // The same, for a caller that already has the key's hash.
+    probeHash &self k:K h:u64 -> Probe {
         if (self.cap == 0) { return Probe.NoRoom; }
 
         mask: long = self.cap - 1;
         firstTomb: long = -1;
-        h: u64 = k.hash();
-        idx: long = (h as long) & mask;      // cap is a power of two, so the mask IS the modulo
+        tag: u8 = slotTag(h);
+        idx: long = (h as long) & mask;      // cap is a power of two, so the mask is the modulo
 
         for n in 0..self.cap {
             st: u8 = 0;
             unsafe { st = self.states[idx]; }
-            if (st == SlotState.Empty) {
+            if (st == SLOT_EMPTY) {
                 if (firstTomb >= 0) { return Probe.Vacant(firstTomb); }
                 return Probe.Vacant(idx);
             }
-            if (st == SlotState.Tomb) {
+            if (st == SLOT_TOMB) {
                 if (firstTomb < 0) { firstTomb = idx; }
             }
-            else {
+            else if (st == tag) {
                 unsafe { if (self.keys[idx] == k) { return Probe.Found(idx); } }
             }
             idx = (idx + 1) & mask;
@@ -162,7 +170,7 @@ methods HashMap<K, V> {
     }
 
     // Grow to at least `need` slots (power of two, minimum 8) and rehash, dropping tombstones
-    // on the way — which is what keeps a churn-heavy table fast.
+    // on the way, which is what keeps a churn-heavy table fast.
     rehash &self need:long -> void {
         ncap: long = 8;
         while (ncap < need) { ncap = ncap * 2; }
@@ -176,13 +184,25 @@ methods HashMap<K, V> {
             self.states = malloc(ncap) as *u8;
             self.keys   = malloc(ncap * sizeof(K)) as *K;
             self.vals   = malloc(ncap * sizeof(V)) as *V;
-            memset(self.states, SlotState.Empty as long, ncap);
+            memset(self.states, SLOT_EMPTY as long, ncap);
             self.cap    = ncap;
             self.count  = 0;
             self.dead   = 0;
 
-            for i in 0..oldCap {                             // re-insert every live entry
-                if (oldStates[i] == SlotState.Full) { self.put(oldKeys[i], oldVals[i]); }
+            // Move every live entry over. The keys are known to differ and the new table has
+            // no tombstones, so each goes in the first empty slot from its home: where `put`
+            // would put it, without comparing any keys on the way. Its tag comes along.
+            mask: long = ncap - 1;
+            for i in 0..oldCap {
+                st: u8 = oldStates[i];
+                if (isFullSlot(st)) {
+                    idx: long = (oldKeys[i].hash() as long) & mask;
+                    while (self.states[idx] != SLOT_EMPTY) { idx = (idx + 1) & mask; }
+                    self.states[idx] = st;
+                    self.keys[idx] = oldKeys[i];
+                    self.vals[idx] = oldVals[i];
+                    self.count += 1;
+                }
             }
             if (oldCap > 0) {
                 free(oldStates);
@@ -200,17 +220,17 @@ methods HashMap<K, V> {
 
     // Insert, or overwrite the value if the key is already there.
     put &self k:K v:V -> void {
-        // Three-quarters full, counting tombstones, is when probe sequences start to get long.
-        // But WHICH of the two filled it decides what to do: more room only helps if live
-        // entries need it, so when tombstones are what crossed the line, rehash at the SAME
-        // capacity to sweep them out. Doubling instead would answer churn by taking memory it
-        // already had — a table holding 49 keys reached 2048 slots that way.
+        // Probe sequences get long once the table is three-quarters full, counting tombstones.
+        // If live entries pushed it over, grow. If tombstones did, rehash at the same capacity
+        // to sweep them out; doubling there would let a table with steady churn keep growing
+        // without ever holding more keys.
         if ((self.count + self.dead + 1) * 4 > self.cap * 3) {
             if ((self.count + 1) * 4 > self.cap * 3) { self.rehash(self.cap * 2 + 8); }
             else                                     { self.rehash(self.cap); }
         }
 
-        pr: Probe = self.probe(k);
+        h: u64 = k.hash();
+        pr: Probe = self.probeHash(k, h);
         match pr {
             Found(fi)  {
                 unsafe {
@@ -220,14 +240,14 @@ methods HashMap<K, V> {
             }
             Vacant(vi) {
                 unsafe {
-                    if (self.states[vi] == SlotState.Tomb) { self.dead = self.dead - 1; }
+                    if (self.states[vi] == SLOT_TOMB) { self.dead = self.dead - 1; }
                     self.keys[vi]   = k;
-                    self.states[vi] = SlotState.Full;
+                    self.states[vi] = slotTag(h);
                     self.vals[vi]   = v;
                 }
-                self.count = self.count + 1;
+                self.count += 1;
             }
-            NoRoom { panicState("HashMap.put", "the table is full and could not grow"); }
+            NoRoom { panicState("HashMap.put", "table is full and cannot grow"); }
         }
     }
 
@@ -248,9 +268,9 @@ methods HashMap<K, V> {
                 unsafe {
                     goneK: K = self.keys[ri];            // moved out: this scope releases them
                     goneV: V = self.vals[ri];
-                    self.states[ri] = SlotState.Tomb;
+                    self.states[ri] = SLOT_TOMB;
                 }
-                self.count = self.count - 1;
+                self.count -= 1;
                 self.dead  = self.dead + 1;
                 return true;
             }
@@ -268,9 +288,9 @@ methods HashMap<K, V> {
                 unsafe {
                     goneK: K = self.keys[ri];
                     v = self.vals[ri];
-                    self.states[ri] = SlotState.Tomb;
+                    self.states[ri] = SLOT_TOMB;
                 }
-                self.count = self.count - 1;
+                self.count -= 1;
                 self.dead  = self.dead + 1;
                 return Option.Some(v);
             }
@@ -282,26 +302,26 @@ methods HashMap<K, V> {
     clear &self -> void {
         unsafe {
             for i in 0..self.cap {
-                if (self.states[i] == SlotState.Full) {
+                if (isFullSlot(self.states[i])) {
                     goneK: K = self.keys[i];
                     goneV: V = self.vals[i];
                 }
             }
-            if (self.cap > 0) { memset(self.states, SlotState.Empty as long, self.cap); }
+            if (self.cap > 0) { memset(self.states, SLOT_EMPTY as long, self.cap); }
         }
         self.count = 0;
         self.dead  = 0;
     }
 }
 
-// `m[k]` is a borrow of the value, trapping if the key is absent -- the in-place form of
+// `m[k]` is a borrow of the value, trapping if the key is absent. It is the in-place form of
 // `get`, and the one that works for an owning V. `m[k] = v` is `put`.
 methods HashMap<K, V> for Index<K, V> {
     at &self k:K -> &V {
         pr: Probe = self.probe(k);
         match pr {
             Found(gi) { unsafe { return self.vals[gi]; } }
-            _         { panicState("HashMap.at", "no such key — use find or has"); }
+            _         { panicState("HashMap.at", "key not found"); }
         }
     }
 }
@@ -309,7 +329,7 @@ methods HashMap<K, V> for IndexSet<K, V> {
     setAt &self k:K v:V -> void { self.put(k, v); }
 }
 
-// Reading a value OUT hands out a copy, which only a Copy value has to give.
+// Reading a value out hands out a copy, which only a Copy value has to give.
 // A deep copy (see Vec's Clone for why it has to be written out).
 methods HashMap<K: Clone, V: Clone> for Clone {
     clone &self -> HashMap<K, V> {
@@ -325,14 +345,13 @@ methods HashMap<K: Clone, V: Clone> for Clone {
 }
 
 methods HashMap<K, V: Copy> {
-    // THE lookup: absence is an ordinary outcome for a map, and this is the accessor that can
-    // say so without trapping or being handed a value of V to stand in for "not there". `get`
-    // and `getOr` predate it and stay because each is shorter when you know the key is there
-    // or you have a real default.
+    // The general lookup. A missing key is a normal outcome for a map, and this reports it
+    // without trapping and without needing a stand-in value of V. `get` and `getOr` are shorter
+    // when you know the key is there or have a real default.
     //
     // Every method of a generic type is stamped per instantiation whether it is called or not,
-    // so this instantiates `Option<V>` for every map in the program. Worth it here, unlike
-    // Result's conversions: reporting absence is a map's primary operation, not a side trip.
+    // so this instantiates `Option<V>` for every map in the program. That cost is worth paying
+    // here, because reporting a missing key is central to what a map does.
     find &self k:K -> Option<V> {
         pr: Probe = self.probe(k);
         match pr {
@@ -346,7 +365,7 @@ methods HashMap<K, V: Copy> {
         pr: Probe = self.probe(k);
         match pr {
             Found(gi) { unsafe { return self.vals[gi]; } }
-            _         { panicState("HashMap.get", "no such key — use find, has or getOr"); }
+            _         { panicState("HashMap.get", "key not found"); }
         }
     }
 
@@ -362,7 +381,7 @@ methods HashMap<K, V: Copy> {
     values &self -> Vec<V> {
         out: Vec<V>;
         out.reserve(self.count);
-        unsafe { for i in 0..self.cap { if (self.states[i] == SlotState.Full) { out.push(self.vals[i]); } } }
+        unsafe { for i in 0..self.cap { if (isFullSlot(self.states[i])) { out.push(self.vals[i]); } } }
         return out;
     }
 }
@@ -372,7 +391,7 @@ methods HashMap<K: Copy, V> {
     keys &self -> Vec<K> {
         out: Vec<K>;
         out.reserve(self.count);
-        unsafe { for i in 0..self.cap { if (self.states[i] == SlotState.Full) { out.push(self.keys[i]); } } }
+        unsafe { for i in 0..self.cap { if (isFullSlot(self.states[i])) { out.push(self.keys[i]); } } }
         return out;
     }
 }
@@ -392,10 +411,10 @@ pub macro map src:str -> Node {
     vals: Vec<str>;
     for pair in pieces {
         at: long = arrowAt(pair);
-        if (at < 0) { panic("map!: an element is `key => value`"); }
+        if (at < 0) { panic("map!: expected `key => value`"); }
         after: long = at + 1;
         while (charAt(pair, after) != '>') { after = after + 1; }
-        after = after + 1;
+        after += 1;
         keys.push(strTrim(strSlice(pair, 0, at)));
         vals.push(strTrim(strSlice(pair, after, pair.len - after)));
     }
@@ -423,7 +442,7 @@ local arrowAt s:str -> long {
             while (j < s.len && charAt(s, j) == ' ') { j = j + 1; }
             if (j < s.len && charAt(s, j) == '>') { return i; }
         }
-        i = i + 1;
+        i += 1;
     }
     return -1;
 }

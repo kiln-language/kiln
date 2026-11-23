@@ -1,9 +1,9 @@
-// Pool<T> — a generational arena: the value-semantics way to build graphs.
+// Pool<T>: a generational arena: the value-semantics way to build graphs.
 //
-// Linked structures need many handles to the same node, which is exactly what safe references
-// cannot express. A Pool sidesteps references: nodes live in one growable arena and are named
-// by HANDLES — plain Copy {index, generation} values that can be stored in fields, passed
-// around and duplicated freely. Safety is the generation check (the slotmap design):
+// Linked structures need many handles to the same node, and safe references cannot express
+// that. A Pool avoids references: nodes live in one growable arena and are named by handles,
+// plain Copy {index, generation} values that can be stored, passed and duplicated freely.
+// Safety comes from a generation check, as in a slotmap:
 //
 //   - each slot carries a generation counter: even = vacant, odd = live;
 //   - alloc bumps it even->odd and returns Handle { idx, that generation };
@@ -20,7 +20,7 @@
 //     nodes: Pool<int>;                    // Default: an empty pool
 //     h: Handle = nodes.alloc(42);
 //     nodes.free(h);
-//     nodes.get(h);                        // TRAP: stale generation
+//     nodes.get(h);                        // trap: stale generation
 #include <{core, panic, heap, mem}>
 
 // A handle that names nothing live. Each cause is reported separately, because which one it
@@ -69,8 +69,7 @@ methods Pool<T> {
     unsafe headAt &self idx:long -> *SlotHead { return self.slotAt(idx) as *SlotHead; }
     unsafe valueAt &self idx:long -> *T { return (self.slotAt(idx) + SLOT_HEAD) as *T; }
 
-    // Doubling growth. Slots keep their indices, so every outstanding handle stays valid —
-    // which is the point of naming nodes by index.
+    // Doubling growth. Slots keep their indices, so every outstanding handle stays valid.
     grow &self -> void {
         stride: long = self.stride();
         ncap: long = self.cap * 2;
@@ -84,7 +83,7 @@ methods Pool<T> {
         self.cap = ncap;
     }
 
-    // Claim a slot — free list first, then fresh — store v, and name it.
+    // Claim a slot (free list first, then fresh), store v, and name it.
     alloc &self v:T -> Handle {
         idx: long = 0;
         if (self.freeHead != 0) {
@@ -93,7 +92,7 @@ methods Pool<T> {
         } else {
             if (self.len == self.cap) { self.grow(); }
             idx = self.len;
-            self.len = self.len + 1;
+            self.len += 1;
         }
         g: long = 0;
         unsafe {
@@ -109,14 +108,14 @@ methods Pool<T> {
     // Validate a handle and hand back its payload pointer, so a caller reads or writes it with
     // one typed access. Traps on anything stale or malformed.
     unsafe check &self h:Handle -> *T {
-        if (h.idx < 0 || h.idx >= self.len) { panicIndex("Pool.check: handle", h.idx, self.len); }
-        if (h.gen % 2 == 0)    { poolStale("the handle was never live (a live generation is odd)"); }
-        if (self.headAt(h.idx).gen != h.gen) { poolStale("the slot was freed, and may already hold something else"); }
+        if (h.idx < 0 || h.idx >= self.len) { panicIndex("Pool.check", h.idx, self.len); }
+        if (h.gen % 2 == 0)    { poolStale("invalid handle"); }
+        if (self.headAt(h.idx).gen != h.gen) { poolStale("stale handle: slot was freed"); }
         return self.valueAt(h.idx);
     }
 
-    // Does `h` name a live node of this pool? The question `check` asks, answered instead of
-    // trapped on: for a cache of handles that may have gone stale on purpose.
+    // Does `h` name a live node of this pool? The same test `check` makes, but it returns false
+    // instead of trapping, for callers holding handles that may legitimately have gone stale.
     isLive &self h:Handle -> bool {
         if (h.idx < 0 || h.idx >= self.len || h.gen % 2 == 0) { return false; }
         unsafe { return self.headAt(h.idx).gen == h.gen; }
@@ -159,7 +158,7 @@ methods Pool<T> {
         n: long = self.len;
         f: long = self.freeHead;
         while (f != 0) {
-            n = n - 1;
+            n -= 1;
             unsafe { f = self.headAt(f - 1).next; }
         }
         return n;

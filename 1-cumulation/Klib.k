@@ -5,7 +5,7 @@
 // no symbol is defined in it. The metadata says what the package is and everything a dependent
 // needs in place of compiling it again. A text header, then a binary body:
 //
-//     kiln-klib 4                         the format, refused unless exact
+//     kiln-klib 9                         the format, refused unless exact
 //     package <name>   key <hex>          what was built, and from what (the content key)
 //     dep <name> <key>                    each direct dependency, and the key it was built against
 //     extra <path>                        a module read from below the package's root directory
@@ -23,12 +23,14 @@
 //                 is linked by, what it was compiled against, and its facts
 //     IR          the optimized IR of what it exports that an inliner would copy, by link label
 //                 (`codegen::irpack`), for a dependent to inline
+//     EFFECTS     what each function it exports may write, by link label (`codegen::effects`),
+//                 for a dependent's `flow.k` to keep what a call to one cannot reach
 //     POISON      the globals a startup initializer may write
 //     IMAGES      the folded globals' images: bytes, and where the pointers in them are
 //     MODDIR      per module, in the order its compile scanned them: its path, package and
 //                 includes, whether it declares a macro, and where its section is in MODULES
 //     MODULES     the module sections (`KlibTree`): each module's tree as its parser produced it
-//                 -- registry operations, declarations, facts, bodies -- so a dependent neither
+//                 (registry operations, declarations, facts, bodies), so a dependent neither
 //                 scans, preprocesses, lexes nor parses any of this package's files
 //
 // The body is hashed once as a whole, and checked when it is read, so the readers after that
@@ -37,10 +39,10 @@
 #include <transform::facts>
 #include <parse::upstream>
 #include <pre::Preprocessor>
-#include <codegen::{asm, irpack}>
+#include <codegen::{asm, irpack, effects}>
 #include <stdlib::{encode, file, textfile, chars, map, option, result, string, vec, hash128, sort}>
 
-pub KLIB_FORMAT: str = "kiln-klib 4";
+pub KLIB_FORMAT: str = "kiln-klib 9";
 pub KLIB_META: str = "kiln.meta";
 
 // The chunk tags. A reader skips a tag it does not know, so a later format can add one.
@@ -56,6 +58,7 @@ pub CHUNK_MODULES: long = 9;
 pub CHUNK_NAMEINDEX: long = 10;      // reserved: a name-to-declaration index (part 3)
 pub CHUNK_INSTFNS: long = 11;
 pub CHUNK_IR: long = 12;
+pub CHUNK_EFFECTS: long = 13;
 // A module section's (`KlibTree`).
 pub CHUNK_OPS: long = 20;
 pub CHUNK_DECLS: long = 21;
@@ -148,43 +151,199 @@ local metaMember inout f:File limit:long -> Result<String, long> {
 
 local asText b:[u8] -> str { return b as str; }
 
+// ─── whether a `.klib` can be used ───────────────────────────────────────────
+
+// Whether a `.klib` can be used as it is, and if not, why, as a phrase that reads after "its
+// cached .klib" or "it": "is damaged (...)", "was written in another format (...)". A value, not
+// an error: a build rebuilds the package from its source and says why (`Build.k`). Only a compile
+// handed one it cannot use stops, since it has no source to rebuild from (`cannotUse`).
+pub struct KlibCheck { ok: bool, why: String }
+
+pub klibUsable -> KlibCheck { return KlibCheck { ok: true, why: stringOf("") }; }
+pub klibDamaged what:String -> KlibCheck { return KlibCheck { ok: false, why: format("is damaged ({})", what) }; }
+
+// What a failed read of the archive says (`metaMember`'s answers).
+local klibUnreadable e:long -> KlibCheck {
+    if (e == 8) { return klibDamaged(stringOf("it is not an archive")); }
+    if (e == 2) { return klibDamaged(stringOf("it has no `kiln.meta` member")); }
+    if (e == 5) { return klibDamaged(stringOf("it is cut short inside its metadata")); }
+    return KlibCheck { ok: false, why: format("cannot be read (errno {})", e) };
+}
+
+// The metadata's first line: this compiler's format, another's, or nothing a compiler wrote.
+local formatCheck first:str -> KlibCheck {
+    if (first == KLIB_FORMAT) { return klibUsable(); }
+    if (strStartsWith(first, "kiln-klib ") && first.len < 32) {
+        return KlibCheck { ok: false, why: format("was written in another format (`{}`; this compiler reads `{}`)", first, KLIB_FORMAT) };
+    }
+    return klibDamaged(stringOf("its metadata does not start with a `kiln-klib` line"));
+}
+
+// A `.klib` that this compile was handed and cannot use. A build would rebuild the package from
+// its source; a compile has none, so it stops, naming the file and why.
+pub cannotUse name:str path:str c:KlibCheck -> never {
+    failStr(format("cannot use `{}` for package `{}`: it {}\nhelp: rebuild it with `kilnc build`", path, name, c.why));
+}
+
+// The header of a `.klib`'s metadata: what the package is, what it was built against, and its
+// body, which the header's hash has been checked against.
+pub struct KlibHead { name: str, key: str, init: str, entry: bool, deps: Vec<KlibDep>, body: str }
+
+pub klibHeadOf -> KlibHead {
+    return KlibHead { name: "", key: "", init: "", entry: false, deps: vec![], body: "" };
+}
+
+// The metadata `text` read into `h` and checked: its format, every header line up to the body,
+// and the body's length and hash. The views in `h` are of `text`.
+pub readKlibHead text:str inout h:KlibHead -> KlibCheck {
+    m: MetaIn = metaIn(text);
+    f: KlibCheck = formatCheck(m.restOfLine());
+    if (!f.ok) { return f; }
+    going: bool = true;
+    while (going) {
+        if (m.atEnd()) { m.bad(stringOf("`body`")); going = false; continue; }
+        w: str = m.word();
+        if (w == "package") { h.name = keep(m.text0()); }
+        else if (w == "key") { h.key = keep(m.word()); }
+        else if (w == "dep") {
+            dn: str = keep(m.text0());
+            dk: str = keep(m.word());
+            h.deps.push(KlibDep { name: dn, key: dk });
+        }
+        else if (w == "extra") { m.text0(); }
+        else if (w == "init") {
+            s: Sym = m.name();
+            if (s != NO_SYM) { h.init = nameOf(s); }
+        }
+        else if (w == "entry") { h.entry = m.num() != 0; }
+        else if (w == "body") {
+            n: long = m.num();
+            want: str = m.word();
+            h.body = m.blob(n);
+            if (m.ok()) {
+                hh: Hash128 = hash128Str(h.body);
+                got: String = hh.hex();
+                same: bool = false;
+                unsafe { same = got.view() == want; }
+                if (!same) { return klibDamaged(stringOf("its body does not hash to what its header says")); }
+            }
+            going = false;
+        }
+        else { m.bad(format("a header line, found `{}`", w)); }
+    }
+    if (!m.ok()) { return klibDamaged(format("its header is malformed: {}", m.why)); }
+    return klibUsable();
+}
+
+// A cached `.klib` checked as a build trusts it: an archive every member of which is whole, whose
+// metadata's header and body hold together (`readKlibHead`). The object is measured, not read.
+pub checkKlib path:str -> KlibCheck {
+    st: Result<Metadata, long> = metadata(path);
+    size: long = 0;
+    match st {
+        Ok(md) { size = md.size; }
+        Err(e) { return KlibCheck { ok: false, why: format("cannot be read (errno {})", e) }; }
+    }
+    f: Result<File, long> = File.openRead(path);
+    match f {
+        Err(e) { return KlibCheck { ok: false, why: format("cannot be read (errno {})", e) }; }
+        Ok(file) {
+            meta: String;
+            c: KlibCheck = walkArchive(&file, size, &meta);
+            file.close();
+            if (!c.ok) { return c; }
+            h: KlibHead = klibHeadOf();
+            v: str = "";
+            unsafe { v = meta.view(); }
+            return readKlibHead(v, &h);
+        }
+    }
+    return klibUsable();
+}
+
+// Every member of the archive `f` (`size` bytes) whole, and the metadata member's bytes into
+// `meta`. An `ar` archive is an 8-byte magic, then per member a 60-byte header (the name in its
+// first 16 bytes, the decimal size at 48) and the data, padded to an even length.
+local walkArchive inout f:File size:long inout meta:String -> KlibCheck {
+    head: [u8; 60];
+    n: long = 0;
+    unsafe { n = f.readInto(&head, 8); }
+    if (n != 8 || !(asText(head[0..8]) == "!<arch>\n")) { return klibDamaged(stringOf("it is not an archive")); }
+    at: long = 8;
+    found: bool = false;
+    while (at < size) {
+        f.seek(at, Seek.Set);
+        unsafe { n = f.readInto(&head, 60); }
+        if (n != 60) { return klibDamaged(format("it is cut short at {} bytes, inside a member's header", size)); }
+        msize: long = 0;
+        k: long = 48;
+        while (k < 58 && head[k] >= '0' && head[k] <= '9') { msize = msize * 10 + (head[k] as long) - '0'; k = k + 1; }
+        name: str = memberName(asText(head[0..16]));
+        if (at + 60 + msize > size) {
+            return klibDamaged(format("it is cut short: member `{}` holds {} bytes, of which {} are there", name, msize, size - at - 60));
+        }
+        if (name == KLIB_META) {
+            meta.reserve(msize);
+            got: long = 0;
+            unsafe { got = f.readInto(meta.buf as long, msize); }
+            if (got != msize) { return KlibCheck { ok: false, why: format("cannot be read (only {} of its metadata's {} bytes)", got, msize) }; }
+            meta.len = msize;
+            found = true;
+        }
+        at = at + 60 + msize + (msize & 1);
+    }
+    if (!found) { return klibDamaged(stringOf("it has no `kiln.meta` member")); }
+    return klibUsable();
+}
+
+// A member's name as `ar` pads it: blanks after, and a `/` ending it in the GNU format.
+local memberName raw:str -> str {
+    n: long = raw.len;
+    while (n > 0 && charAt(raw, n - 1) == ' ') { n = n - 1; }
+    if (n > 0 && charAt(raw, n - 1) == '/') { n = n - 1; }
+    return strSlice(raw, 0, n);
+}
+
 // What a build needs to know before trusting a cached `.klib`: that its format is this one, its
 // key, whether it holds the program's entry point, and which files beyond its root directory's
 // own the compile read (a module in a subdirectory that one of them includes), whose bytes are
 // in the key too. All in the header, ahead of the modules. A file that is missing, damaged or of
-// another format answers `ok: false`, and is rebuilt.
-pub struct KlibHeader { ok: bool, key: String, entry: bool, extras: Vec<str> }
+// another format answers `ok: false`, and is rebuilt; `present` and `why` say whether there was
+// one, and what is wrong with it.
+pub struct KlibHeader { ok: bool, present: bool, why: String, key: String, entry: bool, extras: Vec<str> }
 
 pub readKlibHeader path:str -> KlibHeader {
-    none: KlibHeader = KlibHeader { ok: false, key: stringOf(""), entry: false, extras: vec![] };
+    out: KlibHeader = KlibHeader { ok: false, present: fileExists(path), why: stringOf(""), key: stringOf(""),
+                                   entry: false, extras: vec![] };
+    if (!out.present) { return out; }
     // The header is the first thing in the member, and a few hundred bytes long.
     meta: Result<String, long> = readKlibMetaUpTo(path, 65536);
     match meta {
-        Err(_) { return none; }
+        Err(e) { u: KlibCheck = klibUnreadable(e); out.why = u.why; return out; }
         Ok(text) {
             v: str = "";
             unsafe { v = text.view(); }
-            if (!strStartsWith(v, KLIB_FORMAT) || charAt(v, KLIB_FORMAT.len) != '\n') { return none; }
-            m: MetaIn = metaIn(v, path);
-            m.restOfLine();
-            key: String;
-            entry: bool = false;
-            extras: Vec<str>;
-            loop {
-                if (m.atEnd()) { return none; }
+            m: MetaIn = metaIn(v);
+            f: KlibCheck = formatCheck(m.restOfLine());
+            if (!f.ok) { out.why = f.why; return out; }
+            going: bool = true;
+            while (going) {
+                if (m.atEnd()) { m.bad(stringOf("`entry`")); going = false; continue; }
                 w: str = m.word();
-                if (w == "package" || w == "dep") { m.text0(); if (w == "dep") { m.word(); } continue; }
-                if (w == "key") { key.pushStr(m.word()); continue; }
-                if (w == "extra") { extras.push(keep(m.text0())); continue; }
-                if (w == "init") { m.name(); continue; }
-                if (w == "entry") { entry = m.num() != 0; break; }
-                return none;
+                if (w == "package" || w == "dep") { m.text0(); if (w == "dep") { m.word(); } }
+                else if (w == "key") { out.key.pushStr(m.word()); }
+                else if (w == "extra") { out.extras.push(keep(m.text0())); }
+                else if (w == "init") { m.name(); }
+                else if (w == "entry") { out.entry = m.num() != 0; going = false; }
+                else { m.bad(format("a header line, found `{}`", w)); }
             }
-            if (key.length() == 0) { return none; }
-            return KlibHeader { ok: true, key: key, entry: entry, extras: extras };
+            if (!m.ok()) { u: KlibCheck = klibDamaged(format("its header is malformed: {}", m.why)); out.why = u.why; return out; }
+            if (out.key.length() == 0) { u: KlibCheck = klibDamaged(stringOf("its header has no key")); out.why = u.why; return out; }
+            out.ok = true;
+            return out;
         }
     }
-    return none;
+    return out;
 }
 
 // ─── the key ─────────────────────────────────────────────────────────────────
@@ -267,64 +426,36 @@ pub loadKlib name:str path:str -> void {
     text: str = "";
     match meta {
         Ok(t)  { text = holdSource(t); }
-        Err(e) { failStr(format("cannot read {} for package '{}' (errno {})", path, name, e)); }
+        Err(e) { cannotUse(name, path, klibUnreadable(e)); }
     }
-    m: MetaIn = metaIn(text, path);
-    first: str = m.restOfLine();
-    if (!(first == KLIB_FORMAT)) {
-        failStr(format("{} is not a {} archive (it says '{}') -- it was written by a different compiler; rebuild it", path, KLIB_FORMAT, first));
+    h: KlibHead = klibHeadOf();
+    c: KlibCheck = readKlibHead(text, &h);
+    if (!c.ok) { cannotUse(name, path, c); }
+    if (!(h.name == name)) {
+        failStr(format("`{}` holds package `{}`, not `{}`", path, h.name, name));
     }
-    info: KlibInfo = KlibInfo { name: "", key: "", path: keep(path), init: "", entry: false,
-                                firstDep: gKlibDeps.len(), depCount: 0,
-                                body: "", symBase: gSymIn.len(), symCount: 0,
+    info: KlibInfo = KlibInfo { name: h.name, key: h.key, path: keep(path), init: h.init, entry: h.entry,
+                                firstDep: gKlibDeps.len(), depCount: h.deps.len(),
+                                body: h.body, symBase: gSymIn.len(), symCount: 0,
                                 imageBase: gFacts.images.len(), modulesAt: 0 };
-    loop {
-        if (m.atEnd()) { m.bad(stringOf("`body`")); }
-        w: str = m.word();
-        if (w == "package") { info.name = keep(m.text0()); continue; }
-        if (w == "key") { info.key = keep(m.word()); continue; }
-        if (w == "dep") {
-            dn: str = keep(m.text0());
-            dk: str = keep(m.word());
-            gKlibDeps.push(KlibDep { name: dn, key: dk });
-            info.depCount = info.depCount + 1;
-            continue;
-        }
-        if (w == "extra") { m.text0(); continue; }
-        if (w == "init") {
-            s: Sym = m.name();
-            if (s != NO_SYM) { info.init = nameOf(s); }
-            continue;
-        }
-        if (w == "entry") { info.entry = m.num() != 0; continue; }
-        if (w == "body") {
-            n: long = m.num();
-            want: str = m.word();
-            info.body = m.blob(n);
-            h: Hash128 = hash128Str(info.body);
-            got: String = h.hex();
-            unsafe { if (!(got.view() == want)) { failStr(format("{}: damaged .klib metadata (its body does not hash to what its header says) -- rebuild it", path)); } }
-            break;
-        }
-        m.bad(format("a header line, found '{}'", w));
-    }
-    if (!(info.name == name)) {
-        failStr(format("{} holds package '{}', not '{}'", path, info.name, name));
-    }
-    readKlibBody(&info, gKlibs.len());
+    gKlibDeps.extend(h.deps);
+    b: KlibCheck = readKlibBody(&info, gKlibs.len());
+    if (!b.ok) { cannotUse(name, path, b); }
     gUpstreamPkgs.put(info.name, true);
     gKlibs.push(info);
 }
 
 // The package-wide chunks of a body: names, exports, instances, the facts that are not per
 // module, and the module directory. A module's own section is read when the scan reaches it.
-local readKlibBody inout info:KlibInfo index:long -> void {
-    d: Decoder = decoderOf(info.body as [u8]);
+local readKlibBody inout info:KlibInfo index:long -> KlibCheck {
+    d: Decoder;
+    unsafe { d = decoderOf(info.body as [u8]); }
     while (d.remaining() > 0 && d.ok()) {
         tag: long = d.getUvarint() as long;
         n: long = d.getLen();
         at: long = d.pos;
-        c: Decoder = decoderOf(d.getRaw(n));
+        c: Decoder;
+        unsafe { c = decoderOf(d.getRaw(n)); }
         if (tag == CHUNK_STRINGS) {
             // The names: their spellings are views of the body, interned only when first read.
             count: long = c.getLen();
@@ -359,6 +490,8 @@ local readKlibBody inout info:KlibInfo index:long -> void {
             }
         } else if (tag == CHUNK_IR) {
             readShipChunk(&c, info.symBase, info.symCount);
+        } else if (tag == CHUNK_EFFECTS) {
+            readEffectsChunk(&c);
         } else if (tag == CHUNK_POISON) {
             if (bool.decode(c)) { gFacts.poisonAll = true; }
             k: long = c.getLen();
@@ -401,33 +534,38 @@ local readKlibBody inout info:KlibInfo index:long -> void {
         } else if (tag == CHUNK_MODULES) {
             info.modulesAt = at;
         }
-        if (!c.ok()) { failStr(format("{}: damaged .klib metadata ({}) -- rebuild it", info.path, c.error())); }
+        if (!c.ok()) { return klibDamaged(format("its metadata is malformed: {}", c.error())); }
     }
-    if (!d.ok()) { failStr(format("{}: damaged .klib metadata ({}) -- rebuild it", info.path, d.error())); }
+    if (!d.ok()) { return klibDamaged(format("its metadata is malformed: {}", d.error())); }
+    return klibUsable();
 }
 
 // Every loaded `.klib` was built against the dependencies it names; the ones loaded beside it
 // must be those very builds. A mismatch is a stale archive, and trusting it would link code
-// compiled against declarations that have since changed.
+// compiled against declarations that have since changed. A build never hands a compile one,
+// since the dependencies' keys are in its own key; a compile handed one stops on it.
 pub checkKlibConsistency -> void {
     for info in gKlibs {
         for k in 0..info.depCount {
             d: KlibDep = gKlibDeps.get(info.firstDep + k);
             at: long = klibIndex(d.name);
             if (at < 0) {
-                failStr(format("{} depends on package '{}', which no --extern provides", info.path, d.name));
+                failStr(format("`{}` depends on package `{}`, which no `--extern` provides", info.path, d.name));
             }
-            have: KlibInfo = gKlibs.get(at);
-            if (!(have.key == d.key)) {
-                failStr(format("{} was built against {} {}, but {} is {} -- the archive is stale; rebuild it",
-                               info.path, d.name, d.key, have.path, have.key));
-            }
+            c: KlibCheck = staleCheck(d, gKlibs.get(at));
+            if (!c.ok) { cannotUse(info.name, info.path, c); }
         }
     }
 }
+// Whether the dependency `d` a `.klib` records is the build `have` loaded beside it.
+local staleCheck d:KlibDep have:KlibInfo -> KlibCheck {
+    if (have.key == d.key) { return klibUsable(); }
+    return KlibCheck { ok: false, why: format("is stale (built against package `{}` with key {}, but `{}` has key {})",
+                                              d.name, d.key, have.path, have.key) };
+}
 
-// One function's facts (`gOutFacts` entry `fi`) as a module section's FACTS, and INSTFNS, carry
-// them; and read back into `gFacts`, answering the new entry.
+// One function's facts (`gOutFacts` entry `fi`), written the way a module section's FACTS and
+// INSTFNS carry them, and read back into `gFacts`, answering the new entry.
 pub putFnFact inout out:Encoder fi:long -> void {
     f: FnFact = gOutFacts.fns.get(fi);
     f.divergent.encode(out);

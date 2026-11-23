@@ -1,7 +1,7 @@
 // A type's declaration as a value: what a derive macro reads.
 //
-// A trait may name a macro that writes its implementation for any type that lacks one --
-// `trait Encode derive deriveEncode { ... }` -- and when the program needs that implementation
+// A trait may name a macro that writes its implementation for any type that lacks one
+// (`trait Encode derive deriveEncode { ... }`), and when the program needs that implementation
 // the compiler builds one of these from its own tables and hands it to the macro as its one
 // parameter: a `Struct`, an `Enum`, or a `Decl` for a macro that takes either. The macro
 // returns `quote { methods @(t.name) for Encode { ... } }`, which is checked like hand-written
@@ -9,12 +9,12 @@
 // was needed. Nothing here costs anything at runtime: a program that builds one by hand has
 // built an ordinary value.
 //
-// The compiler fills these by FIELD NAME, each field only if it is declared here, so a field can
-// be added without the compiler having to know; the ones it fills are the ones below. A type
-// is named as the compiler holds it: qualified (`shapes::Point`), a generic type's instance by
-// its stamped name (`Pair_long_string::String`, its fields at their concrete types), and a
-// field's type spelled the way a quote may splice it where a type is read (`long`,
-// `shapes::Point`, `ptr_u8` for `*u8`, `slice_u8` for `[u8]`).
+// The compiler fills these by field name, and only the fields declared here, so a field can be
+// added without changing the compiler. Types are named the way the compiler holds them. A plain
+// type is qualified, like `shapes::Point`. A generic instance uses its stamped name, like
+// `Pair_long_string::String`, with its fields at their concrete types. A field's type is
+// spelled so a quote can splice it where a type is expected: `long`, `shapes::Point`, `ptr_u8`
+// for `*u8`, `slice_u8` for `[u8]`.
 #include <{vec, panic, string, sys}>
 
 // One field of a struct, or one value a variant carries.
@@ -50,4 +50,4 @@ pub enum Decl { OfStruct(Struct), OfEnum(Enum) }
 // type, the trait and the function that needed the implementation. (The compiler answers this
 // call itself while a macro runs; reached at runtime it is a panic.) A `String`, since the reason
 // is nearly always `format(...)`; a fixed one is `stringOf("...")`.
-pub refuse why:String -> never { unsafe { sysWrite(2, why.view().ptr, why.len()); } sysExit(1); }
+pub refuse why:String -> never { spillStdoutNow(); unsafe { sysWrite(2, why.view().ptr, why.len()); } sysExit(1); }

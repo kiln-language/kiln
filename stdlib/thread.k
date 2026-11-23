@@ -2,7 +2,7 @@
 // this process's address space.
 //
 // The clone trampoline stays file-private; only the complete operations are `pub`.
-#include <{sys, core, panic}>
+#include <{sys, core, panic, atomic}>
 
 // ─── scheduling ─────────────────────────────────────────────────────────────
 
@@ -43,14 +43,16 @@ pub availableParallelism -> long {
 // ─── threads ────────────────────────────────────────────────────────────────
 // One mmap per thread holds its control block, its TLS page and its stack:
 //   [    +0]  the control words, named by `Ctl` below
-//   [ +4096]  the thread's TLS page (its heap cache, set via CLONE_SETTLS)
+//   [ +4096]  the thread's TLS page (its heap cache and its chain of armed `recover`s, set via
+//             CLONE_SETTLS)
 //   [ +8192]  a guard page, no access: a stack that overflows faults here instead of
 //             overwriting the TLS page and the control words
 //   [+12288..size]  the thread's stack (grows down)
 //
-// The control words are ordinary aligned 8-byte accesses, which x86-64 guarantees not to tear,
-// so `kill` on one thread and `shouldStop` on another see whole values. Nothing
-// read-modify-writes them, so none needs a lock prefix.
+// `Tid` and `Cancel` change while another thread reads them (the kernel writes `Tid`, `kill`
+// writes `Cancel`), so every access to them is an atomic load or store: a body polling
+// `shouldStop` in a loop reads memory each time round. The other words are written before the
+// thread starts and only read after.
 local enum Ctl: long {
     Tid,        // kernel tid; the kernel clears it to 0 on exit, which is what join waits on
     Cancel,     // kill sets it; the body polls shouldStop
@@ -64,18 +66,20 @@ local HEAD: long = 12288;                // the control page, the TLS page, the 
 pub DEFAULT_STACK: long = 57344;         // a 68 KiB region in all
 
 local unsafe ctl r:long -> *long { return r as *long; }
+local unsafe ctlWord r:long w:Ctl -> *long { return (r + 8 * (w as long)) as *long; }
 
 // ─── the child side ─────────────────────────────────────────────────────────
 // The kernel hands the child its region address in a register, so a thread body is
-// `fn(ctrl:long)->void` — the raw control pointer, the one place the ABI shows through.
+// `fn(ctrl:long)->void` and receives the raw control pointer. This is where the ABI leaks into
+// the API.
 //
-// SOUNDNESS IOU: both accessors trust `ctrl` to be the live block spawn() passed in. A body
-// handed some other long reads whatever is at that address.
+// Unchecked: both accessors trust `ctrl` to be the live block spawn() passed in. A body handed
+// any other long reads whatever is at that address.
 
 // The argument given to spawn, typically a heap pointer to shared data.
 pub threadArg ctrl:long -> long { unsafe { return ctl(ctrl)[Ctl.Arg]; } }
 // True once kill() has asked this thread to stop; a body should poll it and return.
-pub shouldStop ctrl:long -> bool { unsafe { return ctl(ctrl)[Ctl.Cancel] != 0; } }
+pub shouldStop ctrl:long -> bool { unsafe { return atomicLoad(ctlWord(ctrl, Ctl.Cancel)) != 0; } }
 
 // Start fn(ctrl) on `region`'s stack with its own TLS. `rbx` survives the syscall into the
 // child (callee-saved by the syscall ABI), and the child reads its function from the shared
@@ -92,14 +96,15 @@ local unsafe threadClone region:long -> void {
         "lea r8, [rbx + 4096]"        // TLS page (CLONE_SETTLS)
         "mov rdx, rbx"                // parentTid ptr
         "mov rdi, 0x3D0F00"           // VM|FS|FILES|SIGHAND|THREAD|SYSVSEM|PARENT_SETTID|CHILD_CLEARTID|SETTLS
-        "mov rax, 56"                 // clone
+        "mov eax, 56"                 // clone
         "syscall"
         "test rax, rax"
         "jnz .tcloneParent"
         "mov rdx, [rbx + 16]"         // CHILD: the Fn word
         "mov rax, rbx"                // arg0 = ctrl (Kiln passes arg0 in rax)
+        "mov rdi, rbx"                // and in rdi, where a body built by LLVM (System V) reads it
         "call rdx"
-        "mov rax, 60"                 // exit — this thread only
+        "mov eax, 60"                 // exit, this thread only
         "xor rdi, rdi"
         "syscall"
         ".tcloneParent:"
@@ -107,7 +112,7 @@ local unsafe threadClone region:long -> void {
 }
 
 // ─── the parent side ────────────────────────────────────────────────────────
-// Plain data (Copy), so it can be stored and passed around, but a distinct TYPE, so a bare
+// Plain data (Copy), so it can be stored and passed around, but a distinct type, so a bare
 // `long` cannot be joined by accident.
 pub struct Thread { ctrl: *u8 }
 
@@ -122,7 +127,7 @@ pub spawnWithStack f:fn(long)->void arg:long stackBytes:long -> Thread {
     size: long = HEAD + stack;
     unsafe {
         region: long = syscall6(Syscall.Mmap, 0, size, 3, 0x22, -1, 0);   // RW, PRIVATE|ANON
-        if (region < 0) { panic("spawn: the kernel refused a thread region (mmap failed)"); }
+        if (region < 0) { panic("spawn: cannot allocate thread stack (mmap failed)"); }
         syscall3(Syscall.Mprotect, region + 2 * PAGE, PAGE, 0);          // PROT_NONE
         w: *long = ctl(region);
         w[Ctl.Tid] = 0;               // the kernel fills this in, and clears it on exit
@@ -137,10 +142,10 @@ pub spawnWithStack f:fn(long)->void arg:long stackBytes:long -> Thread {
 
 methods Thread {
     // The kernel task id, or 0 once the thread has exited.
-    id &self -> long { unsafe { return ctl(self.ctrl)[Ctl.Tid]; } }
+    id &self -> long { unsafe { return atomicLoad32(self.ctrl as *int) as long; } }   // the kernel writes 32 bits
     isRunning &self -> bool { return self.id() != 0; }
     // Cooperative: the body must poll shouldStop and return.
-    kill &self -> void { unsafe { ctl(self.ctrl)[Ctl.Cancel] = 1; } }
+    kill &self -> void { unsafe { atomicStore(ctlWord(self.ctrl as long, Ctl.Cancel), 1); } }
 
     // Block until the thread finishes, then give its region back to the OS. The kernel clears
     // the Tid word and futex-wakes on exit, so this parks in the kernel rather than spinning.
@@ -148,7 +153,7 @@ methods Thread {
         unsafe {
             tid: *int = self.ctrl as *int;           // the kernel writes a 32-bit tid
             loop {
-                t: int = *tid;
+                t: int = atomicLoad32(tid);
                 if (t == 0) { break; }
                 syscall4(Syscall.Futex, tid as long, 0, t, 0);   // FUTEX_WAIT while it still reads t
             }

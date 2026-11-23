@@ -13,7 +13,8 @@
 //     bytes: Vec<u8> = e.bytes();
 //     view: [u8] = "";
 //     unsafe { view = bytesOf(&bytes); }    // a view of the vector, as `String.view` is
-//     d: Decoder = decoderOf(view);
+//     d: Decoder;
+//     unsafe { d = decoderOf(view); }       // `bytes` outlives `d`
 //     q: Point = Point.decode(d);           // and Point: Decode
 //     if (!d.done()) { ...d.error()... }
 //
@@ -32,26 +33,28 @@
 //   HashMap<K, V>           the entry count (LEB128), then key, value, key, value... in slot order
 //   Box<T>                  the T
 //   a struct (derived)      each field, in declaration order; nothing between them
-//   a sum type (derived)    the variant's tag (LEB128), then its payloads in order -- so
+//   a sum type (derived)    the variant's tag (LEB128), then its payloads in order, so
 //                           `Option<T>` is 0, or 1 and the T, and `Result<T, E>` likewise
 //   a backed enum (derived) its integer, zigzag LEB128 (`enum Color: int { ... }`)
 //
 // ─── failure ─────────────────────────────────────────────────────────────────
-// Decoding never traps and never reads past its input. The first problem -- the input ends, a
-// length is longer than what is left, a bool is 2, a tag names no variant, a value does not fit
-// its type -- puts the `Decoder` in a failed state that keeps its first reason; every read after
-// it answers zero (or empty) at once, so a decode written as straight-line code needs no check
-// per field and ends quickly. Check `ok()` (or `done()`, which also wants the input used up)
-// once, at the end. `decodeValue` does all of that and hands back a `Result`.
+// Decoding never traps and never reads past its input. The first problem puts the `Decoder` in
+// a failed state and records why: the input ends, a length runs past what is left, a bool is 2,
+// a tag names no variant, or a value does not fit its type. After that every read returns zero
+// or empty immediately, so straight-line decode code needs no per-field checks. Call `ok()` once
+// at the end, or `done()` to also require that all input was consumed. `decodeValue` does all of
+// this and returns a `Result`.
 //
-// Efficiency: an encoder appends to one growable buffer, reserving before every multi-byte
-// write; bytes and strings are one `memcpy`; decoding a `str` is a VIEW into the input (no copy:
-// it lives as long as the input does), a `String` one allocation of exactly its length, and a
-// `Vec` reserves its decoded length once. Raw bytes go through `putBytes`/`getBytes` (a length,
-// then one copy); a `Vec<u8>` encodes the same bytes but element by element, since nothing lets
-// `Vec<T>`'s implementation specialize for u8. A length longer than the bytes left is refused
-// before anything is allocated, which is what makes a hostile length harmless (and a `Vec` of an
-// empty struct, whose elements encode to nothing, undecodable past length 0).
+// Cost: an encoder appends to one growable buffer and reserves before each multi-byte write.
+// Bytes and strings are a single `memcpy`. Decoding a `str` returns a view into the input with
+// no copy, so it lives as long as the input. A decoded `String` is one allocation of its exact
+// length, and a `Vec` reserves its decoded length once. Raw bytes go through
+// `putBytes`/`getBytes`, which write a length and then copy once. A `Vec<u8>` encodes the same
+// bytes one element at a time, because `Vec<T>`'s implementation cannot specialize for u8.
+//
+// A length longer than the remaining input is refused before anything is allocated, so a
+// hostile length cannot force a huge allocation. The downside is that a `Vec` of an empty
+// struct, whose elements encode to nothing, cannot be decoded past length 0.
 //
 // Not covered: floats, inline arrays, raw and function pointers, trait objects. The derive refuses
 // the last four by name. (Tuples are covered by the derives themselves.)
@@ -79,8 +82,8 @@ methods Encoder {
             p: *u8 = self.out.buf.ptr;
             while ((v >> 7) != 0) {
                 p[n] = ((v & 127) | 128) as u8;
-                v = v >> 7;
-                n = n + 1;
+                v >>= 7;
+                n += 1;
             }
             p[n] = v as u8;
         }
@@ -104,7 +107,7 @@ methods Encoder {
         if (b.len == 0) { return; }
         self.out.reserve(b.len);
         unsafe { memcpy((self.out.buf.ptr + self.out.count) as long, b.ptr as long, b.len); }
-        self.out.count = self.out.count + b.len;
+        self.out.count += b.len;
     }
     putLen &self n:long -> void { self.putUvarint(n as u64); }
     // A length, then the bytes.
@@ -134,8 +137,9 @@ pub trait Encode derive deriveEncode { encode &self out:&Encoder -> void; }
 pub trait Decode derive deriveDecode { decode inp:&Decoder -> Self; }
 
 // A decoder reading `data` from its start. It holds a view: `data` must outlive it, and so must
-// every `str` it decodes, since those are views into `data` too.
-pub decoderOf data:[u8] -> Decoder {
+// every `str` it decodes, since those are views into `data` too. `unsafe` for that reason: the
+// caller vouches for `data`. `decodeValue` is the safe way in when the whole input is one value.
+pub unsafe decoderOf data:[u8] -> Decoder {
     unsafe { return Decoder { at: data.ptr, len: data.len, pos: 0, failed: false, why: "" }; }
 }
 
@@ -154,29 +158,29 @@ methods Decoder {
     }
 
     getU8 &self -> u8 {
-        if (self.pos >= self.len) { self.fail("the input ends inside a value"); return 0; }
+        if (self.pos >= self.len) { self.fail("unexpected end of input"); return 0; }
         b: u8 = 0;
         unsafe { b = self.at[self.pos]; }
-        self.pos = self.pos + 1;
+        self.pos += 1;
         return b;
     }
     getUvarint &self -> u64 {
         v: u64 = 0;
         shift: long = 0;
         while (shift < 64) {
-            if (self.pos >= self.len) { self.fail("the input ends inside a value"); return 0; }
+            if (self.pos >= self.len) { self.fail("unexpected end of input"); return 0; }
             b: long = 0;
             unsafe { b = self.at[self.pos] as long; }
-            self.pos = self.pos + 1;
-            v = v | (((b & 127) as u64) << shift);
+            self.pos += 1;
+            v |= (((b & 127) as u64) << shift);
             if (b < 128) {
                 // The tenth byte may carry only the 64th bit.
-                if (shift == 63 && b > 1) { self.fail("a number wider than 64 bits"); return 0; }
+                if (shift == 63 && b > 1) { self.fail("integer overflows 64 bits"); return 0; }
                 return v;
             }
-            shift = shift + 7;
+            shift += 7;
         }
-        self.fail("a number wider than 64 bits");
+        self.fail("integer overflows 64 bits");
         return 0;
     }
     getU64LE &self -> u64 {
@@ -200,16 +204,16 @@ methods Decoder {
     getLen &self -> long {
         u: u64 = self.getUvarint();
         n: long = u as long;
-        if (n < 0 || n > self.len - self.pos) { self.fail("a length longer than the input left"); return 0; }
+        if (n < 0 || n > self.len - self.pos) { self.fail("length exceeds remaining input"); return 0; }
         return n;
     }
     // A sum type's tag: any number, checked by the caller against its variants.
     getTag &self -> long { return self.getUvarint() as long; }
     // The next `n` bytes, in place.
     getRaw &self n:long -> [u8] {
-        if (n < 0 || n > self.len - self.pos) { self.fail("a length longer than the input left"); n = 0; }
+        if (n < 0 || n > self.len - self.pos) { self.fail("length exceeds remaining input"); n = 0; }
         at: long = self.pos;
-        self.pos = self.pos + n;
+        self.pos += n;
         unsafe { return (self.at + at)[..n]; }
     }
     getBytes &self -> [u8] { return self.getRaw(self.getLen()); }
@@ -225,10 +229,11 @@ pub encodeValue<T: Encode> v:T -> Vec<u8> {
 // A `T` decoded from all of `data`, or why not: a failed read, or bytes left over after it.
 // `T` comes from where the result is stored: `r: Result<Point, str> = decodeValue(bytes)`.
 pub decodeValue<T: Decode> data:[u8] -> Result<T, str> {
-    d: Decoder = decoderOf(data);
+    d: Decoder;
+    unsafe { d = decoderOf(data); }                  // `data` outlives the call, and `d` does not
     v: T = T.decode(d);
     if (!d.ok()) { return Result.Err(d.error()); }
-    if (d.remaining() > 0) { return Result.Err("bytes left over after the value"); }
+    if (d.remaining() > 0) { return Result.Err("trailing bytes after value"); }
     return Result.Ok(v);
 }
 
@@ -238,7 +243,7 @@ methods bool for Encode { encode &self out:&Encoder -> void { if (self) { out.pu
 methods bool for Decode {
     decode inp:&Decoder -> bool {
         b: u8 = inp.getU8();
-        if (b > 1) { inp.fail("a bool that is neither 0 nor 1"); }
+        if (b > 1) { inp.fail("invalid bool"); }
         return b == 1;
     }
 }
@@ -253,7 +258,7 @@ methods int for Encode { encode &self out:&Encoder -> void { out.putVarint(self 
 methods int for Decode {
     decode inp:&Decoder -> int {
         v: long = inp.getVarint();
-        if (v < -2147483648 || v > 2147483647) { inp.fail("a number too wide for an int"); return 0; }
+        if (v < -2147483648 || v > 2147483647) { inp.fail("integer out of range for int"); return 0; }
         return v as int;
     }
 }
@@ -261,7 +266,7 @@ methods i16 for Encode { encode &self out:&Encoder -> void { out.putVarint(self 
 methods i16 for Decode {
     decode inp:&Decoder -> i16 {
         v: long = inp.getVarint();
-        if (v < -32768 || v > 32767) { inp.fail("a number too wide for an i16"); return 0; }
+        if (v < -32768 || v > 32767) { inp.fail("integer out of range for i16"); return 0; }
         return v as i16;
     }
 }
@@ -271,7 +276,7 @@ methods u32 for Encode { encode &self out:&Encoder -> void { out.putUvarint(self
 methods u32 for Decode {
     decode inp:&Decoder -> u32 {
         v: u64 = inp.getUvarint();
-        if ((v >> 32) != 0) { inp.fail("a number too wide for a u32"); return 0; }
+        if ((v >> 32) != 0) { inp.fail("integer out of range for u32"); return 0; }
         return v as u32;
     }
 }
@@ -279,7 +284,7 @@ methods u16 for Encode { encode &self out:&Encoder -> void { out.putUvarint(self
 methods u16 for Decode {
     decode inp:&Decoder -> u16 {
         v: u64 = inp.getUvarint();
-        if ((v >> 16) != 0) { inp.fail("a number too wide for a u16"); return 0; }
+        if ((v >> 16) != 0) { inp.fail("integer out of range for u16"); return 0; }
         return v as u16;
     }
 }
@@ -365,11 +370,11 @@ pub macro deriveDecode d:Decl -> Node {
 // What a value of this field's type cannot be written as.
 local encodableField owner:str f:Field -> void {
     why: str = "";
-    if (f.isRawPointer)       { why = " is a raw pointer, an address that means nothing outside this process"; }
-    else if (f.isFn)          { why = " is a function pointer, an address that means nothing outside this process"; }
-    else if (f.isTraitObject) { why = " is a trait object, whose concrete type a decoder could not know"; }
-    else if (f.isArray)       { why = " is an inline array, which is not supported yet"; }
-    if (why.len > 0) { refuse(format("{}.{}{}", owner, f.name, why)); }
+    if (f.isRawPointer)       { why = "a raw pointer"; }
+    else if (f.isFn)          { why = "a function pointer"; }
+    else if (f.isTraitObject) { why = "a trait object"; }
+    else if (f.isArray)       { why = "an inline array, which is not supported yet"; }
+    if (why.len > 0) { refuse(format("cannot encode {}.{}: field is {}", owner, f.name, why)); }
 }
 
 local encodeOfStruct t:Struct -> Node {
@@ -402,8 +407,7 @@ local encodeOfEnum e:Enum -> Node {
     for v in e.variants {
         if (v.payloads.len() == 0) { continue; }
         ps: Vec<Node>;
-        for j in 0..v.payloads.len() {
-            p: Field = v.payloads.get(j);
+        for p in v.payloads {
             encodableField(e.name, p);
             ps.push(quote { self.@(p.name).encode(out); });
         }
@@ -446,12 +450,12 @@ local decodeOfEnum e:Enum -> Node {
         return quote { methods @(e.name) for Decode {
             decode inp:&Decoder -> Self {
                 v: long = inp.getVarint();
-                if (!(@known)) { inp.fail("a value the enum has no variant for"); v = @first; }
+                if (!(@known)) { inp.fail("invalid enum value"); v = @first; }
                 return v as @(e.name);
             }
         } };
     }
-    if (e.variants.len() == 0) { refuse(format("{} has no variants, so no value of it can be decoded", e.name)); }
+    if (e.variants.len() == 0) { refuse(format("cannot decode {}: enum has no variants", e.name)); }
     arms: Vec<Node>;
     fallback: long = 0;
     for i in 0..e.variants.len() {
@@ -467,7 +471,7 @@ local decodeOfEnum e:Enum -> Node {
         decode inp:&Decoder -> Self {
             tag: long = inp.getTag();
             @arms
-            inp.fail("a tag no variant has");
+            inp.fail("invalid variant tag");
             return @other;
         }
     } };

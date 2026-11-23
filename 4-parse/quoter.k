@@ -1,9 +1,10 @@
-// A syntax tree serialized as the expression that builds the equivalent `Node` value: a
-// constructor call for a tree, written as the tree. `quote { a + 1 }` compiles to
+// Turns a syntax tree into the expression that builds the equivalent `Node` value: a tree of
+// constructor calls shaped like the tree itself. `quote { a + 1 }` compiles to
 // `Node.Binary(BinOp.Add, newBox(Node.Name("a")), newBox(Node.Int(1)))`.
 //
-// The parser uses it for `quote`, the checker to hand a macro the tree of an argument. A tree it
-// cannot serialize is a compile error naming what it met, never a silently smaller tree.
+// The parser uses it for `quote`, and the checker uses it to hand a macro the tree of an
+// argument. A tree it cannot serialize is a compile error naming what it met, never a silently
+// smaller tree.
 #include <{ast, registry, types}>
 #include <support::compiler>
 #include <stdlib::{chars, fmt, string, vec}>
@@ -15,8 +16,8 @@ pub struct Quoter { node: Sym, binOp: Sym, unOp: Sym }
 // a method a person writes.
 pub SPLICE_METHOD: str = "$splice";
 
-// The `BinOp` variant each binary operator becomes, in `Op` order -- the two enums are declared
-// in the same order, so the operator's own index is the key.
+// The `BinOp` variant each binary operator becomes, in `Op` order. The two enums are declared in
+// the same order, so the operator's own index is the key.
 local gBinOpNames: Vec<str> = vec![
     "Assign",
     "Add",    "Sub",    "Mul",    "Div",    "Mod",
@@ -58,9 +59,9 @@ local holdsSplice s:str -> bool {
 }
 
 methods Quoter {
-    // A block's statements. One standing as `@x` is not a statement but a list splice: whatever
-    // `x` holds -- a Node, or a `Vec<Node>` -- is added in its place (`QuoteAdd` in stdlib/ast.k,
-    // whose two implementations the argument's type picks between).
+    // A block's statements. A statement that is just `@x` is really a list splice: whatever `x`
+    // holds (a Node, or a `Vec<Node>`) is added in its place, through `QuoteAdd` in stdlib/ast.k,
+    // whose two implementations the argument's type picks between.
     quoteStmts &self inout a:Ast ids:Vec<long> -> NodeId {
         none: Vec<NodeId>;
         b: NodeId = self.qCall(a, "nodeList", none);
@@ -101,7 +102,7 @@ methods Quoter {
         }
         spelled: str = typeMangleName(k, n);
         if (holdsSplice(spelled)) {
-            failStr(stringOf("quote: a spliced type stands alone -- build the whole spelling (`ref_T`, `ptr_T`) in the macro"));
+            failStr(stringOf("a spliced type name inside a larger type is not supported in a `quote`\nhelp: build the whole spelling (`ref_T`, `ptr_T`) in the macro and splice that"));
         }
         return self.qStr(a, intern(spelled));
     }
@@ -119,7 +120,7 @@ methods Quoter {
         }
         if (st.kind == StmtKind.VarDecl) {
             d: VarDeclNode = a.decls.get(st.at);
-            if (d.isArray) { failStr(stringOf("quote cannot serialize an array declaration yet")); }
+            if (d.isArray) { failStr(stringOf("an array declaration is not supported inside a `quote` yet")); }
             args: Vec<NodeId>;
             args.push(self.qStr(a, d.name));
             args.push(self.qType(a, d.kind, d.structName));
@@ -130,7 +131,7 @@ methods Quoter {
         if (st.kind == StmtKind.If) { return self.quoteIf(a, st.at); }
         if (st.kind == StmtKind.While) {
             w: WhileNode = a.whiles.get(st.at);
-            if (w.step >= 0) { failStr(stringOf("quote cannot serialize a `for` loop yet")); }
+            if (w.step >= 0) { failStr(stringOf("a `for` loop is not supported inside a `quote` yet")); }
             args: Vec<NodeId>;
             args.push(self.qBoxed(a, self.quoteTree(a, w.cond)));
             args.push(self.qBoxed(a, self.quoteBlock(a, w.body)));
@@ -146,10 +147,13 @@ methods Quoter {
         if (st.kind == StmtKind.Block) {
             return self.quoteBlock(a, a.blockStmts.get(st.at).body);
         }
+        if (st.kind == StmtKind.Recover) {
+            failStr(stringOf("a `recover` is not supported inside a `quote`\nnote: `ast::Node` has no form for it, nor for the `unsafe` block it has to sit in"));
+        }
         none: Vec<NodeId>;
         if (st.kind == StmtKind.Break)    { return self.qVariant(a, "Break", none); }
         if (st.kind == StmtKind.Continue) { return self.qVariant(a, "Continue", none); }
-        failStr(stringOf("quote cannot serialize this statement (a loop, match, unsafe or asm block)"));
+        failStr(stringOf("this statement is not supported inside a `quote`\nnote: a `quote` can hold declarations, expressions, `if`, `while`, `return`, `break`, `continue` and blocks"));
         return NO_NODE;
     }
     // An `if` chain: the else is another If, a Block (the parser's always-true last link), or
@@ -172,16 +176,16 @@ methods Quoter {
     }
     qNothing &self inout a:Ast -> NodeId { none: Vec<NodeId>; return self.qVariant(a, "Nothing", none); }
 
-    // One `Node.Variant(args...)` as AST: the tag from the enum's own declaration, the payload
-    // fields in order. The same shape parseVariant builds from source.
+    // One `Node.Variant(args...)` as a tree: the tag, taken from the enum's own declaration, then
+    // the payload fields in order. It is the same shape `parseVariant` builds from source.
     qVariant &self inout a:Ast name:str args:Vec<NodeId> -> NodeId {
         owner: Sym = self.node;
-        d: EnumDef = gReg.enumDef(gReg.findEnum(nameOf(owner)));
+        d: EnumDef = gReg.enumDef(gReg.findEnumSym(owner));
         vi: long = gReg.findVariant(d, name);
-        if (vi < 0) { failStr(format("stdlib::ast's Node has no variant '{}'", name)); }
+        if (vi < 0) { failStr(format("no variant `{}` in enum `Node`\nnote: a `quote` builds the `Node` that `stdlib::ast` declares", name)); }
         vd: VariantDef = gReg.variantAt(d, vi);
         if (vd.payloadCount != args.len()) {
-            failStr(format("Node.{} carries {} value(s), the quoter gave {}", name, vd.payloadCount, args.len()));
+            failStr(format("wrong number of values for `Node.{}`: expected {}, found {}\nnote: a `quote` builds the `Node` that `stdlib::ast` declares", name, vd.payloadCount, args.len()));
         }
         inits: Vec<InitNode>;
         inits.push(InitNode { name: intern(enumTagField()),
@@ -193,13 +197,13 @@ methods Quoter {
         a.lits.push(LitNode { typeName: owner, firstInit: first, initCount: inits.len(), rest: NO_NODE });
         return a.leafOf(Op.StructLit, Payload.Lit(a.lits.len() - 1), Lit.Struct, owner);
     }
-    // A backed-enum constant -- `BinOp.Add` -- as the integer it is.
+    // A backed-enum constant such as `BinOp.Add`, as the integer it is.
     qEnumConst &self inout a:Ast ty:str name:str -> NodeId {
         owner: Sym = self.binOp;
         if (ty == "UnOp") { owner = self.unOp; }
-        d: EnumDef = gReg.enumDef(gReg.findEnum(nameOf(owner)));
+        d: EnumDef = gReg.enumDef(gReg.findEnumSym(owner));
         vi: long = gReg.findVariant(d, name);
-        if (vi < 0) { failStr(format("{} has no variant '{}'", nameOf(owner), name)); }
+        if (vi < 0) { failStr(format("no variant `{}` in enum `{}`", name, nameOf(owner))); }
         return a.leaf(Op.Literal, Payload.Num(gReg.variantAt(d, vi).value), d.backing);
     }
     qStr &self inout a:Ast s:Sym -> NodeId { return a.leaf(Op.StringLit, Payload.Text(s), Lit.Str); }
@@ -211,7 +215,7 @@ methods Quoter {
                                        slot: NO_SLOT, callee: NO_NODE, sigKey: NO_SYM });
         return a.leaf(Op.FunctionCall, Payload.Call(a.calls.len() - 1), Lit.Int);
     }
-    // `newBox(<node>)` -- a child is held through a Box, which is what makes Node recursive.
+    // `newBox(<node>)`: a child is held through a Box, which is what lets Node be recursive.
     qBoxed &self inout a:Ast node:NodeId -> NodeId {
         one: Vec<NodeId>; one.push(node);
         return self.qCall(a, "newBox", one);
@@ -253,11 +257,11 @@ methods Quoter {
 
     // The tree, as the expression that builds it.
     quoteTree &self inout a:Ast id:NodeId -> NodeId {
-        if (id == NO_NODE) { failStr(stringOf("quote met an empty expression")); }
+        if (id == NO_NODE) { failStr(stringOf("an empty expression cannot be quoted")); }
         e: Expr = a.expr(id);
         if (e.left != NO_NODE) {
             bn: str = binOpName(e.op);
-            if (bn.len == 0) { failStr(format("quote cannot serialize this expression (operator {})", e.op as long)); }
+            if (bn.len == 0) { failStr(format("this expression (`{}`) is not supported inside a `quote`", nameof(Op, e.op))); }
             args: Vec<NodeId>;
             args.push(self.qEnumConst(a, "BinOp", bn));
             args.push(self.qBoxed(a, self.quoteTree(a, e.left)));
@@ -268,7 +272,7 @@ methods Quoter {
         if (un.len > 0) {
             args: Vec<NodeId>;
             args.push(self.qEnumConst(a, "UnOp", un));
-            match e.payload { Sub(v) { args.push(self.qBoxed(a, self.quoteTree(a, v))); } _ { failStr(stringOf("quote met a malformed prefix operator")); } }
+            match e.payload { Sub(v) { args.push(self.qBoxed(a, self.quoteTree(a, v))); } _ { failStr(stringOf("a malformed prefix operator cannot be quoted")); } }
             return self.qVariant(a, "Unary", args);
         }
         // `@x`: a deep copy of the Node `x` holds, so one tree may be spliced in several places.
@@ -287,10 +291,10 @@ methods Quoter {
             match e.payload {
                 Sub(v) {
                     inner: Expr = a.expr(v);
-                    if (inner.op != Op.Lvalue) { failStr(stringOf("quote can serialize `&` of a variable only, for now")); }
+                    if (inner.op != Op.Lvalue) { failStr(stringOf("`&` of anything but a variable is not supported inside a `quote` yet")); }
                     match inner.payload { Name(n) { args.push(self.qBoxed(a, self.qName(a, n))); } _ { } }
                 }
-                _ { failStr(stringOf("quote cannot serialize this address-of")); }
+                _ { failStr(stringOf("this `&` expression is not supported inside a `quote`")); }
             }
             return self.qVariant(a, "Unary", args);
         }
@@ -305,7 +309,7 @@ methods Quoter {
                 }
                 _ { }
             }
-            if (!isInteger(e.kind) && e.kind != Lit.Bool) { failStr(stringOf("quote can serialize only integer literals for now")); }
+            if (!isInteger(e.kind) && e.kind != Lit.Bool) { failStr(stringOf("this literal is not supported inside a `quote` yet\nnote: a `quote` can hold integer, `bool`, float and string literals")); }
             args: Vec<NodeId>;
             match e.payload { Num(v) { args.push(self.qInt(a, v)); } _ { } }
             return self.qVariant(a, "Int", args);
@@ -359,7 +363,7 @@ methods Quoter {
         if (e.op == Op.ArrayIndex) {
             ix: IndexNode = a.indexes.get(0);
             match e.payload { Index(i) { ix = a.indexes.get(i); } _ { } }
-            if (ix.whole || ix.index == NO_NODE) { failStr(stringOf("quote cannot serialize a slice expression yet")); }
+            if (ix.whole || ix.index == NO_NODE) { failStr(stringOf("a slice expression is not supported inside a `quote` yet")); }
             base: NodeId = NO_NODE;
             if (ix.base != NO_NODE) { base = self.quoteTree(a, ix.base); } else { base = self.qName(a, ix.name); }
             args: Vec<NodeId>;
@@ -370,7 +374,7 @@ methods Quoter {
         if (e.op == Op.StructLit || e.op == Op.TupleLit) {
             l: LitNode = a.lits.get(0);
             match e.payload { Lit(i) { l = a.lits.get(i); } _ { } }
-            if (l.rest != NO_NODE) { failStr(stringOf("quote cannot serialize `..rest` yet")); }
+            if (l.rest != NO_NODE) { failStr(stringOf("a struct literal with `..rest` is not supported inside a `quote` yet")); }
             names: Vec<Sym>;
             vals: Vec<NodeId>;
             for k in 0..l.initCount {
@@ -388,7 +392,7 @@ methods Quoter {
             args.push(self.qList(a, vals));
             return self.qVariant(a, "StructLit", args);
         }
-        failStr(format("quote cannot serialize this expression (operator {})", e.op as long));
+        failStr(format("this expression (`{}`) is not supported inside a `quote`", nameof(Op, e.op)));
         return NO_NODE;
     }
 

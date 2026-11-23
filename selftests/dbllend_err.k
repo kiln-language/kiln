@@ -1,5 +1,5 @@
 // A trait object may reach a `&self` method through its vtable, so lending one is a mutable
-// access — the same value lent twice in one argument list overlaps itself.
+// access, and the same value lent twice in one argument list overlaps itself.
 #include <stdlib::core>
 struct MySink { count: long }
 methods MySink for Write { write &self ptr:long len:long -> long { self.count = self.count + len; return len; } }

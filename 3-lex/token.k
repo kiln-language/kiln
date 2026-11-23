@@ -69,11 +69,9 @@ local countToks -> long {
     return n;
 }
 
-// What `next` does with a character. The C++ lexer asked this as a run of predicate calls in a
-// fixed order: `isspace`, then `/`, then `#`, then `isalpha||_`, then `isdigit`, then the quotes,
-// then `.`, so a semicolon paid every one of them before reaching the punctuation map. The
-// classes are disjoint, which is what lets one table read replace the whole run and still answer
-// exactly what the run answered.
+// What `next` does with a character. The classes are disjoint, which is what lets one table read
+// answer what would otherwise take a run of predicate calls (`isspace`, then `/`, then `#`, and so
+// on), with a semicolon paying for every one of them before it reached the punctuation table.
 pub enum CharClass: int {
     Punct,     // anything else: a two-character operator, or the single-character table
     Space,
@@ -97,10 +95,10 @@ local NO_PARTNER: long = -2;
 local struct TwoCharOp { p1: long, t1: Tok, p2: long, t2: Tok }
 
 local struct TokTables {
-    // The text the C++ lexer stored as a token's `value`, indexed by the kind, and empty (which
-    // the zero fill a partial literal does already makes it) for the kinds that carry a value of
-    // their own. Real data: nothing about `+` says its spelling is "+". The kind's printed name is
-    // not here; the declaration above already says it, and `tokName` reads it from there.
+    // Each punctuation kind's spelling, indexed by the kind, and empty for the kinds that carry a
+    // value of their own (the zero fill of a partial literal already makes it so). This is real
+    // data: nothing about `Plus` says its spelling is "+". The kind's printed name is not here;
+    // the declaration above already says it, and `tokName` reads it from there.
     spell: [str; SPELL_SLOTS],    // checked against Tok by countToks
     punct: [Tok; ASCII],          // the single-character kind, or Tok.FileEnd for "not one"
     cls:   [CharClass; ASCII],    // what `next` does with it
@@ -144,7 +142,7 @@ methods TokTables for Default {
         // The kinds that are pure punctuation. The eight that carry a value of their own are not
         // written: `TokTables { }` names fewer fields than the struct has, so the whole slot is
         // zeroed before anything is stored into it, and a zeroed `str` is "". Two to a line, as
-        // the byte-keyed tables below are; with the name gone these are one short assignment each.
+        // the byte-keyed tables below are.
         t.spell[Tok.AtSign as long]        = "@";    t.spell[Tok.Colon as long]        = ":";
         t.spell[Tok.Semicolon as long]     = ";";    t.spell[Tok.Comma as long]        = ",";
         t.spell[Tok.Dot as long]           = ".";    t.spell[Tok.LeftParen as long]    = "(";
@@ -212,8 +210,8 @@ local gTokNames: Vec<String> = tokNames();
 local tokNames -> Vec<String> {
     t: Vec<String>;
     for i in 0..TOK_COUNT { t.push(screamingSnake(nameof(Tok, i as Tok))); }
-    // The four the C++ lexer spells its own way; no re-casing of the variant produces them, so
-    // they are data. The other 43 were the declaration above, written out a second time.
+    // Four kinds the token dump names its own way, matching what the earlier compiler printed. No
+    // re-casing of the variant produces them, so they are written out.
     t.set(Tok.DotDot as long,           stringOf("DOTDOT"));
     t.set(Tok.ColonColon as long,       stringOf("COLONCOLON"));
     t.set(Tok.IsLessOrEqual as long,    stringOf("IS_LESS_THAN_OR_EQUAL"));
@@ -221,28 +219,67 @@ local tokNames -> Vec<String> {
     return t;
 }
 
-// The name the C++ lexer printed for a kind, so a token dump from either compiler reads the same.
-// Derived from the enum's own declaration rather than kept as a second copy of it, indices and all.
+// A kind's name in the token dump, the same name the earlier compiler printed, so a dump from
+// either compiler reads the same. Derived from the enum's own declaration rather than kept as a
+// second copy of it, indices and all.
 pub tokName k:Tok -> str {
     unsafe { return gTokNames.at(k as long).view(); }
 }
 
-// The text the C++ lexer stored as a token's `value` for the kinds that are pure punctuation.
-// Empty for the kinds that carry a value of their own.
+// The spelling of a kind that is pure punctuation, and empty for the kinds that carry a value of
+// their own.
 pub spellOf k:Tok -> str { return gTok.spell[k as long]; }
 
+// A token kind as a diagnostic names it: punctuation by its spelling in backticks (`;`), anything
+// that carries a value by what it is ("identifier", "integer literal"), and the end of the input
+// as "end of file". What "expected `;`" says.
+pub describeKind k:Tok -> String {
+    out: String;
+    if (k == Tok.Id) { out.pushStr("identifier"); return out; }
+    if (k == Tok.FileEnd) { out.pushStr("end of file"); return out; }
+    if (k == Tok.IntLiteral || k == Tok.LongLiteral || k == Tok.U64Literal) { out.pushStr("integer literal"); return out; }
+    if (k == Tok.FloatLiteral) { out.pushStr("float literal"); return out; }
+    if (k == Tok.CharLiteral) { out.pushStr("character literal"); return out; }
+    if (k == Tok.StringLiteral) { out.pushStr("string literal"); return out; }
+    if (k == Tok.Literal || k == Tok.BooleanLiteral) { out.pushStr("boolean literal"); return out; }
+    spelling: str = spellOf(k);
+    if (spelling.len == 0) { out.pushStr(tokName(k)); return out; }
+    out.push('`');
+    out.pushStr(spelling);
+    out.push('`');
+    return out;
+}
+
+// A token as a diagnostic names it: what "found `x`" says. A name or a number is shown as written;
+// a string or a character literal by its kind, since its text may be long or hold anything.
+pub describeTok t:Token -> String {
+    out: String;
+    if (t.kind == Tok.Id || t.kind == Tok.Literal || t.kind == Tok.FloatLiteral) {
+        out.push('`');
+        out.pushStr(nameOf(t.text));
+        out.push('`');
+        return out;
+    }
+    if (t.kind == Tok.IntLiteral || t.kind == Tok.LongLiteral) {
+        out.push('`');
+        out.pushLong(t.num);
+        out.push('`');
+        return out;
+    }
+    return describeKind(t.kind);
+}
+
 // The single-character kinds. `Tok.FileEnd` means "not one of these", which is also the answer
-// for a byte outside ASCII: the C++ map had no entry for one either, and the lexer rejects both
-// the same way. Takes the `long` the scanner already holds rather than a `char`, so a high byte
-// cannot arrive here as a negative index.
+// for a byte outside ASCII, and the lexer rejects both the same way. Takes the `long` the scanner
+// already holds rather than a `char`, so a high byte cannot arrive here as a negative index.
 pub punctOf c:long -> Tok {
     if (c < 0 || c >= ASCII) { return Tok.FileEnd; }
     return gTok.punct[c];
 }
 
 // What `next` should do with `c`. A byte outside ASCII is `Punct`, which sends it down the same
-// path a `$` takes: no two-character operator and no entry in the punctuation table, so it is
-// rejected, which is what the C++ lexer did with one too, having no map entry for it either.
+// path a `$` takes: it starts no two-character operator and has no entry in the punctuation
+// table, so it is rejected.
 pub charClass c:long -> CharClass {
     if (c < 0 || c >= ASCII) { return CharClass.Punct; }
     return gTok.cls[c];
@@ -258,8 +295,8 @@ pub twoCharOf first:long next:long -> Tok {
     return Tok.FileEnd;
 }
 
-// One token as the dump prints it: the kind, then the value when there is one. Matches the C++
-// `--emit=tokens` output line for line, which is the whole point of it.
+// One token as the dump prints it: the kind, then the value when there is one. It matches the
+// earlier compiler's `--emit=tokens` output line for line, which is the whole point of it.
 //
 // Appends rather than returning a String so the caller can reuse one buffer for the whole dump:
 // a token stream is millions of lines on a real build.

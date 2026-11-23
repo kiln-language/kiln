@@ -51,10 +51,14 @@ methods f64 {
         return r;
     }
 
-    // Toward zero. From 2^52 up every f64 is whole already, and an infinity or a NaN is kept.
+    // Toward zero. From 2^52 up every f64 is whole already, and an infinity or a NaN is kept (a
+    // NaN fails both compares). Below 1 the answer is a zero with the sign of `self`, which
+    // `self * 0.0` is exactly. All plain float operations, so a caller can have it inlined.
     trunc &self -> f64 {
-        if (!(self.abs() < 4503599627370496.0)) { return self; }
-        return ((self as long) as f64).copySign(self);
+        if (!(self > -4503599627370496.0 && self < 4503599627370496.0)) { return self; }
+        t: f64 = (self as long) as f64;
+        if (t == 0.0) { return self * 0.0; }
+        return t;
     }
     floor &self -> f64 { t: f64 = self.trunc(); if (t > self) { return t - 1.0; } return t; }
     ceil &self -> f64 { t: f64 = self.trunc(); if (t < self) { return t + 1.0; } return t; }
@@ -96,8 +100,8 @@ methods f64 {
         b: f64 = self;
         while (k != 0) {
             if ((k & 1) != 0) { r = r * b; }
-            b = b * b;
-            k = k >> 1;
+            b *= b;
+            k >>= 1;
         }
         if (n < 0) { return 1.0 / r; }
         return r;
@@ -214,32 +218,32 @@ local parseBits s:str single:bool -> Option<long> {
         any = true;
         if (sig > 0 || c != 0) {
             if (sig < 18) { m = m * 10 + c; } else { scale = scale + 1; }
-            sig = sig + 1;
+            sig += 1;
         }
-        j = j + 1;
+        j += 1;
     }
     if (byteAt(num, j) == '.') {
-        j = j + 1;
+        j += 1;
         while (isDigit(byteAt(num, j))) {
             c: long = num[j] - '0';
             any = true;
             if (sig > 0 || c != 0) {
                 if (sig < 18) { m = m * 10 + c; scale = scale - 1; }
-                sig = sig + 1;
+                sig += 1;
             } else { scale = scale - 1; }
-            j = j + 1;
+            j += 1;
         }
     }
     if (!any) { return Option.None; }
     if (byteAt(num, j) == 'e' || byteAt(num, j) == 'E') {
-        j = j + 1;
+        j += 1;
         neg: bool = byteAt(num, j) == '-';
         if (neg || byteAt(num, j) == '+') { j = j + 1; }
         if (!isDigit(byteAt(num, j))) { return Option.None; }
         e: long = 0;
         while (isDigit(byteAt(num, j))) {
             if (e < 100000) { e = e * 10 + (num[j] - '0'); }
-            j = j + 1;
+            j += 1;
         }
         if (neg) { scale = scale - e; } else { scale = scale + e; }
     }
@@ -285,26 +289,26 @@ local exactBits text:[u8] single:bool -> long {
         if (kept > 0 || c != '0') {
             if (kept < 800) {
                 bigMulAdd(&d, 10, c - '0');
-                kept = kept + 1;
+                kept += 1;
                 if (seenDot) { exp10 = exp10 - 1; }
             } else {
                 if (c != '0') { sticky = true; }
                 if (!seenDot) { exp10 = exp10 + 1; }
             }
         } else if (seenDot) { exp10 = exp10 - 1; }
-        i = i + 1;
+        i += 1;
     }
     // A value halfway between two floats has under 800 significant digits, so past them only
     // "more than nothing" matters, and one more nonzero digit says it.
     if (sticky) { bigMulAdd(&d, 10, 1); exp10 = exp10 - 1; }
     if (i < text.len) {                                   // the exponent: the form is checked
-        i = i + 1;
+        i += 1;
         neg: bool = text[i] == '-';
         if (neg || text[i] == '+') { i = i + 1; }
         e: long = 0;
         while (i < text.len) {
             if (e < 100000) { e = e * 10 + (text[i] - '0'); }
-            i = i + 1;
+            i += 1;
         }
         if (neg) { exp10 = exp10 - e; } else { exp10 = exp10 + e; }
     }
@@ -334,7 +338,7 @@ local exactBits text:[u8] single:bool -> long {
         step: long = 1;
         for j in 0..n { step = step * 10; }
         if (bigDivSmall(&q, step)) { rem = true; }
-        places = places - n;
+        places -= n;
     }
     L: long = bigBits(q);
     lead: long = L - 1 - k;                               // the binary exponent of the leading bit
@@ -448,7 +452,7 @@ local bigDivSmall inout x:Vec<long> d:long -> bool {
         cur: long = (r << 32) | x.get(i);
         x.set(i, cur / d);
         r = cur % d;
-        i = i - 1;
+        i -= 1;
     }
     return r != 0;
 }

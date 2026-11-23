@@ -1,7 +1,8 @@
 // The syntax tree as text: one node per line, indented by depth, as `<kind> <detail>`.
 //
-// Shaped to be diffable against the C++ compiler's `--emit=ast`, so there are no positions, no
-// ids, and nothing that depends on which arena slot a node happened to land in.
+// It matches what the earlier C++ compiler printed for `--emit=ast`, so the two can be diffed.
+// That is why there are no positions, no ids, and nothing that depends on which arena slot a node
+// happened to land in.
 #include <{ast, types}>
 #include <support::compiler>
 #include <stdlib::{chars, fmt, string, vec}>
@@ -15,9 +16,8 @@ local line inout out:String depth:long text:str -> void {
     out.push('\n');
 }
 
-// The same, for a line that was built. Appending copies the bytes, so this needs no
-// `unsafe` view of the String it was handed -- which is what every caller here was
-// opening one for.
+// The same, for a line built in a String. Appending copies the bytes, so a caller does not have
+// to open an `unsafe` view of its String just to print it.
 local lineOf inout out:String depth:long text:String -> void {
     indent(out, depth);
     out.pushString(text);
@@ -27,12 +27,13 @@ local lineOf inout out:String depth:long text:String -> void {
 // How a type is spelled in this dump, which is not how `types.k` mangles one.
 //
 // The mangler gives a pointer, a slice and a type variable their companion (`ptr_u8`,
-// `slice_int`, `T`) because two instantiations that differ only there must not collide
-// (`Vec<*int>` and `Vec<*char>` are one name under the C++ rule). That is the better rule and it
-// stays. But the C++ dump prints the C++ mangling, so printing this one here reports a difference
-// on every line carrying such a type and buries the tree underneath. The dump follows the C++
-// spelling: the companion for a struct or a trait object, `ref_` for a borrow, a sanitized
-// signature for a `fn`, the bare kind for everything else, so that what it does report is real.
+// `slice_int`, `T`), because two instantiations that differ only there must not collide (under
+// the C++ compiler's rule, `Vec<*int>` and `Vec<*char>` get the same name). That is the better
+// rule and it stays. The dump, though, matches what the earlier C++ compiler printed, and printing
+// our mangling would report a difference on every line that carries such a type, burying the rest
+// of the tree. So the dump spells a struct or a trait object by its companion, a borrow with
+// `ref_`, a `fn` by a sanitized signature and everything else by its bare kind, and the
+// differences it does report are real ones.
 local dumpType k:Lit n:Sym -> str {
     if (k == Lit.Struct || k == Lit.TraitObj) {
         if (n == NO_SYM) { return typeName(k); }
@@ -133,6 +134,14 @@ pub dumpStmt a:Ast inout out:String st:Stmt depth:long -> void {
         if (w.step >= 0) { line(out, depth + 1, "step"); dumpBlock(a, out, w.step, depth + 2); }
         return;
     }
+    if (st.kind == StmtKind.Recover) {
+        w: WhileNode = a.whiles.get(st.at);
+        line(out, depth, "recover");
+        dumpBlock(a, out, w.body, depth + 1);
+        line(out, depth + 1, "else");
+        dumpBlock(a, out, w.step, depth + 2);
+        return;
+    }
     if (st.kind == StmtKind.Loop || st.kind == StmtKind.Unsafe
         || st.kind == StmtKind.Block) {
         bs: BlockStmtNode = a.blockStmts.get(st.at);
@@ -227,15 +236,15 @@ local dumpIf a:Ast inout out:String at:long depth:long -> void {
     if (n.elseIf >= 0) { dumpIf(a, out, n.elseIf, depth); }
 }
 
-// The spelling `--emit=ast` prints for an operator. Not the variant's name (`nameof` would give
-// `LessThan`, and the dump has to read `<` to diff against the C++ compiler's), so it is data.
-// Keyed by the member rather than laid out in the enum's order: the table used to be a `vec![]`
-// whose entries lined up with `Op` by position and were tied to it only by a trailing comment, so
-// inserting a variant anywhere but the end silently relabelled every operator after it. Nothing
-// checked that, and `--emit=ast` is what the parser is diffed against.
+// The spelling `--emit=ast` prints for an operator. It can't be the variant's name (`nameof`
+// would give `LessThan`, and the dump has to read `<` to match the earlier compiler's), so it is a
+// table. The table is keyed by the member rather than laid out in the enum's order: a list that
+// lines up with `Op` only by position silently relabels every operator after a variant inserted
+// anywhere but the end, nothing would catch that, and `--emit=ast` is what the parser is diffed
+// against.
 //
-// Seeded with `?`, which is what an operator added to `Op` and forgotten here prints as. The same
-// shape `irOpNames` in codegen/irdump.k already used.
+// Every slot starts as `?`, which is what an operator added to `Op` and forgotten here prints as.
+// `irOpNames` in codegen/irdump.k is built the same way.
 local gOpNames: Vec<str> = opNames();
 
 local opNames -> Vec<str> {

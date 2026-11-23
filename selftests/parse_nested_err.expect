@@ -1,0 +1,10 @@
+selftests/parse_nested_err.k:12:54: error: expected an expression, found `;`
+   12 |         f: Fn(long) -> long = |x: long| { return x * ; };
+      |                                                      ^
+selftests/parse_nested_err.k:22:31: error: expected an expression, found `;`
+   22 |     run(|| { run(|| { n = n + ; }); });
+      |                               ^
+selftests/parse_nested_err.k:26:26: error: expected `;`, found `}`
+   26 | later -> long { return 7 }
+      |                          ^
+3 errors generated.

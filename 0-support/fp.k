@@ -123,8 +123,9 @@ pub i64ToF32 v:long -> long {
     return canonF32(r);
 }
 
-// An unsigned one (its 64 bits read as unsigned): halved, with the low bit kept as a sticky bit
-// so the rounding is the same, converted signed and doubled, when the top bit is set.
+// An unsigned 64-bit integer to the nearest f64 / f32. With the top bit clear this is the signed
+// conversion. With it set, the value is halved (keeping the low bit as a sticky bit, so the
+// rounding comes out the same), converted as signed, and doubled.
 pub u64ToF64 v:long -> long {
     if (v >= 0) { return i64ToF64(v); }
     h: long = ((v as u64) >> (1 as u64)) as long;
@@ -153,8 +154,9 @@ pub f32ToI64 v:long -> long {
     return r;
 }
 
-// Toward zero to an unsigned 64-bit integer: at or above 2^63, 2^63 off first and the top bit
-// set after. NaN gives 2^63, like any value out of range.
+// Toward zero to an unsigned 64-bit integer. A value at or above 2^63 has 2^63 taken off before
+// the signed conversion and the top bit set after it. NaN gives 2^63, as any value out of range
+// does.
 pub F64_TWO63: long = 4890909195324358656;    // 2^63 as an f64: 0x43E0000000000000
 pub F32_TWO63: long = 1593835520;             // 2^63 as an f32: 0x5F000000
 pub f64ToU64 v:long -> long {

@@ -1,11 +1,11 @@
 #!/bin/bash
 # Does compile time grow with the program, or faster than it?
 #
-# Three families, one axis each (see gen_scaling.py). For each size the compiler is run three
-# times and the fastest kept, then the ratio of time to size is printed: a LINEAR compiler holds
-# that ratio flat as N grows, and a quadratic one doubles it every time N doubles. That ratio is
-# the whole point of the table — the raw seconds say how big the program is, not how the compiler
-# scales.
+# Each family grows a program along one axis (see gen_scaling.py). For each size the compiler is
+# run three times and the fastest run is kept, then the ratio of time to size is printed. A LINEAR
+# compiler holds that ratio flat as N grows, and a quadratic one doubles it every time N doubles.
+# That ratio is the whole point of the table: the raw seconds say how big the program is, not how
+# the compiler scales.
 #
 # Run from the repository root.
 OUT=${2:-build}

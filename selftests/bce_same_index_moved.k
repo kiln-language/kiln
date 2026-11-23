@@ -1,4 +1,4 @@
-// The same index read twice is checked once -- unless it moved in between. Here it moved past
+// The same index read twice is checked once, unless it moved in between. Here it moved past
 // the end, and the second read must panic.
 #include <stdlib::vec>
 main -> int {

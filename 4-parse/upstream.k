@@ -56,10 +56,11 @@ pub markExternReady at:long -> void {
     gExternReady.set(at, true);
 }
 
-// The generic struct instances some dependency already stamped -- and so cloned and checked
-// every method of. Stamped here again (an instance has no symbol outside the object that
-// stamped it), but its methods are LAZY: each is checked, and compiled, only if this package's
-// code reaches it. Whatever is wrong with one was reported where the instance was first made.
+// The generic struct instances some dependency already stamped, which means it also cloned and
+// checked every one of their methods. They are stamped here again, since an instance has no
+// symbol outside the object that stamped it, but their methods are LAZY: each one is checked and
+// compiled only if this package's code reaches it. Anything wrong with one was already reported
+// where the instance was first made.
 pub var gKnownInstances: HashMap<str, bool> = map![];
 pub var gLazyFn: Vec<bool> = vec![];
 
@@ -96,9 +97,10 @@ pub var gLinkAlias: HashMap<str, str> = map![];
 // in a package build.
 pub var gInstanceFp: HashMap<str, long> = map![];
 
-// How many implementations the registry held when parsing ended: those, and only those, are the
-// ones the source declares (a derived one, or an instance's restated one, comes after). What a
-// fingerprint is computed from, in the owner and in the dependent alike.
+// How many implementations the registry held when parsing ended. Those, and only those, are the
+// ones the source declares; a derived one, or one an instance restates, comes after them. The
+// fingerprint is computed from this set, in the owner and in the dependent alike, so both sides
+// see the same implementations.
 pub var gDeclaredImpls: long = 0;
 
 // A body this compile has not checked and will not compile: a dependency's, or a lazy method
@@ -110,7 +112,7 @@ pub isUnchecked at:long -> bool {
 // A global another package owns: its storage, and its initializer, are that package's.
 pub isExternGlobal n:Sym -> bool {
     if (gUpstreamPkgs.isEmpty()) { return false; }
-    gi: long = gReg.findGlobal(nameOf(n));
+    gi: long = gReg.findGlobalSym(n);
     if (gi < 0) { return false; }
     return isUpstreamPkg(gReg.globalDef(gi).pkg);
 }

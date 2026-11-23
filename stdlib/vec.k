@@ -1,29 +1,29 @@
-// Vec<T> — a growable, heap-backed, bounds-checked sequence, split the way a systems Vec is:
+// Vec<T>: a growable, heap-backed, bounds-checked sequence, split the way a systems Vec is:
 // `RawVec<T>` owns the allocation, the capacity and all the growth arithmetic; `Vec<T>` layers
 // the live-element count and the sequence API on top. The split keeps the unsafe pointer math
 // in one small place.
 //
-// The buffer is a typed `*T`, so an element is `p[i]` — one size-scaled machine access. The
-// block copy appears only where a whole block really moves, which is growth.
+// The buffer is a typed `*T`, so an element is `p[i]`, one size-scaled machine access. Block
+// copies happen only when the whole buffer moves, which is on growth.
 //
 // Growth is amortized doubling, so N pushes cost O(N) copies in total.
 //
-// AN ELEMENT NEED NOT BE `Copy`. What a method does with an element decides what it needs:
+// An element need not be `Copy`. What a method does with an element decides what it needs:
 //
-//   methods Vec<T>          moving one in or out, or around — push, pop, insert, removeAt,
-//                           swap, set, clear — and the length. Available for every T.
-//   methods Vec<T: Copy>    READING one without removing it — get, last. For a Copy type the
-//                           bytes ARE the value, so handing back a copy costs nothing and
+//   methods Vec<T>          moving one in or out, or around (push, pop, insert, removeAt,
+//                           swap, set, clear), and the length. Available for every T.
+//   methods Vec<T: Copy>    reading one without removing it: get, last. For a Copy type the
+//                           bytes are the value, so handing back a copy costs nothing and
 //                           leaves the vector's own copy intact.
-//   methods Vec<T: Clone>   the same read for a type that owns something — cloneAt, lastClone.
+//   methods Vec<T: Clone>   the same read for a type that owns something: cloneAt, lastClone.
 //                           An owning element cannot be handed out by copying it: two owners
 //                           of one buffer is a double free, so the duplicate must be explicit.
 //
 // So `Vec<String>` is an ordinary vector you can push to, pop from and reorder; only reading
 // an element in place asks you to say whether you want a clone.
 //
-// A Vec is a value, exclusively owned, and not internally synchronized. To share one, wrap it —
-// `Mutex<Vec<T>>` — and reach it under `with`.
+// A Vec is a value, exclusively owned, and not internally synchronized. To share one, wrap it in
+// `Mutex<Vec<T>>` and reach it under `with`.
 //
 //     xs: Vec<int>;                   // Default: empty, no allocation
 //     xs.push(10); xs.push(20); xs.push(30);
@@ -36,7 +36,7 @@
 //     n: String = names.cloneAt(0);   // a clone, because the vector keeps its own
 //     out: String = names.pop();      // or take it out entirely
 //
-// And written as a literal, `vec![...]` -- the macro at the end of this file:
+// And written as a literal, `vec![...]` (the macro is at the end of this file):
 //
 //     v: Vec<long> = vec![1, 2, 3];        // typed by where it is stored
 //     e: Vec<P>    = vec![];               // empty, typed the same way
@@ -46,7 +46,7 @@
 // The same trap a slice or Pool bounds failure compiles to (SIGILL).
 // Every one of these ends the program. They name the operation and the index because the
 // stack trace a SIGILL leaves has neither.
-local vecEmpty what:str -> never { panicState(what, "the vector is empty"); }
+local vecEmpty what:str -> never { panicState(what, "vector is empty"); }
 
 // ─── RawVec<T>: the owning allocation ───────────────────────────────────────
 // A typed heap pointer (null while unallocated) and how many T's it can hold. Frees the block
@@ -59,9 +59,9 @@ methods RawVec<T> for Default {
 methods RawVec<T> for Drop {
     drop &self -> void { unsafe { if (self.cap > 0) { free(self.ptr); } } }
 }
-// No bound: this moves BLOCKS, never individual values. Relocating the buffer is one memcpy
+// No bound: this moves blocks, never individual values. Relocating the buffer is one memcpy
 // of the bytes an element happens to occupy, which is as true of an owning element as a Copy
-// one — the element is not duplicated, it is somewhere else afterwards.
+// one: the element is not duplicated, it is somewhere else afterwards.
 methods RawVec<T> {
     // Room for at least `need` elements: grow to max(need, 2*cap, 4), through realloc (in place
     // when the block has the room, its pages moved when it is large, else a copy).
@@ -80,9 +80,9 @@ methods RawVec<T> {
 }
 
 // ─── Vec<T>: the sequence ───────────────────────────────────────────────────
-// Vec's Drop releases the LIVE ELEMENTS; `buf` then frees the block on its own, since a
+// Vec's Drop releases the live elements; `buf` then frees the block on its own, since a
 // hand-written drop runs before the fields' glue. Derived glue alone would do only the second
-// half, which is right for a Copy element and a leak for an owning one — the elements are
+// half, which is right for a Copy element and a leak for an owning one. The elements are
 // the vector's to release, and nothing else knows how many are live.
 pub struct Vec<T> { buf: RawVec<T>, count: long }
 
@@ -96,7 +96,7 @@ methods Vec<T> for Default {
         return Vec { buf: r, count: 0 };
     }
 }
-// Everything that MOVES an element rather than reading one: available for every T.
+// Everything that moves an element rather than reading one: available for every T.
 // A Vec of the arguments, in order: what `vec![a, b, c]` expands to, and usable as it is.
 pub vecOf<T: Copy> xs:...T -> Vec<T> {
     v: Vec<T>;
@@ -117,19 +117,19 @@ methods Vec<T> {
     isEmpty &self -> bool { return self.count == 0; }
 
     // Room for `additional` more elements beyond the current length. `xs: Vec<T>;
-    // xs.reserve(n)` is the with-capacity idiom — construction is Default, capacity a method.
+    // xs.reserve(n)` is the with-capacity idiom: construction is Default, and capacity is a method.
     reserve &self additional:long -> void { self.buf.reserve(self.count + additional); }
 
-    // Amortized O(1).
+    // Amortized O(1). The full test first: inlined, the common case is one compare.
     push &self v:T -> void {
-        self.buf.reserve(self.count + 1);
+        if (self.count == self.buf.cap) { self.buf.reserve(self.count + 1); }
         unsafe { self.buf.ptr[self.count] = v; }
-        self.count = self.count + 1;
+        self.count += 1;
     }
 
     pop &self -> T {
         if (self.count <= 0) { vecEmpty("Vec.pop"); }
-        self.count = self.count - 1;
+        self.count -= 1;
         unsafe { return self.buf.ptr[self.count]; }
     }
     // The last element, or None when there is none: `pop` for a caller that expects emptiness.
@@ -138,7 +138,7 @@ methods Vec<T> {
         return Option.Some(self.pop());
     }
 
-    // Replaces element i. The one it replaces is released first — overwriting an owning
+    // Replaces element i. The one it replaces is released first, because overwriting an owning
     // element without dropping it leaks whatever it held.
     set &self i:long v:T -> void {
         if (i < 0 || i >= self.count) { panicIndex("Vec.set", i, self.count); }
@@ -171,7 +171,24 @@ methods Vec<T> {
             while (k > i) { p[k] = p[k - 1]; k = k - 1; }    // [i, count) -> [i+1, count+1)
             p[i] = v;
         }
-        self.count = self.count + 1;
+        self.count += 1;
+    }
+
+    // The elements from `at` on, moved into a new Vec in one pass; this one keeps [0, at).
+    // Rust's split_off.
+    splitOff &self at:long -> Vec<T> {
+        if (at < 0 || at > self.count) { panicIndex("Vec.splitOff", at, self.count); }
+        out: Vec<T>;
+        n: long = self.count - at;
+        out.buf.reserve(n);
+        unsafe {
+            src: *T = self.buf.ptr;
+            dst: *T = out.buf.ptr;
+            for k in 0..n { dst[k] = src[at + k]; }
+        }
+        out.count = n;
+        self.count = at;
+        return out;
     }
 
     // Remove element i (0..len-1), shifting the tail left. O(n).
@@ -183,7 +200,7 @@ methods Vec<T> {
             r = p[i];
             for k in i..self.count - 1 { p[k] = p[k + 1]; }   // (i, count) -> [i, count-1)
         }
-        self.count = self.count - 1;
+        self.count -= 1;
         return r;
     }
 
@@ -201,8 +218,8 @@ methods Vec<T> {
     clear &self -> void { self.truncate(0); }
 }
 
-// `xs[i]` is a BORROW of the element -- read a field of it, call a method on it, write a field
-// through it, hand it to a function that borrows -- and so it works for every element type: an
+// `xs[i]` is a borrow of the element (read a field of it, call a method on it, write a field
+// through it, hand it to a function that borrows), so it works for every element type: an
 // owning element is never copied out, only reached. Binding it to a local copies, which a Copy
 // type allows and an owning one refuses (clone it, or `pop`). `xs[i] = v` replaces the whole
 // element, releasing the old one.
@@ -216,21 +233,27 @@ methods Vec<T> for IndexSet<long, T> {
     setAt &self i:long v:T -> void { self.set(i, v); }
 }
 
-// Reading an element WITHOUT removing it. For a Copy type the bytes are the value, so the
+// Reading an element without removing it. For a Copy type the bytes are the value, so the
 // vector keeps its own and the caller gets one for free.
 methods Vec<T: Copy> {
-    // Every element of `other`, appended. One `reserve` for the whole run rather than a growth
-    // check per element, which is the point of having this rather than a push loop written out
-    // at each call site. `other` is lent and keeps its elements, which is why this is here
-    // rather than above: for an owning element, move them out one at a time with `pop`.
+    // Append every element of `other`: one `reserve` for the whole run and one block copy,
+    // since a Copy element is its bytes (a push apiece cost a growth check and a store per
+    // element, which on a byte vector is most of the work). `other` is only lent and keeps its
+    // elements, so this needs Copy and lives here rather than above. For owning elements, move
+    // them across one at a time with `pop`.
     extend &self other:Vec<T> -> void {
-        self.reserve(other.len());
-        for x in other { self.push(x); }
+        n: long = other.len();
+        if (n <= 0) { return; }
+        self.reserve(n);
+        unsafe { memcpy((self.buf.ptr + self.count) as long, other.buf.ptr as long, n * sizeof(T)); }
+        self.count += n;
     }
     // The same from a slice: an array's elements, or a variadic's.
     extendSlice &self xs:[T] -> void {
+        if (xs.len <= 0) { return; }
         self.reserve(xs.len);
-        for x in xs { self.push(x); }
+        unsafe { memcpy((self.buf.ptr + self.count) as long, xs.ptr as long, xs.len * sizeof(T)); }
+        self.count += xs.len;
     }
     // The first element; traps on an empty vector, like `last`.
     first &self -> T {
@@ -249,11 +272,11 @@ methods Vec<T: Copy> {
     }
 }
 
-// The same read for an element that OWNS something. There is no free copy to hand out — two
-// owners of one buffer is a double free — so the duplicate is explicit, and named so at the
+// The same read for an element that owns something. There is no free copy to hand out (two
+// owners of one buffer is a double free), so the duplicate is explicit, and named so at the
 // call site. `pop` is still there when you want the element itself rather than a copy.
 // A deep copy, each element cloned. Without it Clone would be derived field by field, and the
-// copy would share this vector's buffer — and free it a second time.
+// copy would share this vector's buffer and free it a second time.
 methods Vec<T: Clone> for Clone {
     clone &self -> Vec<T> {
         out: Vec<T>;
@@ -277,7 +300,7 @@ methods Vec<T: Clone> {
 
 // `vec![ ... ]`: the compiler hands the macro the source between the brackets, it splits that
 // on the commas between elements and reads each back as code where the macro was called, and
-// the call becomes `vecOf(...)` -- or `emptyVec()` for nothing at all.
+// the call becomes `vecOf(...)`, or `emptyVec()` for nothing at all.
 //
 // A macro is written against `ast`'s `Node`, and `ast` holds a tree's children in a `Vec`, so
 // this file cannot include `ast`. It need not: a macro declaration is read once the whole

@@ -1,0 +1,10 @@
+selftests/parse_stray_err.k:7:1: error: expected a statement, found `)`
+    7 | )
+      | ^
+selftests/parse_stray_err.k:9:1: error: expected a statement, found `42`
+    9 | 42;
+      | ^
+selftests/parse_stray_err.k:11:31: error: expected an expression, found `}`
+   11 | h x:long -> long { return x + }
+      |                               ^
+3 errors generated.

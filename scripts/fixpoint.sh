@@ -1,6 +1,6 @@
 #!/bin/bash
-# gen1 builds gen2 builds gen3, and the last two must be byte-identical: the compiler has
-# reached a fixpoint on its own source. Run from the repository root.
+# gen1 builds gen2, gen2 builds gen3, and gen2.s and gen3.s must be byte-identical, which shows
+# the compiler has reached a fixpoint on its own source. Run from the repository root.
 set -e
 OUT=${1:-build}
 [ -x "$OUT/gen1" ] || scripts/build.sh "$OUT"

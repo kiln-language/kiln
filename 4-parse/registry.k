@@ -17,7 +17,7 @@ pub struct BareName { name: Sym, rival: Sym }
 // The one wording for that, so the parser (which can point at the line) and a caller with no
 // position to give both say the same thing.
 pub ambiguousName bare:str b:BareName -> String {
-    return format("'{}' is ambiguous between '{}' and '{}' — qualify it with a module (e.g. {})",
+    return format("`{}` is ambiguous\nnote: it could refer to `{}` or to `{}`\nhelp: write which one you mean, as `{}`",
                   bare, nameOf(b.name), nameOf(b.rival), nameOf(b.rival));
 }
 
@@ -30,7 +30,20 @@ pub qualifiedName mod:str bare:str -> Sym {
     return internString(s);
 }
 
-// The part of `module::Name` after the separator, or the whole thing if there is none.
+// `qualifiedName` of two symbols, with each pair worked out only once. The checker asks this for
+// every name it resolves, and building and interning the text every time was a noticeable share
+// of the compile on its own.
+local var gQualMemo: HashMap<long, long> = map![];
+pub qualifiedSym mod:Sym bare:Sym -> Sym {
+    if ((mod as long) < 0 || (bare as long) < 0) { return qualifiedName(nameOf(mod), nameOf(bare)); }
+    key: long = ((mod as long) << 32) | (bare as long);
+    hit: Option<long> = gQualMemo.find(key);
+    match hit { Some(q) { return q as Sym; } None { } }
+    q: Sym = qualifiedName(nameOf(mod), nameOf(bare));
+    gQualMemo.put(key, q as long);
+    return q;
+}
+
 // The module a qualified name was declared in: everything before the last `::`. NO_SYM when the
 // name carries no module, which is what a runtime hook and a trait's flat name look like.
 pub moduleOfName q:str -> Sym {
@@ -46,14 +59,14 @@ pub moduleOfName q:str -> Sym {
 
 // Every qualified declaration of one bare name, as a chain through flat arrays.
 //
-// The inverse of the walk it replaces. Resolving `opName` used to build `<module>::opName` for
-// every module the caller can see and ask whether each was declared, O(visible modules) per
-// name, and a program's build quadratic in its module count. This asks the registry for the
-// declarations of `opName` directly, which is almost always one, and then asks the graph whether
-// that one is visible.
+// Resolving `opName` by building `<module>::opName` for every module the caller can see, and
+// asking whether each was declared, costs O(visible modules) per name and makes a program's build
+// quadratic in its module count. This index answers the inverse question: it gives the
+// declarations of `opName` directly (almost always just one), and the import graph then says
+// whether that one is visible.
 //
-// A chain rather than a run because declarations arrive while the program is still being parsed,
-// and a run cannot be appended to once the next one has started.
+// It is a chain rather than a run because declarations arrive while the program is still being
+// parsed, and a run cannot be appended to once the next one has started.
 pub struct BareIndex {
     head: HashMap<str, long>,
     qual: Vec<Sym>,
@@ -88,6 +101,7 @@ methods BareIndex {
     ownerAt &self i:long -> Sym  { return self.owner.get(i); }
 }
 
+// The part of `module::Name` after the separator, or the whole thing if there is none.
 pub lastComponentOf q:str -> str {
     i: long = 0;
     cut: long = -1;
@@ -183,9 +197,10 @@ pub struct GlobalDef {
     file: Sym,
     pkg: Sym,
     init: NodeId,         // NO_NODE when it is default-initialized
-    // A global is immutable unless declared `var`: computed at compile time -- failing to is an
-    // error -- never written after (the checker refuses every write), and emitted in `.rodata`.
-    // A `var` may initialize at startup and be written; it lives in `.data`.
+    // A global is immutable unless declared `var`. An immutable one must be computed at compile
+    // time (it is an error if it cannot be), is never written afterwards (the checker refuses
+    // every write), and is emitted in `.rodata`. A `var` may be initialized at startup and
+    // written; it lives in `.data`.
     isVar: bool
 }
 
@@ -193,7 +208,7 @@ pub struct GlobalDef {
 
 pub struct AliasDef { name: Sym, target: TypeRef, visibility: Vis, file: Sym, pkg: Sym }
 
-// `<Struct>_<Trait>_vtable`. One per implementation, holding the method addresses in the
+// `vt_<Struct>_<Trait>_vtable`. One per implementation, holding the method addresses in the
 // trait's declaration order, which is the order a dispatch indexes by. Here rather than beside
 // the emitter because both the lowerer (which points at one) and the emitter (which writes one)
 // have to agree on the spelling.
@@ -207,8 +222,8 @@ pub vtableName concrete:Sym trait:Sym -> str {
     return keepString(s);
 }
 
-// `::` is not a NASM identifier character, so every symbol this compiler emits spells a module
-// qualifier with `$` instead, a function label, a global, and a vtable alike.
+// `::` is not a NASM identifier character, so every symbol this compiler emits (a function label,
+// a global, a vtable) spells a module qualifier with `$` instead.
 pub pushMangled inout s:String name:str -> void {
     i: long = 0;
     while (i < name.len) {
@@ -248,10 +263,9 @@ pub methodName owner:Sym method:Sym -> Sym {
     return out;
 }
 
-// One `T: Trait` from a template's parameter list: which parameter, and what it must implement.
-// One `T: Trait<Args>` from a template's parameter list. The arguments matter as much as the
-// trait: `count<T, I: Iter<T>>` mentions T nowhere else, so the only way to learn what T is, is
-// to see what `Iter` the concrete I implements.
+// One `T: Trait<Args>` from a template's parameter list: which parameter, and what it must
+// implement. The arguments matter as much as the trait: `count<T, I: Iter<T>>` mentions T nowhere
+// else, so the only way to learn what T is, is to see which `Iter` the concrete I implements.
 pub struct MethodBound { param: long, trait: TraitRef }
 
 // What kind of thing one template parameter is, beside its name in `gParams`: a type, or a
@@ -262,11 +276,11 @@ pub struct GParamInfo { isLen: bool, deflt: TypeRef }
 pub struct GTemplate {
     name:  Sym,
     firstParam: long, paramCount: long,     // into `gParams`
-    firstField: long, fieldCount: long,     // into `gFields` (a struct's fields, an enum's payloads
+    firstField: long, fieldCount: long,     // into `gFields`: a struct's fields, an enum's payloads
     firstVariant: long, variantCount: long, // into `gVariants`, for a sum type
-    // `struct Wrap<W: Default>`) a bound on the type's own parameter, which every instance must
-    // meet. A methods block's bounds are conditional (an instance that fails one simply has no
-    // such method); these are not, so an instance that fails one is an error at the use.
+    // The bounds on the type's own parameters (`struct Wrap<W: Default>`), which every instance
+    // must meet. A methods block's bounds are conditional (an instance that fails one simply has
+    // no such method); these are not, so an instance that fails one is an error at the use.
     firstBound: long, boundCount: long,     // into `bounds`
     isEnum: bool,
     visibility: Vis, file: Sym, pkg: Sym
@@ -295,7 +309,7 @@ pub struct Registry {
     fieldAt2:  HashMap<long, long>,   // (firstField, name) -> the field's index in the run
 
     traits:    Vec<TraitDef>,
-    traitAt:   HashMap<str, long>,
+    traitAt:   HashMap<long, long>,     // by the name's number
     traitMethods: Vec<TraitMethodSig>,
     // Every run of type references a trait needs: a declaration's parameters (`firstParam`) and
     // an instantiation's arguments (`firstArg`), which are the same shape and never overlap.
@@ -313,9 +327,14 @@ pub struct Registry {
     // The traits a module owns (declared without `pub`: `geo::Shape`), in declaration order. A
     // method call asks its own module's first (`Checker.ownTraitMethod`); few programs have any.
     ownedTraits: Vec<Sym>,
+    // What each stamped instantiation instantiates: the base trait and its arguments, found by
+    // the instance's name number (`traitInstOf`). An instance is spelled with its arguments
+    // (`Fn1_geo::P_long`), so its spelling cannot be split back into a name and arguments.
+    traitInsts: Vec<TraitRef>,
+    traitInstAt: HashMap<long, long>,
 
     globals:   Vec<GlobalDef>,
-    globalAt:  HashMap<str, long>,
+    globalAt:  HashMap<long, long>,     // by the name's number
     macroAt:   HashMap<str, long>,    // the functions declared `macro`, by qualified name
     // `trait T derive m`: the macro that writes `methods X for T` for a type with none, as
     // written, and the file the trait was declared in, which is where that name resolves.
@@ -330,29 +349,34 @@ pub struct Registry {
     // what makes it convert only by `as` and take operators only through traits.
     distinctBase: HashMap<str, TypeRef>,
 
-    // A bare name's declaration in each table, and how far each has been indexed. One index per
-    // table because the tables have a precedence, and how far because declarations arrive while
-    // the program is still being parsed.
-    // Every declared type name by its bare component, for `resolveBareIn`. One index over all
+    // Every declared type name by its bare component, for `resolveBareIn`. One index covers all
     // five tables: what it is asked is "who declares this name", and which table holds it is a
     // question only the answer needs.
     byBare: BareIndex,
 
+    // A bare name's first declaration in each table, and how far each table has been indexed.
+    // There is one index per table because the tables have a precedence (`endsWithName`), and
+    // each remembers how far it got because declarations arrive while the program is still
+    // being parsed.
     byStructLast: HashMap<str, Sym>, byEnumLast:  HashMap<str, Sym>,
     byTemplateLast: HashMap<str, Sym>, byTraitLast: HashMap<str, Sym>,
     byAliasLast: HashMap<str, Sym>,
     lastStructs: long, lastEnums: long, lastTemplates: long, lastTraits: long, lastAliases: long,
 
     templates: Vec<GTemplate>,
-    templateAt: HashMap<str, long>,
+    templateAt: HashMap<long, long>,    // by the name's number
     gVariants: Vec<GVariant>,
     bounds:    Vec<MethodBound>,
     gParams:   Vec<Sym>,
     gParamInfo: Vec<GParamInfo>,      // parallel to `gParams`
     gFields:   Vec<GField>,
     requests:  Vec<GRequest>,
-    requestIx: HashMap<str, long>,    // instance name -> its request, so asking is not a scan
+    requestIx: HashMap<long, long>,   // instance name (its number) -> its request, so asking is not a scan
     gArgs:     Vec<TypeRef>,
+    // The structs a closure literal was desugared into (its captures), by the name's number: the
+    // parser's own, and every instance requested of a generic one. Asked by name rather than read
+    // off the spelling, which an instance ends with its last argument's (`m::$closure0_7_m::P`).
+    closureEnvs: HashMap<long, bool>,
 
     // Requests a dependency's unchecked bodies made, held back (see `request`). `deferIn` is the
     // module whose body the parser is reading when it is one of those, NO_SYM otherwise.
@@ -362,13 +386,26 @@ pub struct Registry {
     deferReq:    Vec<long>,           // per module, a chain of the requests its bodies held
     deferNext:   Vec<long>,
     deferHead:   HashMap<str, long>,
-    released:    Vec<long>            // let go since monomorphization last drained
+    released:    Vec<long>,           // let go since monomorphization last drained
+
+    // While the parser reads its own modules (`journal`), the keys that the sets above holding no
+    // index (`macroAt`, `deriveBy` and `deriveIn`, `distinctBase`, `closureEnvs`, `implFnSet`)
+    // gained, as pairs of a `KEY_*` tag and the name: what `rewindTo` takes back out of them. A
+    // table holding an index needs no record, since its new entries point past the mark.
+    journal:     bool,
+    added:       Vec<long>
 }
 
+local KEY_MACRO: long = 1;
+local KEY_DERIVE: long = 2;
+local KEY_DISTINCT: long = 3;
+local KEY_CLOSURE: long = 4;
+local KEY_IMPLFN: long = 5;
+
 // ─── what a `...any` box says, as `stdlib::fmt` reads it ─────────────────────
-// The tag a box gets for a kind `fmt.k`'s own `BoxTag` names a variant for (`Bool`), read from
-// that enum, so the compiler and the library cannot disagree: a library without the variant
-// gets `dflt`, the tag it always read that kind with.
+// The tag a box gets for a kind that `fmt.k`'s own `BoxTag` enum names a variant for (`Bool`).
+// It is read from that enum so the compiler and the library cannot disagree; a library without
+// the variant gets `dflt`, the tag it has always read that kind with.
 pub boxTagOf variant:str dflt:long -> long {
     ei: long = gReg.findEnum(FMT_BOX_TAG);
     if (ei < 0) { return dflt; }
@@ -393,13 +430,13 @@ pub var gCallHints: HashMap<long, long> = map![];
 pub var gHintTraits: Vec<Sym> = vec![];
 
 // ─── where an instance came from ─────────────────────────────────────────────
-// For an error's "instantiated from" notes (`parse::diag`): where each generic instance was first
-// asked for (a type's, `Vec_String`, or a function's, `vecOf_long`), and the instance whose code
-// asked, NO_SYM when it was code nothing stamped. `gCtxInst` is the instance whose code is being
-// worked on now: monomorphization sets it while it clones one, the checker while it types one.
-// And the instance (or derive) each stamped function belongs to. Kept beside the registry rather
-// than in it: nothing here crosses into a `.klib`, so a dependency's instances' chains stop at
-// the dependency.
+// For an error's "in instantiation of" notes (`parse::diag`): where each generic instance was
+// first asked for (a type's, `Vec_String`, or a function's, `vecOf_long`) and which instance's
+// code asked for it (NO_SYM when it was code nothing stamped), plus the instance (or derive) each
+// stamped function belongs to. `gCtxInst` is the instance whose code is being worked on right
+// now: monomorphization sets it while it clones one, and the checker while it types one. This is
+// kept beside the registry rather than in it because none of it goes into a `.klib`, so the
+// chain for a dependency's instance stops at the dependency.
 pub struct Origin { pos: long, parent: Sym, label: Sym }   // label: how a note names it, if not by its type
 pub var gCtxInst: Sym = NO_SYM;
 local var gOrigins: HashMap<str, Origin> = map![];
@@ -411,6 +448,9 @@ pub noteOrigin inst:Sym pos:long label:Sym -> void {
     if (parent == inst) { parent = NO_SYM; }
     gOrigins.put(nameOf(inst), Origin { pos: pos, parent: parent, label: label });
 }
+// A request taken back with the declaration that made it (`Registry.rewindTo`). While the parser
+// runs, only a new request notes an origin, so the request's is the one there.
+pub forgetOrigin inst:Sym -> void { gOrigins.remove(nameOf(inst)); }
 pub originOf inst:Sym -> Origin {
     hit: Option<Origin> = gOrigins.find(nameOf(inst));
     match hit { Some(o) { return o; } None { } }
@@ -444,11 +484,11 @@ pub enterFnAtDef fn:Sym -> void {
     gPos = fnPosOf(fn);
 }
 
-// The keys the two indexes below are built on: two numbers in one word. A struct's field run
-// identifies the struct (the run never moves once appended) so a field needs no copy of its
-// owner's name; an implementation is its type's name and its trait's, each a `Sym`. They were
-// strings, built and interned for every lookup, and the registry is asked one per field access
-// and per "does it implement".
+// The keys the two indexes below are built on: two numbers packed into one word. A struct's field
+// run identifies the struct (the run never moves once appended), so a field needs no copy of its
+// owner's name; an implementation is keyed by its type's name and its trait's, each a `Sym`.
+// String keys would have to be built and interned for every lookup, and the registry is asked
+// once per field access and once per "does it implement".
 local fieldKey firstField:long name:Sym -> long {
     return (firstField << 32) | (name as long);
 }
@@ -456,8 +496,9 @@ local implKey structName:Sym trait:Sym -> long {
     return ((structName as long) << 32) | (trait as long);
 }
 
-// One last-component index. Free functions rather than methods: `self.f(&self.map, ..)` lends
-// `self` mutably while a field of it is lent as well, which exclusivity refuses: rightly.
+// Lookups in one last-component index. These are free functions rather than methods because
+// `self.f(&self.map, ..)` would lend `self` mutably while one of its fields is lent as well,
+// which exclusivity (rightly) refuses.
 local lastHit inout m:HashMap<str, Sym> bare:str -> Sym {
     hit: Option<Sym> = m.find(bare);
     match hit { Some(n) { return n; } None { } }
@@ -476,7 +517,7 @@ methods Registry for Default {
                           traits: vec![], traitAt: map![], traitMethods: vec![],
                           traitArgs: vec![], impls: vec![], implFns: vec![],
                           implAt2: map![], implNext: vec![], implFnSet: map![], carriedOwners: map![],
-                          carriedNext: vec![], ownedTraits: vec![],
+                          carriedNext: vec![], ownedTraits: vec![], traitInsts: vec![], traitInstAt: map![],
                           globals: vec![], globalAt: map![], macroAt: map![],
                           deriveBy: map![], deriveIn: map![], globalOrder: vec![],
                           aliases: vec![], aliasAt: map![], distinctBase: map![],
@@ -487,9 +528,9 @@ methods Registry for Default {
                           lastTraits: 0, lastAliases: 0,
                           templates: vec![], templateAt: map![], gVariants: vec![], bounds: vec![],
                           gParams: vec![], gParamInfo: vec![], gFields: vec![],
-                          requests: vec![], requestIx: map![], gArgs: vec![],
+                          requests: vec![], requestIx: map![], gArgs: vec![], closureEnvs: map![],
                           deferIn: NO_SYM, reqDeferred: vec![], reqPos: vec![], deferReq: vec![], deferNext: vec![],
-                          deferHead: map![], released: vec![] };
+                          deferHead: map![], released: vec![], journal: false, added: vec![] };
     }
 }
 
@@ -554,11 +595,12 @@ methods Registry {
         return NOT_FOUND;
     }
     hasStruct &self q:str -> bool { return self.findStruct(q) >= 0; }
+    hasStructSym &self n:Sym -> bool { return self.findStructSym(n) >= 0; }
     structDef &self i:long -> StructDef { return self.structs.get(i); }
     structCount &self -> long { return self.structs.len(); }
     // Re-place a struct's fields from the sizes its field types have now. A struct is laid out
     // when it is parsed, and a field naming a generic instance had no size then (nothing had
-    // stamped it) so it took zero bytes and every field after it landed on top of it. Answers
+    // stamped it), so it took zero bytes and every field after it landed on top of it. Returns
     // whether anything actually moved, which is what lets the caller repeat to a fixpoint.
     relayoutStruct &self i:long -> bool {
         d: StructDef = self.structs.get(i);
@@ -567,7 +609,7 @@ methods Registry {
         moved: bool = false;
         for k in 0..d.fieldCount {
             f: FieldDef = self.fields.get(d.firstField + k);
-            p: Placed = placeField(cursor, f);
+            p: Placed = self.placeFieldIn(cursor, f);
             if (p.field.offset != f.offset) { moved = true; }
             self.fields.set(d.firstField + k, p.field);
             cursor = p.next;
@@ -584,14 +626,14 @@ methods Registry {
     // declaration order, so a variant's `firstPayload` is one past the tag. This is what sizes
     // `Many(Vec<Tree>)` inside `Tree`: `Vec<Tree>` had no size while `Tree` was being read.
     relayoutSum &self i:long d:StructDef -> bool {
-        e: long = self.findEnum(nameOf(d.name));
+        e: long = self.findEnumSym(d.name);
         if (e < 0) { return false; }
         ed: EnumDef = self.enumDef(e);
         tagSize: long = typeInfo(ed.backing).size;
         maxAlign: long = tagSize;
         for k in 1..d.fieldCount {
             f: FieldDef = self.fields.get(d.firstField + k);
-            a: long = typeSizeOf(f.kind, f.structName);
+            a: long = self.typeSizeIn(f.kind, f.structName);
             if (isAggregate(f.kind)) { a = 8; }
             if (a > maxAlign) { maxAlign = a; }
         }
@@ -604,7 +646,7 @@ methods Registry {
             for j in 0..var.payloadCount {
                 at: long = d.firstField + 1 + var.firstPayload + j;
                 f: FieldDef = self.fields.get(at);
-                p: Placed = placeField(cursor, f);
+                p: Placed = self.placeFieldIn(cursor, f);
                 if (p.field.offset != f.offset) { moved = true; }
                 self.fields.set(at, p.field);
                 cursor = p.next;
@@ -620,11 +662,12 @@ methods Registry {
     }
     fieldAt &self d:StructDef k:long -> FieldDef { return self.fields.get(d.firstField + k); }
 
-    // A field by name, or NOT_FOUND. Keyed on the field's position in the flat `fields` vector (
-    // `firstField + <name>`) which identifies it without building a key from the struct's own
-    // name, and stays valid because a struct's run never moves once appended. It is not a
-    // handful-of-fields lookup any more: the checker asks it per field access, per struct
-    // literal initializer and per drop-glue walk, over structs with dozens of fields.
+    // A field by name, or NOT_FOUND. It is keyed on where the struct's run starts in the flat
+    // `fields` vector together with the name (`fieldKey`), which identifies the field without
+    // building a key from the struct's own name, and stays valid because a struct's run never
+    // moves once appended. This is not a handful-of-fields lookup: the checker asks it per field
+    // access, per struct literal initializer and per drop-glue walk, over structs with dozens of
+    // fields.
     findField &self d:StructDef name:str -> long { return self.findFieldSym(d, intern(name)); }
     // The same for a name already interned: what nearly every caller holds.
     findFieldSym &self d:StructDef name:Sym -> long {
@@ -657,8 +700,12 @@ methods Registry {
         return NOT_FOUND;
     }
     isEnumType &self q:str -> bool { return self.findEnum(q) >= 0; }
+    isEnumTypeSym &self n:Sym -> bool { return self.findEnumSym(n) >= 0; }
     // A distinct type's base (`type Meters = distinct long` -> long), recorded once its enum is.
-    addDistinct &self name:Sym base:TypeRef -> void { self.distinctBase.put(nameOf(name), base); }
+    addDistinct &self name:Sym base:TypeRef -> void {
+        if (self.journal && !self.distinctBase.has(nameOf(name))) { self.noteAdded(KEY_DISTINCT, name); }
+        self.distinctBase.put(nameOf(name), base);
+    }
     // The base of the distinct type `n`, or `Lit.Void` when `n` is not one.
     distinctOf &self n:Sym -> TypeRef {
         if (n == NO_SYM || self.distinctBase.len() == 0) { return TypeRef { base: Lit.Void, name: NO_SYM }; }
@@ -745,14 +792,13 @@ methods Registry {
     // generic struct is laid out before anything reads its fields. Idempotent: a second use of
     // the same instantiation finds the first.
     stampTrait &self base:Sym args:Vec<TypeRef> -> Sym {
-        at: long = self.findTrait(nameOf(base));
+        at: long = self.findTraitSym(base);
         if (at < 0) { return base; }
         d: TraitDef = self.traits.get(at);
         if (d.paramCount == 0 || args.len() != d.paramCount) { return base; }
-        inst: Sym = intern(self.traitMangled(TraitRef { name: base,
-                                                       firstArg: self.addTraitArgs(args),
-                                                       argCount: args.len() }));
-        if (self.findTrait(nameOf(inst)) >= 0) { return inst; }
+        ref: TraitRef = TraitRef { name: base, firstArg: self.addTraitArgs(args), argCount: args.len() };
+        inst: Sym = intern(self.traitMangled(ref));
+        if (self.findTraitSym(inst) >= 0) { return inst; }
 
         sigs: Vec<TraitMethodSig>;
         for k in 0..d.methodCount {
@@ -766,8 +812,20 @@ methods Registry {
         self.traitMethods.extend(sigs);
         self.traits.push(TraitDef { name: inst, firstMethod: firstMethod,
                                     methodCount: sigs.len(), firstParam: 0, paramCount: 0 });
-        self.traitAt.put(nameOf(inst), self.traits.len() - 1);
+        self.traitAt.put(inst as long, self.traits.len() - 1);
+        self.traitInsts.push(ref);
+        self.traitInstAt.put(inst as long, self.traitInsts.len() - 1);
         return inst;
+    }
+    // The base trait and arguments a stamped instance was made from, or -1 for a trait that is
+    // no instance; `traitInstRef` reads it.
+    traitInstOf &self t:Sym -> long {
+        if (self.traitInstAt.isEmpty()) { return NOT_FOUND; }
+        hit: Option<long> = self.traitInstAt.find(t as long);
+        match hit { Some(i) { return i; } None { } }
+        return NOT_FOUND;
+    }
+    traitInstRef &self i:long -> TraitRef { return self.traitInsts.get(i);
     }
 
     // One type from a trait's signature under an instantiation's arguments: a parameter becomes
@@ -815,27 +873,34 @@ methods Registry {
     }
     implFnAt &self im:TraitImplDef k:long -> Sym { return self.implFns.get(im.firstFn + k); }
     implAt &self i:long -> TraitImplDef { return self.impls.get(i); }
+    // Whether `f` is a method of some implementation: a function a vtable may hold.
+    isImplFn &self f:Sym -> bool { return self.implFnSet.has(nameOf(f)); }
 
-    findTrait &self q:str -> long {
-        hit: Option<long> = self.traitAt.find(q);
+    findTrait &self q:str -> long { return self.findTraitSym(symIfAny(q)); }
+    findTraitSym &self n:Sym -> long {
+        hit: Option<long> = self.traitAt.find(n as long);
         match hit { Some(i) { return i; } None { } }
         return NOT_FOUND;
     }
 
-    // An implementation whose functions are its type's plain `Owner_method`s (or carry a trait
-    // that always carries: `implFnNameAs`). One named by `implFnName` for an implementation not
-    // registered yet says what that chose: `addImplAs(..., flatCarries(...))`.
+    // Registers an implementation whose functions are its type's plain `Owner_method`s (or carry
+    // the name of a trait that always carries it; see `implFnNameAs`). An implementation whose
+    // functions `implFnName` named before it was registered has to pass on what that chose:
+    // `addImplAs(..., flatCarries(...))`.
     addImpl &self structName:Sym t:TraitRef fns:Vec<Sym> -> void {
         self.addImplAs(structName, t, fns, false);
     }
     addImplAs &self structName:Sym t:TraitRef fns:Vec<Sym> carried:bool -> void {
         first: long = self.implFns.len();
         self.implFns.extend(fns);
-        for f in fns { self.implFnSet.put(nameOf(f), true); }
+        for f in fns {
+            if (self.journal && !self.implFnSet.has(nameOf(f))) { self.noteAdded(KEY_IMPLFN, f); }
+            self.implFnSet.put(nameOf(f), true);
+        }
         self.impls.push(TraitImplDef { structName: structName, trait: t,
                                        firstFn: first, fnCount: fns.len(), carried: carried });
         self.carriedNext.push(NOT_FOUND);
-        if (carried && !traitCarriesName(t)) {
+        if (carried && !self.carriesName(t)) {
             c: long = self.impls.len() - 1;
             ch: Option<long> = self.carriedOwners.find(nameOf(structName));
             match ch {
@@ -884,9 +949,9 @@ methods Registry {
         return false;
     }
     // The impl behind a trait object's vtable: the one for `concrete` whose trait instantiation
-    // mangles to `mangled` -- the spelling `vtableName` is built from. A scan: the key table is
-    // by the trait's bare name, and a mangled instantiation cannot be split back into name and
-    // arguments without guessing, while dispatch at compile time is rare.
+    // mangles to `mangled`, the spelling `vtableName` is built from. This is a scan, because the
+    // key table is by the trait's bare name and a mangled instantiation cannot be split back into
+    // name and arguments without guessing; dispatch at compile time is rare enough not to mind.
     findImplMangled &self concrete:Sym mangled:Sym -> long {
         for i in 0..self.impls.len() {
             im: TraitImplDef = self.impls.get(i);
@@ -894,19 +959,19 @@ methods Registry {
         }
         return NOT_FOUND;
     }
-    // Make sure the (concrete, trait) impl a trait object names is registered, so its vtable is
-    // emitted. What the lowerer's `noteTraitImpl` does for the coercions it makes itself.
+    // Makes sure the (concrete, trait) impl a trait object names is registered, so that its vtable
+    // is emitted. The lowerer's `noteTraitImpl` does the same for the coercions it makes itself.
     ensureImpl &self concrete:Sym trait:Sym -> void {
         if (concrete == NO_SYM || trait == NO_SYM) { return; }
         tr: TraitRef = TraitRef { name: trait, firstArg: 0, argCount: 0 };
         if (self.implementsTrait(concrete, tr)) { return; }
-        at: long = self.findTrait(nameOf(trait));
+        at: long = self.findTraitSym(trait);
         if (at < 0) { return; }
         t: TraitDef = self.traitDef(at);
         fns: Vec<Sym>;
         carried: bool = self.flatCarries(concrete, tr);
         for k in 0..t.methodCount {
-            fns.push(implFnNameAs(concrete, tr, self.traitMethodAt(t, k).name, carried));
+            fns.push(self.implFnNameIn(concrete, tr, self.traitMethodAt(t, k).name, carried));
         }
         self.addImplAs(concrete, tr, fns, carried);
     }
@@ -917,14 +982,14 @@ methods Registry {
     // and a call `x.m()` that cannot tell them apart says so (`Checker.carriedAmbiguity`). A core
     // trait never carries: its methods' names are built by hand all over the compiler.
     flatCarries &self s:Sym t:TraitRef -> bool {
-        if (t.name == NO_SYM || traitCarriesName(t)) { return false; }
+        if (t.name == NO_SYM || self.carriesName(t)) { return false; }
         i: long = self.firstImplOf(s, t.name);
         if (i >= 0) { return self.impls.get(i).carried; }
         // Nor does a callable's `FnN` at its arguments (`Fn0_long`), which a closure implements
         // with the one `call` its `FnN` has.
         tn: str = nameOf(t.name);
         if (isCoreTraitName(tn) || (strStartsWith(tn, "Fn") && tn.len > 2 && isDigit(charAt(tn, 2)))) { return false; }
-        ti: long = self.findTrait(nameOf(t.name));
+        ti: long = self.findTraitSym(t.name);
         if (ti < 0) { return false; }
         td: TraitDef = self.traitDef(ti);
         for k in 0..td.methodCount {
@@ -969,25 +1034,29 @@ methods Registry {
     implementsNamed &self s:Sym t:str -> bool {
         return self.implementsTrait(s, TraitRef { name: intern(t), firstArg: 0, argCount: 0 });
     }
+    // The same for a trait whose name the caller holds.
+    implementsSym &self s:Sym t:Sym -> bool {
+        return self.implementsTrait(s, TraitRef { name: t, firstArg: 0, argCount: 0 });
+    }
 
     // A struct needs Drop if it implements it directly, or transitively holds a field that does:
     // drop glue is synthesized for the latter. The recursion terminates because a field is
     // declared before its owner, so a value type cannot contain itself.
     //
-    // An instance of a template is asked of the template as well: whether it owns something is
-    // fixed by its declaration, not by how far monomorphization has got. Asking only what has
-    // been registered for the instance answered "no" for `Vec<Tree>` while it was being stamped
-    // (its `Drop` is registered after its methods), and so for `Tree` that holds one: `Tree`
-    // counted as `Copy`, and `methods Vec<T: Copy>` was stamped and checked for `Vec<Tree>`
-    // (STDLIB_REVIEW gap 36). A type that reaches itself only through templates that release
-    // nothing does not need it; the depth bound is what decides that.
+    // For an instance of a template the template is asked as well, because whether it owns
+    // something is fixed by its declaration, not by how far monomorphization has got. Asking only
+    // what has been registered for the instance would answer "no" for `Vec<Tree>` while it is
+    // being stamped (its `Drop` is registered after its methods), and so also for a `Tree` that
+    // holds one. `Tree` would then count as `Copy`, and `methods Vec<T: Copy>` would be stamped
+    // and checked for `Vec<Tree>`. A type that reaches itself only through templates that release
+    // nothing does not need Drop; the depth bound is what decides that.
     needsDrop &self s:Sym -> bool { return self.needsDropAt(s, 0); }
     needsDropAt &self s:Sym depth:long -> bool {
         if (s == NO_SYM || depth > 32) { return false; }
-        if (self.implementsNamed(s, "Drop")) { return true; }
-        r: long = self.findRequest(nameOf(s));
-        if (r >= 0 && self.implementsNamed(self.requestAt(r).base, "Drop")) { return true; }
-        at: long = self.findStruct(nameOf(s));
+        if (self.implementsSym(s, dropName())) { return true; }
+        r: long = self.findRequestSym(s);
+        if (r >= 0 && self.implementsSym(self.requestAt(r).base, dropName())) { return true; }
+        at: long = self.findStructSym(s);
         if (at < 0) {
             if (r < 0) { return false; }
             return self.templateOwns(self.requestAt(r), depth + 1);
@@ -999,11 +1068,12 @@ methods Registry {
         }
         return false;
     }
-    // An instance not stamped yet, from its template's fields at its arguments: a field that is a
-    // parameter owns what its argument owns; one naming a type owns what that type owns, and one
-    // naming another instance over the parameters (`v: Vec<T>`) what that template owns.
+    // Whether an instance not stamped yet owns something, decided from its template's fields at
+    // its arguments. A field that is a parameter owns what its argument owns, a field naming a
+    // type owns what that type owns, and one naming another instance over the parameters
+    // (`v: Vec<T>`) owns what that template owns.
     templateOwns &self r:GRequest depth:long -> bool {
-        ti: long = self.findTemplate(nameOf(r.base));
+        ti: long = self.findTemplateSym(r.base);
         if (ti < 0 || depth > 32) { return false; }
         t: GTemplate = self.templateDef(ti);
         for k in 0..t.fieldCount {
@@ -1029,15 +1099,18 @@ methods Registry {
         return true;   // scalars, views, function and raw pointers: all plain bits
     }
 
-    // Why the struct `s` has no `Clone`, or "" when it has one: written (`methods S for Clone`),
-    // stamped for an instance whose bound held, or derivable. A type that owns nothing is `Copy`,
-    // and its clone is the copy. Otherwise a derived clone copies what is plain and clones what
-    // owns, field by field, so it exists exactly when that is a real duplicate: never for a type
-    // with a `drop` of its own (what it owns sits behind its own pointers, which a field-wise copy
-    // would share, and both values would release them), never past a raw pointer (the copy would
-    // point at what the original does), an array of owning elements, or a field that has no
-    // `Clone` itself. Decided from the declarations alone, so the checker refusing a call and
-    // monomorphization deciding a `T: Clone` bound give one answer.
+    // Why the struct `s` has no `Clone`, or "" when it has one. It has one when it is written
+    // (`methods S for Clone`), stamped for an instance whose bound held, or derivable. A type
+    // that owns nothing is `Copy`, and its clone is the copy. Otherwise a derived clone copies
+    // what is plain and clones what owns, field by field, so it exists exactly when that makes a
+    // real duplicate. It never does for a type with a `drop` of its own (what it owns sits behind
+    // its own pointers, which a field-wise copy would share, and both values would release them),
+    // nor past a raw pointer (the copy would point at what the original does) or a field that has
+    // no `Clone` itself. It is decided from the declarations alone, so the checker refusing a call
+    // and monomorphization deciding a `T: Clone` bound give the same answer.
+    //
+    // The reason is a lowercase clause that the checker prints after `note: `, with names in
+    // backticks. When a field is the reason, the field's own reason follows it after a colon.
     //
     // A recursive type (`enum Tree { Leaf(long), Many(Vec<Tree>) }`) is decided coinductively:
     // a type already being asked about counts as having one, and an instance of a generic type
@@ -1053,7 +1126,7 @@ methods Registry {
         if (!self.needsDrop(s)) { return ""; }
         for k in 0..visiting.len() { if (visiting.get(k) == s) { return ""; } }
         if (self.structImplements(nameOf(s), intern("Drop")) && !self.cloneByTemplate(s)) {
-            return "it owns a resource (implements Drop)";
+            return "it owns a resource (it implements `Drop`)";
         }
         visiting.push(s);
         why: str = self.cloneBlockerOf(s, &visiting);
@@ -1063,26 +1136,26 @@ methods Registry {
     // An instance of a generic type whose template writes its own `Clone`: its clone is that one,
     // stamped, and never a derived one.
     cloneByTemplate &self s:Sym -> bool {
-        r: long = self.findRequest(nameOf(s));
+        r: long = self.findRequestSym(s);
         return r >= 0 && self.structImplements(nameOf(self.requestAt(r).base), intern("Clone"));
     }
     cloneBlockerOf &self s:Sym inout visiting:Vec<Sym> -> str {
         // An instance whose template implements Clone: its own implementation's bound is on the
         // type arguments, so they are what is asked.
         if (self.cloneByTemplate(s)) {
-            req: GRequest = self.requestAt(self.findRequest(nameOf(s)));
+            req: GRequest = self.requestAt(self.findRequestSym(s));
             for k in 0..req.argCount {
                 t: TypeRef = self.gArgAt(req, k);
                 if (t.base == Lit.Struct && t.name != NO_SYM) {
                     inner: str = self.cloneBlockerIn(t.name, &visiting);
-                    if (inner.len > 0) { return keepString(format("its element {} has no Clone: {}", nameOf(t.name), inner)); }
+                    if (inner.len > 0) { return keepString(format("its element type `{}` has no `Clone`: {}", nameOf(t.name), inner)); }
                 } else if (t.base == Lit.TraitObj || t.base == Lit.TypeVar) {
-                    return keepString(format("its element {} has no Clone", nameOf(t.name)));
+                    return keepString(format("its element type `{}` has no `Clone`", nameOf(t.name)));
                 }
             }
             return "";
         }
-        at: long = self.findStruct(nameOf(s));
+        at: long = self.findStructSym(s);
         if (at < 0) { return ""; }
         d: StructDef = self.structs.get(at);
         for k in 0..d.fieldCount {
@@ -1092,13 +1165,11 @@ methods Registry {
                                          cloneFieldLabel(d, f.name)));
             }
             if (f.kind == Lit.Struct && self.needsDrop(f.structName)) {
-                if (f.isArray) {
-                    return keepString(format("{} is an array of {}, which owns a resource",
-                                             cloneFieldLabel(d, f.name), nameOf(f.structName)));
-                }
+                // An array of owning elements is cloned element by element, so it has a clone
+                // exactly when its element does.
                 inner: str = self.cloneBlockerIn(f.structName, &visiting);
                 if (inner.len > 0) {
-                    return keepString(format("{} ({}) has no Clone: {}", cloneFieldLabel(d, f.name),
+                    return keepString(format("{} (`{}`) has no `Clone`: {}", cloneFieldLabel(d, f.name),
                                              nameOf(f.structName), inner));
                 }
             }
@@ -1110,11 +1181,12 @@ methods Registry {
 
     addGlobal &self g:GlobalDef -> void {
         self.globals.push(g);
-        self.globalAt.put(nameOf(g.name), self.globals.len() - 1);
+        self.globalAt.put(g.name as long, self.globals.len() - 1);
         self.globalOrder.push(g.name);
     }
-    findGlobal &self q:str -> long {
-        hit: Option<long> = self.globalAt.find(q);
+    findGlobal &self q:str -> long { return self.findGlobalSym(symIfAny(q)); }
+    findGlobalSym &self n:Sym -> long {
+        hit: Option<long> = self.globalAt.find(n as long);
         match hit { Some(i) { return i; } None { } }
         return NOT_FOUND;
     }
@@ -1123,13 +1195,17 @@ methods Registry {
 
     // ─── macros ──────────────────────────────────────────────────────────────
     // A `macro` is a function the compiler runs; by its qualified name.
-    noteMacro &self q:Sym -> void { self.macroAt.put(nameOf(q), 1); }
+    noteMacro &self q:Sym -> void {
+        if (self.journal && !self.macroAt.has(nameOf(q))) { self.noteAdded(KEY_MACRO, q); }
+        self.macroAt.put(nameOf(q), 1);
+    }
     isMacro &self q:Sym -> bool { return self.macroAt.has(nameOf(q)); }
 
     // ─── derives ─────────────────────────────────────────────────────────────
     // `trait Encode derive deriveEncode { ... }`: the macro, as written, and the file whose
     // module it resolves in. NO_SYM for a trait with no derive.
     noteDerive &self trait:Sym m:Sym file:Sym -> void {
+        if (self.journal && !self.deriveBy.has(nameOf(trait))) { self.noteAdded(KEY_DERIVE, trait); }
         self.deriveBy.put(nameOf(trait), m);
         self.deriveIn.put(nameOf(trait), file);
     }
@@ -1155,14 +1231,16 @@ methods Registry {
 
     addTemplate &self t:GTemplate -> void {
         self.templates.push(t);
-        self.templateAt.put(nameOf(t.name), self.templates.len() - 1);
+        self.templateAt.put(t.name as long, self.templates.len() - 1);
     }
-    findTemplate &self q:str -> long {
-        hit: Option<long> = self.templateAt.find(q);
+    findTemplate &self q:str -> long { return self.findTemplateSym(symIfAny(q)); }
+    findTemplateSym &self n:Sym -> long {
+        hit: Option<long> = self.templateAt.find(n as long);
         match hit { Some(i) { return i; } None { } }
         return NOT_FOUND;
     }
     isGeneric &self q:str -> bool { return self.findTemplate(q) >= 0; }
+    isGenericSym &self n:Sym -> bool { return self.findTemplateSym(n) >= 0; }
 
     // The template an instance name was stamped from: `Option_long` -> `Option`. An instance is
     // not a type at parse time, and a generic use written inside a template is a pattern that is
@@ -1237,15 +1315,17 @@ methods Registry {
     genericArgAt &self first:long k:long -> TypeRef { return self.gArgs.get(first + k); }
 
     requestCount &self -> long { return self.requests.len(); }
-    // `Mutex<T>` written inside a template asks for an instance whose arguments are still
-    // parameters. It names a pattern, not a type, and only becomes a request once an enclosing
-    // stamp binds them.
     // A request is a pattern (a use written inside a template, not a type to stamp) when any of
-    // its arguments still stands for something. That is a type variable directly, or an instance
-    // of another template that is itself a pattern: `Wrap<Wrap<A>>` records its argument as the
-    // instance name `Wrap_A`, a Struct and not a TypeVar, so looking only one level deep stamped
-    // it as a concrete type and `substInstance` then declined to rebuild it, the stamped method
-    // came back returning `Wrap_Wrap_A`, a struct whose own field had no size.
+    // its arguments still stands for a parameter. `Mutex<T>` written inside a template asks for
+    // an instance whose argument is still a parameter; it names a pattern, not a type, and only
+    // becomes a real request once an enclosing stamp binds it.
+    //
+    // An argument stands for a parameter when it is a type variable, or an instance of another
+    // template that is itself a pattern. Looking one level deep is not enough: `Wrap<Wrap<A>>`
+    // records its argument as the instance name `Wrap_A`, a Struct and not a TypeVar. Taken as a
+    // concrete type it would be stamped, `substInstance` would decline to rebuild it, and the
+    // stamped method would come back returning `Wrap_Wrap_A`, a struct whose own field has no
+    // size.
     isPatternRequest &self r:GRequest -> bool { return self.patternArg(r, 0); }
 
     patternArg &self r:GRequest depth:long -> bool {
@@ -1259,10 +1339,10 @@ methods Registry {
     patternType &self t:TypeRef depth:long -> bool {
         if (t.base == Lit.TypeVar) { return true; }
         if (t.base != Lit.Struct || t.name == NO_SYM || depth > 32) { return false; }
-        at: long = self.findRequest(nameOf(t.name));
+        at: long = self.findRequestSym(t.name);
         if (at >= 0) { return self.patternArg(self.requests.get(at), depth + 1); }
         if (!isTupleName(t.name)) { return false; }
-        si: long = self.findStruct(nameOf(t.name));
+        si: long = self.findStructSym(t.name);
         if (si < 0) { return false; }
         d: StructDef = self.structs.get(si);
         for k in 0..d.fieldCount {
@@ -1271,12 +1351,21 @@ methods Registry {
         }
         return false;
     }
-    findRequest &self instance:str -> long {
-        hit: Option<long> = self.requestIx.find(instance);
+    findRequest &self instance:str -> long { return self.findRequestSym(symIfAny(instance)); }
+    findRequestSym &self instance:Sym -> long {
+        hit: Option<long> = self.requestIx.find(instance as long);
         match hit { Some(i) { return i; } None { } }
         return NOT_FOUND;
     }
     requestAt &self i:long -> GRequest { return self.requests.get(i); }
+
+    // `n` (a struct, or a generic one) holds a closure's captures. Marked before any instance of
+    // it is requested, so `request` can pass the mark on.
+    markClosure &self n:Sym -> void {
+        if (self.journal && !self.closureEnvs.has(n as long)) { self.noteAdded(KEY_CLOSURE, n); }
+        self.closureEnvs.put(n as long, true);
+    }
+    isClosureEnv &self n:Sym -> bool { return n != NO_SYM && self.closureEnvs.has(n as long); }
     requestPos &self i:long -> long { return self.reqPos.get(i); }
     gArgAt &self r:GRequest k:long -> TypeRef { return self.gArgs.get(r.firstArg + k); }
 
@@ -1288,7 +1377,7 @@ methods Registry {
     // stamping one clones and checks every method it has. It is released the moment anything
     // else asks for it, or when a body of that module is checked after all (`releaseModule`).
     request &self base:Sym instance:Sym args:Vec<TypeRef> -> void {
-        hit: Option<long> = self.requestIx.find(nameOf(instance));
+        hit: Option<long> = self.requestIx.find(instance as long);
         match hit {
             Some(i) {
                 if (self.deferIn != NO_SYM) { self.noteDeferred(i); }
@@ -1301,7 +1390,8 @@ methods Registry {
         self.gArgs.extend(args);
         self.requests.push(GRequest { base: base, instance: instance,
                                       firstArg: first, argCount: args.len() });
-        self.requestIx.put(nameOf(instance), self.requests.len() - 1);
+        self.requestIx.put(instance as long, self.requests.len() - 1);
+        if (self.closureEnvs.has(base as long)) { self.markClosure(instance); }
         self.reqDeferred.push(self.deferIn != NO_SYM);
         self.reqPos.push(gPos);
         noteOrigin(instance, gPos, NO_SYM);
@@ -1323,8 +1413,8 @@ methods Registry {
         self.reqDeferred.set(i, false);
         self.released.push(i);
     }
-    // Every instance a body of `module` named, released: a function there is about to be checked.
-    // Answers whether that left anything for monomorphization to stamp first.
+    // Releases every instance a body of `module` named, because a function there is about to be
+    // checked. Returns whether that left anything for monomorphization to stamp first.
     releaseModule &self module:Sym -> bool {
         key: str = nameOf(module);
         hit: Option<long> = self.deferHead.find(key);
@@ -1348,25 +1438,28 @@ methods Registry {
     // so `File` written in module `io` means `file::File`, the declaring module, not the using
     // one.
     //
-    // Asked in the order the C++ compiler's `resolveScoped` asks it. The current module answers
-    // first, because a declaration made here shadows one imported from elsewhere. Then the
-    // module's import closure, which the scanner publishes as `gImports`: only a module this one
-    // can actually reach may answer, and two reachable modules declaring the name is not a tie to
-    // be broken by whichever registered first. It is ambiguous, and the caller has to say which.
+    // The current module answers first, because a declaration made here shadows one imported from
+    // elsewhere. Then the module's import closure, which the scanner publishes as `gImports`: only
+    // a module this one can actually reach may answer, and two reachable modules declaring the
+    // name is not a tie to be broken by whichever registered first. It is ambiguous, and the
+    // caller has to say which.
     //
-    // The last step is the search that used to be the only one: any declaration anywhere whose
-    // last component matches. It stays as the fallback because the graph cannot answer for
-    // everything the closure walk does not reach: a single-file program has no edges at all, and
-    // a name the compiler itself reaches for is not written in anyone's source.
-    // `rival` is the other module that declares the name, when two reachable ones do. Handed back
-    // rather than reported here: the parser knows where the name was written and this table does
-    // not, and a diagnostic that cannot point at a line is worth much less than one that can.
+    // The last step is a search for any declaration anywhere whose last component matches. It
+    // stays as the fallback because the import graph cannot answer for everything: a single-file
+    // program has no edges at all, and a name the compiler itself reaches for is not written in
+    // anyone's source.
+    //
+    // `rival` is the other declaration of the name, when two reachable modules declare it. It is
+    // handed back rather than reported here because the parser knows where the name was written
+    // and this table does not, and a diagnostic that points at a line is worth much more than one
+    // that cannot.
     resolveBareIn &self here:str bare:str -> BareName {
         // Already qualified: `write::BufWriterConfig` names the module it comes from, so there is
-        // nothing to resolve. Qualifying it again asks for `here::write::BufWriterConfig`, which
-        // nothing declares, and the last-component index is keyed on `BufWriterConfig` alone so it
-        // does not answer either, the name fell through as undeclared, and a variant written on
-        // it (`write::BufWriterConfig.LineBuffered`) read as a field access on nothing.
+        // nothing to resolve. Qualifying it again would ask for `here::write::BufWriterConfig`,
+        // which nothing declares, and the last-component index is keyed on `BufWriterConfig`
+        // alone, so it would not answer either. The name would fall through as undeclared, and a
+        // variant written on it (`write::BufWriterConfig.LineBuffered`) would read as a field
+        // access on nothing.
         if (lastComponentOf(bare).len != bare.len && self.declares(bare)) {
             return BareName { name: intern(bare), rival: NO_SYM };
         }
@@ -1404,7 +1497,7 @@ methods Registry {
     }
 
     // The same, for a caller with no position to report from. An ambiguity here is still an
-    // error. It is just one that cannot say where.
+    // error, just one that cannot say where.
     resolveBare &self here:str bare:str -> Sym {
         b: BareName = self.resolveBareIn(here, bare);
         if (b.rival != NO_SYM) { failStr(ambiguousName(bare, b)); }
@@ -1418,17 +1511,16 @@ methods Registry {
             || self.findAlias(q) >= 0 || self.findTrait(q) >= 0;
     }
 
-    // Any declared name whose last component is `bare`. One index per table, consulted in the
-    // order the linear scan this replaces walked them in (a struct beats a template beats a
-    // trait beats an alias, whenever they were declared) because a single index would order by
-    // arrival instead, and a struct declared after a template of the same name would lose.
+    // Any declared name whose last component is `bare`. There is one index per table, consulted
+    // in a fixed precedence (a struct, then an enum, a template, a trait, an alias, whenever each
+    // was declared), because a single index would order by arrival instead, and a struct
+    // declared after a template of the same name would lose.
     //
-    // The enum table is asked right after the struct one, which is where the C++ compiler asks
-    // it: `resolveStructEnum` takes structs and enums together under a single predicate and only
-    // then falls through to traits and aliases. Leaving it out cost something real: an enum
-    // declared in another module was not found, so `BufWriterConfig.LineBuffered` written in `io`
-    // read as a field access on a struct nobody declared rather than as the constant it is, and
-    // `lower.k` said so twice on every program: `OFFSET0 no-struct-type .LineBuffered`.
+    // The enum table is asked right after the struct one, matching the earlier C++ compiler,
+    // which took structs and enums together before falling through to traits and aliases.
+    // Without the enum table, an enum declared in another module would not be found, and
+    // `BufWriterConfig.LineBuffered` written in `io` would read as a field access on a struct
+    // nobody declared rather than as the constant it is.
     endsWithName &self bare:str -> Sym {
         self.indexLastComponents();
         n: Sym = lastHit(&self.byStructLast, bare);
@@ -1441,9 +1533,9 @@ methods Registry {
         if (n != NO_SYM) { return n; }
         return lastHit(&self.byAliasLast, bare);
     }
-    // Bring each index up to date with its table. Each remembers how far it was indexed, so a
+    // Brings each index up to date with its table. Each remembers how far it was indexed, so a
     // declaration is looked at once however often this is called, and the first declaration of a
-    // name wins as it did under the scan.
+    // name wins.
     indexLastComponents &self -> void {
         while (self.lastStructs < self.structs.len()) {
             noteLast(&self.byStructLast, self.structs.get(self.lastStructs).name);
@@ -1493,6 +1585,203 @@ methods Registry {
     }
 }
 
+// ─── taking a declaration back ───────────────────────────────────────────────
+// The parser reads each top-level declaration under a `recover` (`Parser.parseDeclRecovering`),
+// and one that an error cut short must leave nothing behind for the rest of the parse. Every
+// table here is cut back to its length when the declaration began, and every key that pointed
+// at what was cut goes with it. Declarations do not nest, so what lies past the mark is exactly
+// what the declaration added.
+
+pub struct RegMark {
+    structs: long, fields: long, enums: long, variants: long, payloads: long,
+    traits: long, traitMethods: long, traitArgs: long, impls: long, implFns: long,
+    ownedTraits: long, traitInsts: long, globals: long, globalOrder: long, aliases: long,
+    bare: long, lastStructs: long, lastEnums: long, lastTemplates: long, lastTraits: long,
+    lastAliases: long, templates: long, gVariants: long, bounds: long, gParams: long,
+    gFields: long, requests: long, gArgs: long, deferReq: long, released: long,
+    deferIn: Sym, added: long, inProgress: long, sigs: long, sigParams: long, coreBuilt: bool
+}
+
+// A first-declaration index entry is put only for a name it lacks, so one naming `n` that was
+// indexed since the mark was put since the mark.
+local forgetLast inout m:HashMap<str, Sym> n:Sym -> void {
+    key: str = lastComponentOf(nameOf(n));
+    hit: Option<Sym> = m.find(key);
+    match hit { Some(x) { if (x == n) { m.remove(key); } } None { } }
+}
+// An entry of a by-name table that points at `i`, which is being cut.
+local forgetAt inout m:HashMap<str, long> key:str i:long -> void {
+    hit: Option<long> = m.find(key);
+    match hit { Some(x) { if (x == i) { m.remove(key); } } None { } }
+}
+local forgetAtNum inout m:HashMap<long, long> key:long i:long -> void {
+    hit: Option<long> = m.find(key);
+    match hit { Some(x) { if (x == i) { m.remove(key); } } None { } }
+}
+
+methods Registry {
+    noteAdded &self tag:long n:Sym -> void { self.added.push(tag); self.added.push(n as long); }
+
+    mark &self -> RegMark {
+        return RegMark { structs: self.structs.len(), fields: self.fields.len(), enums: self.enums.len(),
+                         variants: self.variants.len(), payloads: self.payloads.len(),
+                         traits: self.traits.len(), traitMethods: self.traitMethods.len(),
+                         traitArgs: self.traitArgs.len(), impls: self.impls.len(), implFns: self.implFns.len(),
+                         ownedTraits: self.ownedTraits.len(), traitInsts: self.traitInsts.len(),
+                         globals: self.globals.len(), globalOrder: self.globalOrder.len(),
+                         aliases: self.aliases.len(), bare: self.byBare.qual.len(),
+                         lastStructs: self.lastStructs, lastEnums: self.lastEnums,
+                         lastTemplates: self.lastTemplates, lastTraits: self.lastTraits,
+                         lastAliases: self.lastAliases, templates: self.templates.len(),
+                         gVariants: self.gVariants.len(), bounds: self.bounds.len(),
+                         gParams: self.gParams.len(), gFields: self.gFields.len(),
+                         requests: self.requests.len(), gArgs: self.gArgs.len(),
+                         deferReq: self.deferReq.len(), released: self.released.len(),
+                         deferIn: self.deferIn, added: self.added.len(),
+                         inProgress: gTypesInProgress.len(), sigs: gFnSigs.sigs.len(),
+                         sigParams: gFnSigs.params.len(), coreBuilt: gCoreMethodsBuilt };
+    }
+
+    rewindTo &self m:RegMark -> void {
+        // The bare-name index, newest entry first: each made itself the head of its name's chain,
+        // in front of the one its `next` holds.
+        b: long = self.byBare.qual.len();
+        while (b > m.bare) {
+            b = b - 1;
+            key: str = lastComponentOf(nameOf(self.byBare.qual.get(b)));
+            prev: long = self.byBare.next.get(b);
+            if (prev >= 0) { self.byBare.head.put(key, prev); } else { self.byBare.head.remove(key); }
+        }
+        self.byBare.qual.truncate(m.bare);
+        self.byBare.owner.truncate(m.bare);
+        self.byBare.next.truncate(m.bare);
+        // The first-declaration indexes lose what was indexed since the mark, and index it again
+        // when next asked, from the tables as they will be.
+        for k in m.lastStructs..self.lastStructs { forgetLast(&self.byStructLast, self.structs.get(k).name); }
+        for k in m.lastEnums..self.lastEnums { forgetLast(&self.byEnumLast, self.enums.get(k).name); }
+        for k in m.lastTemplates..self.lastTemplates { forgetLast(&self.byTemplateLast, self.templates.get(k).name); }
+        for k in m.lastTraits..self.lastTraits { forgetLast(&self.byTraitLast, self.traits.get(k).name); }
+        for k in m.lastAliases..self.lastAliases { forgetLast(&self.byAliasLast, self.aliases.get(k).name); }
+        self.lastStructs = m.lastStructs;
+        self.lastEnums = m.lastEnums;
+        self.lastTemplates = m.lastTemplates;
+        self.lastTraits = m.lastTraits;
+        self.lastAliases = m.lastAliases;
+
+        // Requests, with where each was asked for. One made before the mark that the declaration
+        // released is held back again, and a chain of held-back requests that grew falls back to
+        // the entry it was put in front of.
+        for k in m.requests..self.requests.len() {
+            inst: Sym = self.requests.get(k).instance;
+            self.requestIx.remove(inst as long);
+            forgetOrigin(inst);
+        }
+        for k in m.released..self.released.len() {
+            r: long = self.released.get(k);
+            if (r < m.requests) { self.reqDeferred.set(r, true); }
+        }
+        if (self.deferReq.len() > m.deferReq) {
+            heads: Vec<str>;
+            h: long = self.deferHead.nextSlot(-1);
+            while (h >= 0) {
+                if (self.deferHead.valAt(h) >= m.deferReq) { heads.push(self.deferHead.keyAt(h)); }
+                h = self.deferHead.nextSlot(h);
+            }
+            for key in heads {
+                d: long = self.deferHead.get(key);
+                while (d >= m.deferReq) { d = self.deferNext.get(d); }
+                if (d >= 0) { self.deferHead.put(key, d); } else { self.deferHead.remove(key); }
+            }
+        }
+
+        // The by-name tables of everything else that is cut.
+        for k in m.structs..self.structs.len() {
+            d: StructDef = self.structs.get(k);
+            forgetAt(&self.structAt, nameOf(d.name), k);
+            forgetAtNum(&self.structAtSym, d.name as long, k);
+            for f in 0..d.fieldCount {
+                self.fieldAt2.remove(fieldKey(d.firstField, self.fields.get(d.firstField + f).name));
+            }
+        }
+        for k in m.enums..self.enums.len() {
+            n: Sym = self.enums.get(k).name;
+            forgetAt(&self.enumAt, nameOf(n), k);
+            forgetAtNum(&self.enumAtSym, n as long, k);
+        }
+        for k in m.traits..self.traits.len() {
+            n: Sym = self.traits.get(k).name;
+            forgetAtNum(&self.traitAt, n as long, k);
+            hit: Option<long> = self.traitInstAt.find(n as long);
+            match hit { Some(x) { if (x >= m.traitInsts) { self.traitInstAt.remove(n as long); } } None { } }
+        }
+        // An implementation that headed its (type, trait) chain goes with its key; one chained
+        // behind an older one is unhooked from it.
+        for k in m.impls..self.impls.len() {
+            im: TraitImplDef = self.impls.get(k);
+            forgetAtNum(&self.implAt2, implKey(im.structName, im.trait.name), k);
+            if (im.carried) { forgetAt(&self.carriedOwners, nameOf(im.structName), k); }
+        }
+        if (self.impls.len() > m.impls) {
+            for k in 0..m.impls {
+                if (self.implNext.get(k) >= m.impls) { self.implNext.set(k, NOT_FOUND); }
+                if (self.carriedNext.get(k) >= m.impls) { self.carriedNext.set(k, NOT_FOUND); }
+            }
+        }
+        for k in m.globals..self.globals.len() { forgetAtNum(&self.globalAt, self.globals.get(k).name as long, k); }
+        for k in m.aliases..self.aliases.len() { forgetAt(&self.aliasAt, nameOf(self.aliases.get(k).name), k); }
+        for k in m.templates..self.templates.len() { forgetAtNum(&self.templateAt, self.templates.get(k).name as long, k); }
+        // The sets that hold no index, by what the journal says they gained, newest first.
+        a: long = self.added.len();
+        while (a > m.added) {
+            a = a - 2;
+            tag: long = self.added.get(a);
+            n: Sym = self.added.get(a + 1) as Sym;
+            if (tag == KEY_MACRO) { self.macroAt.remove(nameOf(n)); }
+            else if (tag == KEY_DERIVE) { self.deriveBy.remove(nameOf(n)); self.deriveIn.remove(nameOf(n)); }
+            else if (tag == KEY_DISTINCT) { self.distinctBase.remove(nameOf(n)); }
+            else if (tag == KEY_CLOSURE) { self.closureEnvs.remove(n as long); }
+            else if (tag == KEY_IMPLFN) { self.implFnSet.remove(nameOf(n)); }
+        }
+
+        self.structs.truncate(m.structs);
+        self.fields.truncate(m.fields);
+        self.enums.truncate(m.enums);
+        self.variants.truncate(m.variants);
+        self.payloads.truncate(m.payloads);
+        self.traits.truncate(m.traits);
+        self.traitMethods.truncate(m.traitMethods);
+        self.traitArgs.truncate(m.traitArgs);
+        self.impls.truncate(m.impls);
+        self.implFns.truncate(m.implFns);
+        self.implNext.truncate(m.impls);
+        self.carriedNext.truncate(m.impls);
+        self.ownedTraits.truncate(m.ownedTraits);
+        self.traitInsts.truncate(m.traitInsts);
+        self.globals.truncate(m.globals);
+        self.globalOrder.truncate(m.globalOrder);
+        self.aliases.truncate(m.aliases);
+        self.templates.truncate(m.templates);
+        self.gVariants.truncate(m.gVariants);
+        self.bounds.truncate(m.bounds);
+        self.gParams.truncate(m.gParams);
+        self.gParamInfo.truncate(m.gParams);
+        self.gFields.truncate(m.gFields);
+        self.requests.truncate(m.requests);
+        self.reqDeferred.truncate(m.requests);
+        self.reqPos.truncate(m.requests);
+        self.gArgs.truncate(m.gArgs);
+        self.deferReq.truncate(m.deferReq);
+        self.deferNext.truncate(m.deferReq);
+        self.released.truncate(m.released);
+        self.added.truncate(m.added);
+        self.deferIn = m.deferIn;
+        gTypesInProgress.truncate(m.inProgress);
+        gFnSigs.rewindTo(m.sigs, m.sigParams);
+        // Built from the core traits: asked first during the declaration, it may hold what was cut.
+        if (!m.coreBuilt && gCoreMethodsBuilt) { gCoreMethods.clear(); gCoreMethodsBuilt = false; }
+    }
+}
+
 // One registry for the whole compile, for the same reason the interner is one: every phase reads
 // it, and threading it through every signature would buy nothing.
 pub var gReg: Registry;
@@ -1511,24 +1800,35 @@ pub implMethodName im:TraitImplDef method:Sym -> Sym {
 }
 
 // The same, for an implementation of `tr` by `owner` before it is registered. A trait a module
-// owns (declared without `pub`, so `geo::Shape`) carries its name into its methods' too: another
-// module's trait of the same spelling is a different trait, and both may be implemented for one
-// type -- `methods long for Ord` in a program of its own beside the standard library's -- so
-// `long_cmp` would be defined twice. A flat (`pub`) trait without arguments keeps `Owner_method`.
+// owns (declared without `pub`, so `geo::Shape`) puts its name into its methods' names too.
+// Another module's trait of the same spelling is a different trait, and both may be implemented
+// for one type (a program's own `methods long for Ord` beside the standard library's), so without
+// the trait's name `long_cmp` would be defined twice. A flat (`pub`) trait without arguments
+// keeps `Owner_method`.
 pub implFnName owner:Sym tr:TraitRef method:Sym -> Sym {
     return implFnNameAs(owner, tr, method, gReg.flatCarries(owner, tr));
 }
-// The same, the flat trait's choice made (`carried`: see `Registry.flatCarries`).
-pub implFnNameAs owner:Sym tr:TraitRef method:Sym carried:bool -> Sym {
-    if (!carried && !traitCarriesName(tr)) { return methodName(owner, method); }
-    return methodName(methodName(owner, intern(gReg.traitMangled(tr))), method);
-}
-pub traitCarriesName tr:TraitRef -> bool {
-    return tr.argCount > 0 || isModuleTrait(tr.name);
-}
+// The same, with the flat trait's choice already made (`carried`; see `Registry.flatCarries`).
+pub implFnNameAs owner:Sym tr:TraitRef method:Sym carried:bool -> Sym { return gReg.implFnNameIn(owner, tr, method, carried); }
+pub traitCarriesName tr:TraitRef -> bool { return gReg.carriesName(tr); }
 // A trait some module owns: declared without `pub`, so registered as `module::Name`.
-pub isModuleTrait t:Sym -> bool {
-    return t != NO_SYM && lastComponentOf(nameOf(t)).len != nameOf(t).len;
+pub isModuleTrait t:Sym -> bool { return gReg.moduleTrait(t); }
+
+// The same questions asked of a registry rather than of `gReg`, which is how its own methods ask
+// them: a method holding the registry lent `inout` may not name `gReg`, and one holding it lent to
+// read may reach nothing that writes it by name.
+methods Registry {
+    implFnNameIn &self owner:Sym tr:TraitRef method:Sym carried:bool -> Sym {
+        if (!carried && !self.carriesName(tr)) { return methodName(owner, method); }
+        return methodName(methodName(owner, intern(self.traitMangled(tr))), method);
+    }
+    carriesName &self tr:TraitRef -> bool { return tr.argCount > 0 || self.moduleTrait(tr.name); }
+    moduleTrait &self t:Sym -> bool {
+        if (t == NO_SYM) { return false; }
+        inst: long = self.traitInstOf(t);
+        if (inst >= 0) { return self.moduleTrait(self.traitInstRef(inst).name); }
+        return lastComponentOf(nameOf(t)).len != nameOf(t).len;
+    }
 }
 
 // The traits the compiler wires into the language by name (`stdlib::core`'s, and the `FnN` it
@@ -1563,41 +1863,63 @@ pub alignUp x:long a:long -> long { return (x + a - 1) / a * a; }
 //
 // A backed enum keeps its own name all the way down: `kind: Tok` is a `Lit.Struct` companioned
 // "Tok", and only `namedScalar` in codegen ever unwraps it, so every other consumer sees an
-// aggregate where there is really a four-byte integer. Layout is the one that cannot survive the
-// mistake: the struct registry has no row named "Tok", the size came back 0, and the next field
-// was placed on top of this one. That is what put a lexer's `punct`, `cls` and `two` tables all at
-// the same offset, and made the second-generation compiler read a token kind of -1.
+// aggregate where there is really a four-byte integer. Layout is the one consumer that cannot
+// live with that. The struct registry has no row named "Tok", so the size would come back 0 and
+// the next field would be placed on top of this one; that once put a lexer's `punct`, `cls` and
+// `two` tables all at the same offset and made the second-generation compiler read a token kind
+// of -1.
 //
 // A sum type is a different thing with the same keyword: it is a tagged union, registered as a
 // struct under its own name, and answers there like any other aggregate.
-pub backedEnumBacking k:Lit n:Sym -> Lit {
-    if (k != Lit.Struct || n == NO_SYM) { return Lit.Void; }
-    q: str = nameOf(n);
-    i: long = gReg.findEnum(q);
-    if (i < 0 || gReg.isSumType(q)) { return Lit.Void; }
-    return gReg.enumDef(i).backing;
-}
+pub backedEnumBacking k:Lit n:Sym -> Lit { return gReg.enumBackingIn(k, n); }
 
 // How many bytes a value of this type occupies where it is stored: a field, an array element.
 // A named aggregate answers with its registered size; everything else with its kind's. A struct
 // nothing has registered yet answers 0, which is the honest answer at parse time and the reason
 // the layout is done again once monomorphization has stamped every instance.
-pub typeSizeOf k:Lit n:Sym -> long {
-    b: Lit = backedEnumBacking(k, n);
-    if (b != Lit.Void) { return typeInfo(b).size; }
-    // A tuple answers the same way: it is registered as a struct under a name built from its
-    // element types, so it has a size like any other aggregate. Without this arm it answered the
-    // row's own 0 and every field placed after one landed on top of it.
-    if ((k == Lit.Struct || k == Lit.Tuple) && n != NO_SYM) {
-        if (k == Lit.Struct && gTypesInProgress.len() > 0 && gTypesInProgress.get(gTypesInProgress.len() - 1) == n) {
-            failStr(format("{} cannot hold itself directly -- it would be infinitely large. Hold it behind an indirection: Box<{}>, *{} or Vec<{}>",
-                           nameOf(n), nameOf(n), nameOf(n), nameOf(n)));
-        }
-        at: long = gReg.findStruct(nameOf(n));
-        if (at < 0) { return 0; }
-        return gReg.structDef(at).size;
+pub typeSizeOf k:Lit n:Sym -> long { return gReg.typeSizeIn(k, n); }
+
+// The same two, asked of a registry: what its own layout methods call.
+methods Registry {
+    enumBackingIn &self k:Lit n:Sym -> Lit {
+        if (k != Lit.Struct || n == NO_SYM) { return Lit.Void; }
+        q: str = nameOf(n);
+        i: long = self.findEnum(q);
+        if (i < 0 || self.isSumType(q)) { return Lit.Void; }
+        return self.enumDef(i).backing;
     }
-    return typeInfo(k).size;
+    typeSizeIn &self k:Lit n:Sym -> long {
+        b: Lit = self.enumBackingIn(k, n);
+        if (b != Lit.Void) { return typeInfo(b).size; }
+        // A tuple answers the same way: it is registered as a struct under a name built from its
+        // element types, so it has a size like any other aggregate. Without this arm it would
+        // answer the row's own 0, and every field placed after one would land on top of it.
+        if ((k == Lit.Struct || k == Lit.Tuple) && n != NO_SYM) {
+            if (k == Lit.Struct && gTypesInProgress.len() > 0 && gTypesInProgress.get(gTypesInProgress.len() - 1) == n) {
+                failStr(format("recursive type `{}` has infinite size\nnote: `{}` holds itself directly\nhelp: hold it behind an indirection: `Box<{}>`, `*{}` or `Vec<{}>`",
+                               nameOf(n), nameOf(n), nameOf(n), nameOf(n), nameOf(n)));
+            }
+            at: long = self.findStructSym(n);
+            if (at < 0) { return 0; }
+            return self.structDef(at).size;
+        }
+        return typeInfo(k).size;
+    }
+    // `placeField`, asked of a registry.
+    placeFieldIn &self cursor:long f:FieldDef -> Placed {
+        esz: long = self.typeSizeIn(f.kind, f.structName);
+        align: long = esz;
+        // Every aggregate here is built of eight-byte words, so eight is its alignment, but a
+        // backed enum only spells like one, and aligns to the width of the integer it is.
+        if (isAggregate(f.kind) && self.enumBackingIn(f.kind, f.structName) == Lit.Void) { align = 8; }
+        if (align < 1) { align = 1; }
+        at: long = alignUp(cursor, align);
+        span: long = esz;
+        if (f.isArray) { span = f.count * esz; }
+        placed: FieldDef = f;
+        placed.offset = at;
+        return Placed { field: placed, next: at + span };
+    }
 }
 
 // A named type that is nevertheless one register wide: an enum with no payloads, whose values are
@@ -1617,14 +1939,14 @@ pub namedScalarBacking n:Sym -> Lit {
 }
 
 // The type a value of this type is stored as. A backed enum keeps its own name all the way through
-// the front end: `kind: Tok` is a `Lit.Struct` companioned "Tok", so every question about width
-// has to unwrap it first: what a field holds, a load reads, a store writes and an array strides by
-// is the backing integer, and `Lit.Struct` answers those with the eight bytes an unrecognised named
-// type falls back to. A `Tok` field read eight bytes and came back with the next field's value in
-// its top half; the same eight bytes as a stride made `[TokInfo; 47]` and the tables beside it
-// disagree about where their rows are.
+// the front end (`kind: Tok` is a `Lit.Struct` companioned "Tok"), so every question about width
+// has to unwrap it first. What a field holds, what a load reads, what a store writes and what an
+// array strides by is the backing integer, while `Lit.Struct` would answer with the eight bytes an
+// unrecognised named type falls back to. Read as eight bytes, a `Tok` field comes back with the
+// next field's value in its top half, and an eight-byte stride makes `[TokInfo; 47]` and the
+// tables beside it disagree about where their rows are.
 //
-// Everything a value does in a register is unaffected (a temp is a register either way) so this
+// Everything a value does in a register is unaffected (a temp is a register either way), so this
 // belongs at the memory boundary and nowhere else.
 pub storedKind k:Lit n:Sym -> Lit {
     if (k != Lit.Struct || n == NO_SYM) { return k; }
@@ -1639,7 +1961,7 @@ pub storedKind k:Lit n:Sym -> Lit {
 pub typeBytes k:Lit n:Sym -> long {
     // A backed enum is its backing integer, which is also the stride the struct registry laid its
     // array fields out with. Falling through to the eight-byte default for an unrecognised named
-    // type put every stride here at odds with every offset there.
+    // type would put every stride here at odds with every offset there.
     if (namedScalar(k, n)) { return typeInfo(namedScalarBacking(n)).size; }
     if (k == Lit.Struct || k == Lit.Tuple) {
         if (n != NO_SYM) {
@@ -1657,7 +1979,7 @@ pub typeBytes k:Lit n:Sym -> long {
 pub namedWidth n:Sym -> long {
     if (n == NO_SYM) { return 8; }
     if (namedScalar(Lit.Struct, n)) { return typeInfo(namedScalarBacking(n)).size; }
-    at: long = gReg.findStruct(nameOf(n));
+    at: long = gReg.findStructSym(n);
     if (at >= 0) { return gReg.structDef(at).size; }
     w: long = typeInfo(scalarNamed(lastComponentOf(nameOf(n)))).size;
     if (w < 1) { w = 8; }
@@ -1681,33 +2003,20 @@ pub enumPayloadField variant:str i:long -> Sym {
     return out;
 }
 
-// A field as a message names it: "its field 'f'", or, for a sum type's payload slot `$V$k`, the
+// A field as a message names it: "its field `f`", or, for a sum type's payload slot `$V$k`, the
 // variant it carries.
 pub cloneFieldLabel d:StructDef n:Sym -> str {
     s: str = nameOf(n);
-    if (!d.isEnum || s.len < 2 || charAt(s, 0) != '$') { return keepString(format("its field '{}'", s)); }
+    if (!d.isEnum || s.len < 2 || charAt(s, 0) != '$') { return keepString(format("its field `{}`", s)); }
     e: long = 1;
     while (e < s.len && charAt(s, e) != '$') { e = e + 1; }
-    return keepString(format("the payload of its variant '{}'", strSlice(s, 1, e - 1)));
+    return keepString(format("the payload of its variant `{}`", strSlice(s, 1, e - 1)));
 }
 
 // `f` arrives with everything but its offset filled in. Taking it whole rather than as five
 // separate arguments also keeps the call within the six the ABI has registers for: an aggregate
 // return already spends one of them on its hidden destination pointer.
-pub placeField cursor:long f:FieldDef -> Placed {
-    esz: long = typeSizeOf(f.kind, f.structName);
-    align: long = esz;
-    // Every aggregate here is built of eight-byte words, so eight is its alignment, but a backed
-    // enum only spells like one, and aligns to the width of the integer it is.
-    if (isAggregate(f.kind) && backedEnumBacking(f.kind, f.structName) == Lit.Void) { align = 8; }
-    if (align < 1) { align = 1; }
-    at: long = alignUp(cursor, align);
-    span: long = esz;
-    if (f.isArray) { span = f.count * esz; }
-    placed: FieldDef = f;
-    placed.offset = at;
-    return Placed { field: placed, next: at + span };
-}
+pub placeField cursor:long f:FieldDef -> Placed { return gReg.placeFieldIn(cursor, f); }
 
 // ─── tuples ──────────────────────────────────────────────────────────────────
 // A tuple is structural: `(int, int)` written in two files is one type, because nothing names it
@@ -1723,8 +2032,8 @@ pub placeField cursor:long f:FieldDef -> Placed {
 // The element's spelling inside a tuple's name is what `typeMangleName` answers for it, as in an
 // instance's name. An element may itself be a tuple, so the name closes with a `$` of its own:
 // `$tuple$$tuple$long$long$$long$` is `((long, long), long)` and `$tuple$$tuple$long$long$long$$`
-// is `((long, long, long),)`, where without the closing mark both were the same text. It is
-// what a `.klib` and every instance built over a tuple (`Vec_$tuple$long$long$`) are keyed by.
+// is `((long, long, long),)`, which without the closing mark would be the same text. It is what
+// a `.klib` and every instance built over a tuple (`Vec_$tuple$long$long$`) are keyed by.
 pub tupleTypeName elems:Vec<TypeRef> -> Sym {
     s: String;
     s.pushStr("$tuple");
@@ -1740,7 +2049,7 @@ pub tupleTypeName elems:Vec<TypeRef> -> Sym {
 // The element types of a registered tuple, read back from its fields.
 pub tupleElems n:Sym -> Vec<TypeRef> {
     out: Vec<TypeRef>;
-    at: long = gReg.findStruct(nameOf(n));
+    at: long = gReg.findStructSym(n);
     if (at < 0) { return out; }
     d: StructDef = gReg.structDef(at);
     for k in 0..d.fieldCount {
@@ -1767,15 +2076,15 @@ pub tupleFieldName k:long -> Sym {
     return internString(s);
 }
 
-// Register `(A, B, ...)` and answer the struct name it is now known by. Idempotent: the same
+// Registers `(A, B, ...)` and returns the struct name it is now known by. Idempotent: the same
 // element list registers once and every later mention finds it.
 //
-// The layout is the natural one (each field aligned to its own width, the whole rounded to 8)
+// The layout is the natural one (each field aligned to its own width, the whole rounded to 8),
 // which is exactly what `placeField` does for a declared struct, so a tuple and a struct with the
 // same fields have the same shape and one code path lays out both.
 pub registerTuple elems:Vec<TypeRef> -> Sym {
     name: Sym = tupleTypeName(elems);
-    if (gReg.hasStruct(nameOf(name))) { return name; }
+    if (gReg.hasStructSym(name)) { return name; }
     fs: Vec<FieldDef>;
     cursor: long = 0;
     for i in 0..elems.len() {
@@ -1801,19 +2110,18 @@ pub isTupleName n:Sym -> bool {
 //
 // A `fn` type is not one type but a family, and what tells two members apart is the whole
 // signature. `fn(Res)->long` lends its argument and `fn(sink Res)->long` takes it, so an
-// indirect call through the second moves a value the first only borrows, and keyed by the
-// return type alone, as this compiler once did, those are the same type: the callee released
-// its parameter and the caller released it again.
+// indirect call through the second moves a value the first only borrows. Keyed by the return
+// type alone, those two would be the same type, and the callee would release its parameter only
+// for the caller to release it again.
 //
 // So a `Lit.Fn`'s companion name is a key (the canonical spelling of the signature) and this
 // is the table it keys. Interning on that spelling means an identical signature met twice is one
 // entry found by one hash, which matters: the table is asked at every fn-typed call and at every
 // `&f`, and a scan there would be a scan in the hot path of every callback in the program.
 
-// One parameter of a signature: its type, and how the call hands it over. A struct written out
-// rather than a `TypeRef` with a parallel array of conventions beside it: two arrays that must
-// stay the same length is a thing to get wrong, and the C++ compiler retired exactly that pair
-// from `TraitMethodSig` for the same reason.
+// One parameter of a signature: its type, and how the call hands it over. It is a struct of its
+// own rather than a `TypeRef` with a parallel array of conventions beside it, because two arrays
+// that must stay the same length are easy to get wrong.
 pub struct FnParam { kind: Lit, name: Sym, conv: Conv }
 
 pub fnParamOf t:TypeRef c:Conv -> FnParam { return FnParam { kind: t.base, name: t.name, conv: c }; }
@@ -1858,7 +2166,7 @@ methods FnSigTable {
         return s;
     }
 
-    // Record a signature and answer its key: the companion name a `Lit.Fn` then carries.
+    // Records a signature and returns its key: the companion name a `Lit.Fn` then carries.
     // Idempotent: the same signature met again finds the entry it already made.
     register &self ps:Vec<FnParam> ret:TypeRef -> Sym {
         spelling: String = self.key(ps, ret);
@@ -1876,6 +2184,22 @@ methods FnSigTable {
         hit: Option<long> = self.at.find(nameOf(key));
         match hit { Some(i) { return i; } None { } }
         return NOT_FOUND;
+    }
+
+    // Back to `sigs` signatures and `params` parameters, for a declaration taken back
+    // (`Registry.rewindTo`). A removed slot stays a tombstone, so a key can go mid-walk.
+    rewindTo &self sigs:long params:long -> void {
+        if (self.sigs.len() == sigs) { return; }
+        i: long = self.at.nextSlot(-1);
+        while (i >= 0) {
+            if (self.at.valAt(i) >= sigs) {
+                key: str = self.at.keyAt(i);
+                self.at.remove(key);
+            }
+            i = self.at.nextSlot(i);
+        }
+        self.sigs.truncate(sigs);
+        self.params.truncate(params);
     }
 
     sigAt &self i:long -> FnSig { return self.sigs.get(i); }
@@ -1927,6 +2251,44 @@ pub fnSigsClashOnOwnership a:Sym b:Sym -> bool {
     return fnSigsOwnershipClash(x, y);
 }
 
+// One parameter type of a fn signature against another: the same type, a struct and a borrow of
+// it alike (convention inference retypes a read parameter to the borrow, and the key spells the
+// two the same), a fn type by `fnSigsFit`. A type parameter is a pattern and fits anything: the
+// stamped instance is what is held to it.
+local fnTypesFit pk:Lit pn:Sym qk:Lit qn:Sym -> bool {
+    if (pk == Lit.TypeVar || qk == Lit.TypeVar) { return true; }
+    if (pk == Lit.Fn && qk == Lit.Fn) { return fnSigsFit(pn, qn); }
+    if (pn != qn) { return false; }
+    if (pk == qk) { return true; }
+    return (pk == Lit.Ref || pk == Lit.Struct) && (qk == Lit.Ref || qk == Lit.Struct);
+}
+
+// Whether a fn value typed `got` may stand where a `want` is. A call through it is compiled
+// against `want`, so the function it holds must take the same arguments the same way and give
+// back the same result: the same arity, the same parameter and result types, and the same word
+// (lend or `sink`) on every parameter whose type owns something, since through one the caller
+// keeps the value and through the other it gives it up. A `sink` on a parameter that owns
+// nothing changes only whether the callee copies (its prologue does), so either fits either
+// there. Without this check, `f: fn(long)->long = &look` with `look r:Res` would read the
+// integer as an address.
+pub fnSigsFit want:Sym got:Sym -> bool {
+    if (want == got) { return true; }
+    ia: long = gFnSigs.find(want);
+    ib: long = gFnSigs.find(got);
+    if (ia < 0 || ib < 0) { return true; }      // no signature to hold it to: not this question
+    x: FnSig = gFnSigs.sigAt(ia);
+    y: FnSig = gFnSigs.sigAt(ib);
+    if (x.paramCount != y.paramCount) { return false; }
+    if (!fnTypesFit(x.ret.base, x.ret.name, y.ret.base, y.ret.name)) { return false; }
+    if ((x.ret.base == Lit.Ref) != (y.ret.base == Lit.Ref)) { return false; }   // a borrow is not the value
+    for k in 0..x.paramCount {
+        p: FnParam = gFnSigs.paramAt(x, k);
+        q: FnParam = gFnSigs.paramAt(y, k);
+        if (!fnTypesFit(p.kind, p.name, q.kind, q.name)) { return false; }
+    }
+    return !fnSigsOwnershipClash(x, y);
+}
+
 // ─── in a `.klib` ────────────────────────────────────────────────────────────
 // A field carries a length, which inside a template may still name its parameter (`putCount`),
 // so these two codecs are written out rather than derived.
@@ -1959,4 +2321,11 @@ methods FieldDef for Decode {
         return FieldDef { name: name, kind: kind, structName: sn, offset: offset, isArray: isArray,
                           count: getCount(inp) };
     }
+}
+
+// `Drop`'s name, interned once (`needsDrop` asks it of every type it meets).
+local var gDropName: Sym = NO_SYM;
+local dropName -> Sym {
+    if (gDropName == NO_SYM) { gDropName = intern("Drop"); }
+    return gDropName;
 }

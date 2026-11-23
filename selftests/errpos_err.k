@@ -1,5 +1,5 @@
 // An error past the parser says where, as the parser's do: the statement it is in, inside a
-// generic body stamped for the instance that made it wrong. `file:line:col: Error: ...`.
+// generic body stamped for the instance that made it wrong. `file:line:col: error: ...`.
 struct Pair<T> { a: T, b: T }
 methods Pair<T> {
     widest &self -> long {

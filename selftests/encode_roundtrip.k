@@ -1,8 +1,8 @@
 // `Encode`/`Decode` with nothing written by hand: every implementation below is the derive's
-// (stdlib/encode.k), made the first time `main` needs it -- a nested struct, a `Vec` of structs,
+// (stdlib/encode.k), made the first time `main` needs it: a nested struct, a `Vec` of structs,
 // `Option`s, a `HashMap`, a sum type with payloads, a backed enum, a generic struct's instance,
 // negative and extreme integers, a `str` decoded as a view into the input. Then the failures:
-// a truncated input and a tag no variant has are refused cleanly, not trapped on. Exit 0 when
+// a truncated input and an invalid variant tag are refused cleanly, not trapped on. Exit 0 when
 // every check holds, otherwise the number of the first that did not.
 #include <stdlib::io>
 #include <stdlib::encode>
@@ -63,7 +63,8 @@ main -> int {
     view: [u8] = "";
     unsafe { view = bytesOf(&bytes); }
 
-    dd: Decoder = decoderOf(view);
+    dd: Decoder;
+    unsafe { dd = decoderOf(view); }
     r: Doc = Doc.decode(dd);
     if (!dd.done()) { return 1; }
     if (r.id != 7 || r.title != "hello") { return 2; }
@@ -90,21 +91,23 @@ main -> int {
     sb: Vec<u8> = encodeValue("abc");
     sv: [u8] = "";
     unsafe { sv = bytesOf(&sb); }
-    sd: Decoder = decoderOf(sv);
+    sd: Decoder;
+    unsafe { sd = decoderOf(sv); }
     s: str = str.decode(sd);
     if (s != "abc") { return 13; }
     unsafe { if (s.ptr != sv.ptr + 1) { return 14; } }
 
     // Truncated: refused, with the first reason, and nothing read past the end.
-    short: Decoder = decoderOf(view[..10]);
+    short: Decoder;
+    unsafe { short = decoderOf(view[..10]); }
     bad: Doc = Doc.decode(short);
-    if (short.ok() || short.error() != "the input ends inside a value") { return 15; }
+    if (short.ok() || short.error() != "unexpected end of input") { return 15; }
     // A tag no variant of Shape has.
     tb: Vec<u8> = encodeValue(9 as long);
     tv: [u8] = "";
     unsafe { tv = bytesOf(&tb); }
     res: Result<Shape, str> = decodeValue(tv);
-    match res { Ok(_) { return 16; } Err(why) { if (why != "a tag no variant has") { return 17; } } }
+    match res { Ok(_) { return 16; } Err(why) { if (why != "invalid variant tag") { return 17; } } }
     // The whole thing through the one-shot helper.
     whole: Result<Doc, str> = decodeValue(view);
     if (!whole.isOk()) { return 18; }

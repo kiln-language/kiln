@@ -1,0 +1,10 @@
+selftests/parse_macro_err.k:10:22: error: expected `;`, found `}`
+   10 | f -> long { return 1 }
+      |                      ^
+selftests/parse_macro_err.k:6:40: error: expected an expression, found `;`
+    6 | macro twice e:Node -> Node { x: long = ; return e; }
+      |                                        ^
+selftests/parse_macro_err.k:8:57: error: expected `;`, found `}`
+    8 | macro thrice e:Node -> Node { return quote { @(e) * 3 } }
+      |                                                         ^
+3 errors generated.

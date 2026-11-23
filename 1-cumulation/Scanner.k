@@ -38,14 +38,15 @@ methods Scanner {
     scanAll &self roots:Vec<str> -> void {
         // `stdlib::core` declares the traits the compiler wires into the language (`Drop`,
         // `Clone`, `Default`, `Eq`, `Add`...), so it is in every program, first, whether or not
-        // anything includes it: a `methods X for Drop` in a file that includes nothing used to
-        // name a trait no one declared, and the drop never ran. Visited as no module's include,
-        // it adds no import edge; its traits are flat names any module resolves.
+        // anything includes it. Otherwise a `methods X for Drop` in a file that includes nothing
+        // would name a trait nobody declared, and the drop would never run. Since it is visited
+        // as no module's include, it adds no import edge; its traits are flat names any module
+        // resolves.
         corePath: str = keepJoin(STDLIB_ROOT, "core");
         if (gProvidedPaths.has(corePath) || fileExists(corePath)) { self.visit(corePath); }
         for root in roots { self.visit(keep(root)); }
         // A macro is written against `stdlib::ast`'s `Node`, and its declaration is read once
-        // the whole program has been -- so a program that declares one has `ast` in it, whether
+        // the whole program has been. So a program that declares one has `ast` in it, whether
         // or not any module could include it (`vec` cannot: `ast` is built on `Vec`).
         if (self.declaresMacro()) {
             astPath: str = keepJoin(STDLIB_ROOT, "ast");

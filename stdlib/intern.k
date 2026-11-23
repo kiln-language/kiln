@@ -9,11 +9,11 @@
 // over and over wants instead of a `String` per occurrence: an id is `Copy`, so it can be a map
 // key, an enum payload or a struct field without owning anything and without dangling.
 //
-// The bytes live in `owned` and are never removed — interning is monotone, which is the whole
-// bargain: an id stays valid for the life of the interner, so nothing has to be re-checked.
-// `views` is a parallel vector of `str` into them, which is what makes `nameOf` free: a `str` is
-// Copy, so it is handed back rather than cloned. A view stays valid as `owned` grows because a
-// `String`'s bytes are its own heap block — growth moves the 24-byte headers, not the text.
+// The bytes live in `owned` and are never removed, so an id stays valid for the life of the
+// interner and never needs re-checking. `views` is a parallel vector of `str` pointing into
+// them, so `nameOf` costs nothing: a `str` is Copy and is handed back without a clone. A view
+// survives `owned` growing because each `String` keeps its bytes in its own heap block; growth
+// moves the 24-byte headers, not the text.
 #include <{string, vec, map, option}>
 
 pub struct Interner {
@@ -53,16 +53,15 @@ methods Interner {
         return self.views.get(id);
     }
 
-    // Intern `s` and hand back the interner's OWN copy of it: a `str` that outlives whatever
+    // Intern `s` and hand back the interner's own copy of it: a `str` that outlives whatever
     // buffer the text came from. The way to keep a slice of a file, a token or an argument
     // without owning a `String` for each one.
     keep &self s:str -> str { return self.nameOf(self.intern(s)); }
 
-    // The same two, for text that was BUILT rather than borrowed. `String.view` is `unsafe`
-    // because the view dangles if the String is dropped or grown while it is held — but
-    // interning copies the bytes immediately, so that cannot happen here. Taking the String
-    // means the caller never opens an `unsafe` block of its own, which is what makes
-    // "assemble a name, then intern it" an ordinary two-line thing to write.
+    // The same two, for text that was built rather than borrowed. `String.view` is `unsafe`
+    // because the view dangles if the String is dropped or grown while it is held, but interning
+    // copies the bytes right away, so that cannot happen here. Taking the String keeps the
+    // caller out of `unsafe`, so building a name and interning it takes two ordinary lines.
     internString &self s:String -> long { unsafe { return self.intern(s.view()); } }
     keepString   &self s:String -> str  { unsafe { return self.keep(s.view()); } }
 

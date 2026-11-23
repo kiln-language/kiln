@@ -1,11 +1,12 @@
-// A syntax tree as bytes, and back: the form a `.klib` carries a module's declarations and each
-// function body in (`1-cumulation/KlibTree.k` writes and reads the sections; this is the part
-// every phase may need, since a dependency's body is read only when something needs it).
+// A syntax tree as bytes, and back. This is the form in which a `.klib` carries a module's
+// declarations and each of its function bodies. `1-cumulation/KlibTree.k` writes and reads the
+// sections; this file holds the part any phase may need, since a dependency's body is only read
+// when something asks for it.
 //
-// A tree is dense and starts at zero in every arena. Writing one puts a bitmask of the arenas
-// present, then each present arena: its length, then its elements, every index field as it is.
-// Reading one shifts every index by where that arena starts in the reader's tree (`Rebase`),
-// node by node through `ast.k`'s `mapX`, as it is pushed.
+// A tree is dense and starts at zero in every arena. Writing one puts out a bitmask of the arenas
+// present, then, for each present arena, its length and its elements, every index field as it is.
+// Reading one shifts every index by where that arena starts in the reader's tree (`Rebase`), node
+// by node through `ast.k`'s `mapX`, as each node is pushed.
 #include <ast>
 #include <support::compiler>
 #include <stdlib::{encode, map, option, string, vec}>
@@ -48,10 +49,11 @@ pub encodeTree inout e:Encoder a:Ast -> void {
     if (a.structDecls.len() > 0) { a.structDecls.encode(e); }
 }
 
-// Where each statement stands, after the statements: a file index means nothing in another
-// process, so the file crosses as a name through the string table, and only when it changes
-// (a module's statements are all one file's). Per statement: 0 for no position; 1 for the file
-// before; otherwise the file's table place plus 2. Then the line and the column.
+// Each statement's position, written after the statements. A file index means nothing in another
+// process, so the file goes across as a name through the string table, and only when it changes
+// (a module's statements all come from one file). Per statement: 0 for no position, 1 for the same
+// file as the statement before, otherwise the file's place in the table plus 2; then the line and
+// the column.
 pub encodePositions inout e:Encoder a:Ast -> void {
     last: Sym = NO_SYM;
     for k in 0..a.stmtPos.len() {
@@ -112,10 +114,11 @@ pub columnLen a:Ast k:Arena -> long {
 
 // ─── reading: the rebase ─────────────────────────────────────────────────────
 
-// Where each arena of a tree being read starts in the reader's: the length it had before. A
-// function is DECLS's wherever it is named (`fnBase`), and its bounds are the registry's, as the
-// replay of the module's operations placed them (`bounds`), or as written (`sameBounds`, a tree
-// read back in the process that wrote it).
+// Where each arena of a tree being read starts in the reader's tree: the length that arena had
+// before. A function node always lives in its module's DECLS, wherever it is named, so a function
+// index is rebased by `fnBase`, where that module's functions start. A function's bounds are the
+// registry's: where the replay of the module's operations placed them (`bounds`), or exactly as
+// written (`sameBounds`, for a tree read back in the process that wrote it).
 pub struct Rebase { base: Vec<long>, fnBase: long, bounds: HashMap<long, long>, sameBounds: bool }
 
 pub rebaseOf -> Rebase {
@@ -138,7 +141,7 @@ methods Rebase for IdMap {
             if (self.sameBounds) { return v; }
             hit: Option<long> = self.bounds.find(v);
             match hit { Some(i) { return i; } None { } }
-            failStr(format("internal: a function's bounds ({}) were not among its module's operations", v));
+            failStr(format("internal compiler error: a function's bounds ({}) were not among its module's operations", v));
             return v;
         }
         return v + self.base.get(arena as long);
@@ -264,10 +267,11 @@ pub decodeTree inout d:Decoder inout a:Ast inout rb:Rebase -> void {
 
 // ─── a dependency's bodies, read when needed ────────────────────────────────
 // A dependency's function is not checked, lowered or emitted here, so its body is wanted only
-// when compile-time code reaches it (the checker checks it then, `Checker.ctNeed`). Its node says
-// `BODY_LAZY` until then, and where its tree is in the `.klib` is kept here: reading it then costs
-// what it would have cost up front, and a body nothing reaches costs nothing. Templates and
-// macros are read with their module, since stamping an instance or running a macro needs one.
+// when compile-time code reaches it (the checker then checks it, in `Checker.ctNeed`). Until then
+// its node says `BODY_LAZY`, and this file keeps where its tree is in the `.klib`. Reading it late
+// costs what reading it up front would have, and a body nothing reaches costs nothing. Templates
+// and macros are read with their module, since stamping an instance or running a macro needs
+// them.
 
 // Where one body is: its bytes (a view of the kept metadata), the string table its names are in,
 // and where its module's functions start in the tree.
@@ -275,7 +279,7 @@ pub struct LazyBody { at: long, len: long, symBase: long, symCount: long, fnBase
 
 pub var gLazyBodies: Vec<LazyBody> = vec![];
 pub var gLazyAt: Vec<long> = vec![];       // per function of the tree: its entry above, or -1
-pub var gBodiesRead: long = 0;              // read when something needed them
+pub var gBodiesRead: long = 0;              // bodies read because something needed them
 
 pub noteLazyBody fi:long b:LazyBody -> void {
     while (gLazyAt.len() <= fi) { gLazyAt.push(-1); }
@@ -283,12 +287,13 @@ pub noteLazyBody fi:long b:LazyBody -> void {
     gLazyBodies.push(b);
 }
 
-// Function `fi`'s body, read into the tree if it has not been. Answers the function as it is now.
+// Reads function `fi`'s body into the tree if it is not there yet, and returns the function as it
+// now stands.
 pub ensureBody inout a:Ast fi:long -> FnNode {
     f: FnNode = a.fns.get(fi);
     if (f.body != BODY_LAZY) { return f; }
     if (fi >= gLazyAt.len() || gLazyAt.get(fi) < 0) {
-        failStr(format("internal: '{}' has a body in its .klib and nothing says where", nameOf(f.name)));
+        failStr(format("internal compiler error: `{}` has a body in its `.klib`, but nothing records where", nameOf(f.name)));
     }
     b: LazyBody = gLazyBodies.get(gLazyAt.get(fi));
     gLazyAt.set(fi, -1);
@@ -298,13 +303,14 @@ pub ensureBody inout a:Ast fi:long -> FnNode {
     gSymInCount = b.symCount;
     view: [u8] = "";
     unsafe { view = (b.at as *u8)[..b.len]; }
-    d: Decoder = decoderOf(view);
+    d: Decoder;
+    unsafe { d = decoderOf(view); }
     rb: Rebase = rebaseOf();
     rb.startAt(a);
     rb.fnBase = b.fnBase;
     decodeTree(&d, a, &rb);
     root: long = d.getVarint() + rb.base.get(Arena.Blocks as long);
-    if (!d.done()) { failStr(format("{}: damaged .klib metadata ({}) -- rebuild it", b.origin, d.error())); }
+    if (!d.done()) { failStr(format("damaged `.klib` metadata in `{}`: {}\nhelp: rebuild it", b.origin, d.error())); }
     gSymInBase = wasBase;
     gSymInCount = wasCount;
     f.body = root;

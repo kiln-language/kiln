@@ -1,4 +1,4 @@
-// FixedString<N> — text of at most N bytes, held inline: a string you can build and format into
+// FixedString<N>: text of at most N bytes, held inline: a string you can build and format into
 // without the heap, and without lending anyone a pointer.
 //
 //     s: FixedString<64> = formatFixed("{}:{}", host, port);
@@ -7,8 +7,8 @@
 //     println("{}", line);                     // and Display
 //
 // What `StringWriter` does, without its `unsafe`: that one points at a buffer the caller owns
-// and has to be trusted to outlive the writer; this one IS the buffer, so there is nothing to
-// trust. It is plain data — no Drop, nothing to release — and a copy is a copy of the bytes.
+// and has to be trusted to outlive the writer; this one is the buffer, so there is nothing to
+// trust. It is plain data with no Drop and nothing to release, and a copy is a copy of the bytes.
 //
 // A write past N keeps what fits and marks the string `wasCut`, the way `StringWriter` truncates;
 // `pushStr` and `push` also answer whether everything fit.
@@ -26,7 +26,7 @@ methods FixedString<N> for Write {
         n: long = len;
         if (n > N - self.len) { n = N - self.len; self.cut = true; }
         if (n > 0) { unsafe { memcpy(&self.data as long + self.len, ptr, n); } }
-        self.len = self.len + n;
+        self.len += n;
         return n;
     }
 }
@@ -50,7 +50,7 @@ methods FixedString<N> {
     push &self c:char -> bool {
         if (self.len == N) { self.cut = true; return false; }
         self.data[self.len] = c as u8;
-        self.len = self.len + 1;
+        self.len += 1;
         return true;
     }
     pushStr &self s:str -> bool {
@@ -59,7 +59,7 @@ methods FixedString<N> {
     // The last byte, removed; nothing if the string is empty.
     pop &self -> Option<char> {
         if (self.len == 0) { return Option.None; }
-        self.len = self.len - 1;
+        self.len -= 1;
         return Option.Some(self.data[self.len] as char);
     }
 
@@ -76,7 +76,7 @@ methods FixedString<N> {
     toString   &self -> String { return stringOf(self.data[..self.len] as str); }
 }
 
-// Equal, ordered and hashed by CONTENT, like `str` and `String`, so one is a map key and sorts.
+// Equal, ordered and hashed by content, like `str` and `String`, so one is a map key and sorts.
 // (A struct with an array field gets no derived `==`, and the bytes past `len` are not the text.)
 methods FixedString<N> for Eq<str> {
     eq &self other:str -> bool { return strEq(self.data[..self.len] as str, other); }

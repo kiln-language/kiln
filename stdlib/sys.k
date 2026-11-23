@@ -11,8 +11,8 @@
 // is safe, with the raw call in an internal `unsafe { }` block. The `syscallN` entries
 // themselves are all unsafe, since the number decides what the arguments mean.
 
-// The x86-64 syscall numbers the library uses. A plain backed enum: a variant IS its number,
-// so `syscall1(Syscall.Close, fd)` costs exactly what `mov rax, 3` did.
+// The x86-64 syscall numbers the library uses. A plain backed enum whose variants are the
+// numbers, so `syscall1(Syscall.Close, fd)` costs the same as a hard-coded `mov rax, 3`.
 pub enum Syscall: long {
     Read = 0, Write = 1, Open = 2, Close = 3, Fstat = 5, Poll = 7, Lseek = 8, Mmap = 9, Munmap = 11,
     Ioctl = 16, Dup2 = 33, Newfstatat = 262, Dup3 = 292, Pipe2 = 293, Getrandom = 318,
@@ -52,7 +52,28 @@ pub unsafe syscall6 nr:Syscall a:long b:long c:long d:long e:long f:long -> long
 
 // ─── what several modules call ───────────────────────────────────────────────
 
-// Ends this thread at once, without the `@fini` hooks (the `exit` builtin runs them).
+// stdout's held bytes, for a panic. io records at startup where its stdout buffer and fill count
+// live, so panic.k, which sits below io and must not take stdout's lock (the panicking thread may
+// hold it, mid-print), can write them out before its message. Raw addresses rather than a
+// function to call: a function whose address is taken could be reached from any indirect call,
+// and this one writes stdout by name. All 0 until io sets them, at compile time, and once stdout
+// is redirected, which makes `spillStdoutNow` nothing.
+pub var gStdoutBufAt: long = 0;      // the buffer's first byte
+pub var gStdoutPosAt: long = 0;      // the long counting how many bytes it holds
+pub var gStdoutCap: long = 0;
+pub spillStdoutNow -> void {
+    unsafe {
+        if (gStdoutPosAt == 0) { return; }
+        n: long = *(gStdoutPosAt as *long);
+        if (n <= 0 || n > gStdoutCap) { return; }
+        writeAll(1, gStdoutBufAt, n);
+        *(gStdoutPosAt as *long) = 0;
+    }
+}
+
+// Ends this thread at once, without the `@fini` hooks (the `exit` builtin runs them). So what
+// stdout holds is not written either: a program ending this way after printing to a file or a
+// pipe loses it, unless it calls `spillStdoutNow` first, as a panic does.
 pub sysExit code:long -> never {
     unsafe { syscall1(Syscall.Exit, code); }
     loop { }

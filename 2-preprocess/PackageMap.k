@@ -5,7 +5,7 @@
 // package. A manifest may `depend <name> <path>`; dependencies do not chain, and a cycle is
 // refused here, while the manifest chain that produced it can still be named.
 #include <support::compiler>
-#include <stdlib::{chars, path, pathbuf, string, fmt, map, option, panic, vec}>
+#include <stdlib::{chars, dir, path, pathbuf, string, fmt, map, option, panic, result, vec}>
 
 pub MANIFEST: str = "package.kiln";
 
@@ -14,11 +14,11 @@ pub NO_PACKAGE: long = -1;
 // One dependency edge: the name a manifest gave it, and the directory it lives in.
 pub struct PackageDep { name: str, root: str }
 
-// One `depend` line as written, before its path is resolved. Reading a manifest and resolving
-// what it depends on are separate steps, because the package has to be registered before the
-// recursion that reads its dependencies' manifests: otherwise a cycle runs away instead of
-// being named.
-local struct RawDep { name: str, path: str }
+// One `depend` line as written, before its path is resolved, and the line it is on, for an error
+// about it. Reading a manifest and resolving what it depends on are separate steps, because the
+// package has to be registered before the recursion that reads its dependencies' manifests:
+// otherwise a cycle runs away instead of being named.
+local struct RawDep { name: str, path: str, line: long }
 
 // A declared package. Its dependencies are a run in the map's flat `deps` vector rather than a
 // vector of their own, which is what keeps this Copy. The run is contiguous because a package's
@@ -30,12 +30,14 @@ pub struct PackageMap {
     infos:     Vec<PackageInfo>,
     deps:      Vec<PackageDep>,
     byDir:     HashMap<str, long>,   // directory -> index into infos, or NO_PACKAGE
-    resolving: Vec<str>              // manifest roots whose dependencies are being read
+    resolving: Vec<str>,             // manifest roots whose dependencies are being read
+    cwd:       str,                  // the working directory, absolute, once a walk has needed it
+    cwdRead:   bool
 }
 
 methods PackageMap for Default {
     new -> PackageMap {
-        return PackageMap { infos: vec![], deps: vec![], byDir: map![], resolving: vec![] };
+        return PackageMap { infos: vec![], deps: vec![], byDir: map![], resolving: vec![], cwd: "", cwdRead: false };
     }
 }
 
@@ -111,7 +113,8 @@ methods PackageMap {
             Some(t) { body = t; }
             None {
                 up: long = NO_PACKAGE;
-                if (dir.len > 0) { up = self.nearest(dirOf(dir)); }   // keep climbing
+                parent: Option<str> = self.parentOf(dir);
+                match parent { Some(d) { up = self.nearest(d); } None { } }   // keep climbing
                 self.byDir.put(dir, up);
                 return up;
             }
@@ -137,6 +140,39 @@ methods PackageMap {
         return idx;
     }
 
+    // The directory a normalized `dir` sits in, for the walk up to a manifest, or None at the root
+    // of the filesystem. A manifest claims its subtree, so the walk has to visit the directories
+    // that really contain `dir`, all the way to `/`.
+    //
+    // Cutting the last component off the spelling gives that directory everywhere but two places.
+    // An absolute path's top component sits in `/`, which cutting spells as "", the working
+    // directory: a file named `/tmp/x.k` was taken into whatever package the compiler was run
+    // from. And a relative spelling cannot name what contains the working directory (""), or
+    // what contains a `..` (cutting `..` gives "" too, the wrong way round), so those go through
+    // the absolute form of the path.
+    parentOf &self dir:str -> Option<str> {
+        if (isAbsolute(dir)) {
+            if (dir.len == 1) { return Option.None; }
+            up: str = dirOf(dir);
+            if (up.len == 0) { return Option.Some("/"); }
+            return Option.Some(up);
+        }
+        if (dir.len > 0 && !(baseName(dir) == "..")) { return Option.Some(dirOf(dir)); }
+        here: str = self.workingDir();
+        if (here.len == 0) { return Option.None; }       // unknown: stop where the spelling ends
+        return self.parentOf(self.held(joinNormalized(here, dir)));
+    }
+
+    // The working directory, read once. "" when it cannot be read (removed from under us).
+    workingDir &self -> str {
+        if (!self.cwdRead) {
+            self.cwdRead = true;
+            got: Result<String, long> = currentDir();
+            match got { Ok(s) { self.cwd = self.held(s); } Err(_) { } }
+        }
+        return self.cwd;
+    }
+
     // Hand a built String to the interner and keep only the view. Every string this map stores
     // goes through here, which is what lets the map hold views instead of owning buffers.
     held &self s:String -> str {
@@ -157,28 +193,30 @@ methods PackageMap {
     readManifest &self body:str manifest:str inout raw:Vec<RawDep> -> str {
         found: str = "";
         lines: Vec<str> = splitLines(body);
+        n: long = 0;                    // the line being read, from 1
         for line in lines {
+            n = n + 1;
             w: Vec<str> = words(line);
             if (w.len() > 0) {
                 head: str = w.get(0);
                 if (head == "package") {
-                    if (found.len > 0) { self.reject(manifest, stringOf("declares more than one package")); }
-                    if (w.len() < 2) { self.reject(manifest, stringOf("package has no name")); }
+                    if (found.len > 0) { self.reject(manifest, n, stringOf("duplicate `package` line\nnote: a manifest declares one package")); }
+                    if (w.len() < 2) { self.reject(manifest, n, stringOf("expected a package name after `package`")); }
                     found = keep(w.get(1));
                 } else if (head == "depend") {
                     if (w.len() < 3) {
-                        self.reject(manifest, stringOf("`depend` needs a name and a path (depend mathlib ../mathlib)"));
+                        self.reject(manifest, n, stringOf("expected a name and a path after `depend`\nhelp: write it as `depend mathlib ../mathlib`"));
                     }
-                    raw.push(RawDep { name: keep(w.get(1)), path: w.get(2) });
+                    raw.push(RawDep { name: keep(w.get(1)), path: w.get(2), line: n });
                 } else {
-                    self.reject(manifest,
-                                format("unknown directive '{}' (expected `package` or `depend`)",
+                    self.reject(manifest, n,
+                                format("unknown directive `{}`\nnote: a manifest holds only `package` and `depend` lines",
                                        head));
                 }
             }
         }
         // Not `reject`: a manifest that declares nothing is faulted as a whole, not at a line in it.
-        if (found.len == 0) { failStr(format("{} declares no package", manifest)); }
+        if (found.len == 0) { failStr(format("`{}` declares no package\nhelp: add a line `package <name>;`", manifest)); }
         return found;
     }
 
@@ -201,14 +239,14 @@ methods PackageMap {
 
         at: long = self.nearest(depRoot);
         if (at < 0) {
-            self.reject(manifest, format("dependency '{}' has no {} at {}",
-                                         dname, MANIFEST, depRoot));
+            self.reject(manifest, d.line, format("dependency `{}` has no `{}` at `{}`",
+                                                 dname, MANIFEST, depRoot));
         }
         declared: str = self.infos.get(at).name;
         if (!(declared == dname)) {
             theirs: String = joinPath(depRoot, MANIFEST);
-            self.reject(manifest,
-                        format("dependency is named '{}' but {} declares package '{}'",
+            self.reject(manifest, d.line,
+                        format("dependency `{}` does not match its manifest\nnote: `{}` declares package `{}`",
                                dname, theirs, declared));
         }
         return PackageDep { name: dname, root: depRoot };
@@ -221,16 +259,16 @@ methods PackageMap {
     reportCycle &self from:long depRoot:str -> void {
         s: String;
         roots: String;
-        s.pushStr("package dependency cycle: ");
+        s.pushStr("package dependency cycle: `");
         for j in from..self.resolving.len() {
             root: str = self.resolving.get(j);
             s.pushStr(self.nameAt(root));
-            s.pushStr(" -> ");
+            s.pushStr("` -> `");
             if (roots.length() > 0) { roots.pushStr(", "); }
             roots.pushStr(root);
         }
         s.pushStr(self.nameAt(depRoot));
-        s.pushStr(" — a package may not depend on itself, directly or through others (roots: ");
+        s.pushStr("`\nnote: a package may not depend on itself, directly or through other packages (their roots: ");
         s.pushString(roots);
         s.push(')');
         failStr(s);
@@ -247,10 +285,9 @@ methods PackageMap {
         return dir;
     }
 
-    // `<manifest>: <what>`, through `fail`, a manifest diagnostic carries the `Error: ` banner,
-    // unlike an include diagnostic next door. That split is the reference's, not a slip here.
-    reject &self manifest:str what:String -> void {
-        failStr(format("{}: {}", manifest, what));
+    // A manifest error, reported at the line it is about.
+    reject &self manifest:str line:long what:String -> void {
+        failAtStr(manifest, line, 1, what);
     }
 }
 
