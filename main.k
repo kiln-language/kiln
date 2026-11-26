@@ -12,7 +12,7 @@
 #include <codegen::{asm, lower, opt, flow, relayout, irdump, llvm, ir, irpack, effects, relax, scale, regalloc}>
 #include <lex::{lexer, token}>
 
-local USAGE: str = "usage: kilnc <file.k> [-o out.s] [options]\n       kilnc build [root] [-o exe] [--cache dir]\n       kilnc --klib <file.k>... [--extern name=path.klib]... [--meta file] [--compiler-id hex] -o out.s\n\noptions:\n  -o, --output <file>    write the assembly to <file> (default output.s)\n  --emit=<stage>         print one stage and stop: pre, tokens, ast, typed, ir or llvm\n  --lib                  compile a library: export every `pub` function, write no `_start`\n  --use <file>           take the symbols listed in <file> from another object\n  --time-phases          print how long each phase took\n  --trace-fold           print what the compile-time evaluator folded or could not\n  --trace-opt            print what the optimizer did\n  --trace-ipra           print what a call to each function may change\n  --no-flow, --no-relax, --no-thread, --no-cse, --no-hoist, --no-results, --no-build,\n  --no-scale, --no-rotate, --no-select, --no-loop-inline,\n  --no-short-memcpy, --no-exact-calls, --no-second-chance, --no-homes,\n  --no-wide-addr, --no-hoist-dup, --no-empty-loops, --no-forward-inline,\n  --no-splice-slots, --no-commute, --no-xor-bounds, --no-wide-const, --no-set-in-place,\n  --no-fill-loops, --no-sink-homes, --no-neg, --no-asm-out,\n  --no-scale-convert, --no-result-each,\n  --no-unroll, --no-refold, --no-free-seeds, --no-accumulate, --no-ipra\n                         turn one optimization off\n  --no-restrict          trust no borrowed parameter to be the only way to its bytes\n  --no-lent              take a local lent to a call as exposed from then on\n  --no-rodata            read nothing out of an immutable global's image\n  --no-moved-args        copy every struct taken by value in its callee, moved into the call or not\n  --ipra-asm-full        take a function holding an `asm` block to change every caller-saved register\n  --fold-steps=<n>       limit the compile-time evaluator to <n> steps\n  --fold-heap=<MiB>      limit its heap to <MiB> mebibytes\n  --verify-regops        check the registry against its operation log, then stop\n  --klib-verify          in a package build, check every module's tree reads back, then stop\n  -h, --help             print this and exit";
+local USAGE: str = "usage: kilnc <file.k> [-o out.s] [options]\n       kilnc build [root] [-o exe] [--cache dir]\n       kilnc --klib <file.k>... [--extern name=path.klib]... [--meta file] [--compiler-id hex] -o out.s\n\noptions:\n  -o, --output <file>    write the assembly to <file> (default output.s)\n  --emit=<stage>         print one stage and stop: pre, tokens, ast, typed, ir or llvm\n  --lib                  compile a library: export every `pub` function, write no `_start`\n  --use <file>           take the symbols listed in <file> from another object\n  --time-phases          print how long each phase took\n  --trace-fold           print what the compile-time evaluator folded or could not\n  --trace-opt            print what the optimizer did\n  --trace-ipra           print what a call to each function may change\n  --no-flow, --no-relax, --no-thread, --no-cse, --no-hoist, --no-results, --no-build,\n  --no-scale, --no-rotate, --no-select, --no-loop-inline,\n  --no-short-memcpy, --no-exact-calls, --no-second-chance, --no-homes,\n  --no-wide-addr, --no-hoist-dup, --no-empty-loops, --no-forward-inline,\n  --no-splice-slots, --no-commute, --no-xor-bounds, --no-wide-const, --no-set-in-place,\n  --no-fill-loops, --no-sink-homes, --no-neg, --no-asm-out,\n  --no-scale-convert, --no-result-each,\n  --no-unroll, --no-refold, --no-free-seeds, --no-accumulate, --no-ipra,\n  --no-fold-inline, --no-reassociate, --no-literal-bytes, --no-self-inline, --no-merge-acc,\n  --no-retarget, --no-fuse, --no-cond-value, --no-hints,\n  --no-result-rax, --no-partial-inline, --no-rotate-join, --no-lea,\n  --no-pull-result, --no-spill-scratch, --no-frame-operand, --no-convert-copy, --no-fold-offsets, --no-shift-mul, --no-promote-lent\n                   turn one optimization off\n  --no-restrict          trust no borrowed parameter to be the only way to its bytes\n  --no-lent              take a local lent to a call as exposed from then on\n  --no-rodata            read nothing out of an immutable global's image\n  --no-moved-args        copy every struct taken by value in its callee, moved into the call or not\n  --ipra-asm-full        take a function holding an `asm` block to change every caller-saved register\n  --fold-steps=<n>       limit the compile-time evaluator to <n> steps\n  --fold-heap=<MiB>      limit its heap to <MiB> mebibytes\n  --verify-regops        check the registry against its operation log, then stop\n  --klib-verify          in a package build, check every module's tree reads back, then stop\n  -h, --help             print this and exit";
 
 // The number after `--flag=`, which must be one, and positive.
 local flagNumber flag:str at:long -> long {
@@ -200,6 +200,24 @@ main args: ...str -> int {
             gScaleOff = true;
         } else if (x == "--no-rotate") {
             gRotateOff = true;
+        } else if (x == "--no-rotate-join") {
+            gRotateJoinOff = true;
+        } else if (x == "--no-lea") {
+            gLeaOff = true;
+        } else if (x == "--no-pull-result") {
+            gPullResultOff = true;
+        } else if (x == "--no-promote-lent") {
+            gPromoteLentOff = true;
+        } else if (x == "--no-shift-mul") {
+            gShiftMulOff = true;
+        } else if (x == "--no-fold-offsets") {
+            gFoldOffsetsOff = true;
+        } else if (x == "--no-convert-copy") {
+            gConvertCopyOff = true;
+        } else if (x == "--no-frame-operand") {
+            gFrameOperandOff = true;
+        } else if (x == "--no-spill-scratch") {
+            gSpillScratchOff = true;
         } else if (x == "--no-select") {
             gSelectOff = true;
         } else if (x == "--no-loop-inline") {
@@ -214,6 +232,10 @@ main args: ...str -> int {
             gHomesOff = true;
         } else if (x == "--no-sink-homes") {
             gSinkHomesOff = true;
+        } else if (x == "--no-result-rax") {
+            gResultRaxOff = true;
+        } else if (x == "--no-hints") {
+            gHintsOff = true;
         } else if (x == "--no-commute") {
             gCommuteOff = true;
         } else if (x == "--no-xor-bounds") {
@@ -222,6 +244,10 @@ main args: ...str -> int {
             gWideConstOff = true;
         } else if (x == "--no-neg") {
             gNegOff = true;
+        } else if (x == "--no-reassociate") {
+            gReassocOff = true;
+        } else if (x == "--no-literal-bytes") {
+            gLitBytesOff = true;
         } else if (x == "--no-set-in-place") {
             gSetInPlaceOff = true;
         } else if (x == "--no-fill-loops") {
@@ -236,6 +262,20 @@ main args: ...str -> int {
             gRefoldOff = true;
         } else if (x == "--no-accumulate") {
             gAccumulateOff = true;
+        } else if (x == "--no-fold-inline") {
+            gFoldInlineOff = true;
+        } else if (x == "--no-self-inline") {
+            gSelfInlineOff = true;
+        } else if (x == "--no-partial-inline") {
+            gPartialInlineOff = true;
+        } else if (x == "--no-cond-value") {
+            gCondValueOff = true;
+        } else if (x == "--no-fuse") {
+            gFuseOff = true;
+        } else if (x == "--no-retarget") {
+            gRetargetOff = true;
+        } else if (x == "--no-merge-acc") {
+            gMergeAccOff = true;
         } else if (x == "--no-ipra") {
             gIpraOff = true;
         } else if (x == "--ipra-asm-full") {
@@ -384,8 +424,10 @@ main args: ...str -> int {
         fl.run(&lw.ir);
         sa: Scaler;
         sa.run(&lw.ir);
+        op2.retargetAndFuse(&lw.ir);
         if (!gFillLoopsOff) { op2.fillLoopsAll(&lw.ir); }
         if (!gUnrollOff) { op2.unrollAll(&lw.ir); }
+        op2.pullResults(&lw.ir);
         text: String;
         dumpIR(lw.ir, &text);
         unsafe { v: str = text.view(); writeBytes(v.ptr, v.len); }
@@ -494,10 +536,18 @@ main args: ...str -> int {
     // Then element addresses into one addressing mode each, which only the emitter reads.
     sa: Scaler;
     sa.run(&lw.ir);
-    if (gTraceOpt) { eprintln("scale: {} accesses indexed", gScaled); }
+    // A conversion only stored narrower dropped, constants added to addresses folded into the
+    // accesses, a shift before a product folded into its constant, a copy whose source was
+    // computed aside only for it computed in place, and two loops over one range run as one
+    // (`narrowStores`, `foldOffsets`, `shiftMuls`, `retargetCopies`, `fuseOne`).
+    op2.retargetAndFuse(&lw.ir);
     // A loop that only clears a range of a frame slot's array: one block zero.
     if (!gFillLoopsOff) { op2.fillLoopsAll(&lw.ir); }
     if (!gUnrollOff) { op2.unrollAll(&lw.ir); }
+    // A call's result read a few instructions on, read just after the call (`pullResults`).
+    op2.pullResults(&lw.ir);
+    if (gTraceOpt) { eprintln("scale: {} accesses indexed; {} sums made one lea; {} copies computed in place; {} pairs of loops fused; {} call results read where they arrive", gScaled, gLeas, op2.nRetarget, op2.nFusedLoops, op2.nPulled); }
+    if (gTraceOpt) { eprintln("late: {} conversions stored narrower dropped; {} offsets folded into accesses; {} shifts folded into products", op2.nNarrow, op2.nOffsets, op2.nShiftMuls); }
     phaseEnd("flow");
     // A program built from packages starts by running theirs, each after what it depends on.
     if (gKlibMode) { gStartInits = startInits(); }

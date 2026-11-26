@@ -20,6 +20,8 @@
 // ir-count: accumulate::withRecover call accumulate::withRecover 1
 // ir-count: accumulate::before call accumulate::before 0
 // ir-count: accumulate::after call accumulate::after 1
+// Built without copies of a function's body into its own calls (`selfInline`, `opt/self_copy`).
+// flags: --no-self-inline
 #include <stdlib::recover>
 
 var gDrops: long = 0;

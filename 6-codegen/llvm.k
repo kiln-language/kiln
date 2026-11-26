@@ -1047,7 +1047,14 @@ pub emitLlvm inout p:IRProgram inout out:String -> void {
     for f in 0..p.funcs.len() {
         emitFunc(&e, p, p.funcs.get(f));
     }
-    if (e.needBounds) { emitBoundsFail(&e); }
+    if (e.needBounds) {
+        // The `@spill` function the report calls first, when this module defines it.
+        spill: Sym = NO_SYM;
+        for f in 0..p.funcs.len() {
+            if (gSpillFn != NO_SYM && p.funcs.get(f).name == gSpillFn) { spill = gSpillFn; }
+        }
+        emitBoundsFail(&e, spill);
+    }
     emitMemFunctions(&e);
     out.pushString(e.out);
 }
@@ -1165,8 +1172,10 @@ local byteConst inout e:LlvmEmitter name:str text:str -> void {
 // What a failed bounds check runs: the native report (`Emitter.emitFailReport`) in the same words,
 // taken from `boundsText`, written to fd 2 with no allocation and no buffered sink, then exit 134.
 // The checks call `@__kiln_bounds_fail(index, length, where, whereLength, kind)`, where `kind` is
-// the check's `BOUNDS_*` kind and picks the report's head and middle.
-local emitBoundsFail inout e:LlvmEmitter -> void {
+// the check's `BOUNDS_*` kind and picks the report's head and middle. `spill`, the program's
+// `@spill` function or NO_SYM, is called first and once, as the native report does.
+local emitBoundsFail inout e:LlvmEmitter spill:Sym -> void {
+    if (spill != NO_SYM) { e.line("@__kiln_spilled = internal global i8 0"); }
     byteConst(&e, "@bnd.head", boundsText("__methBndHead"));
     byteConst(&e, "@bnd.mid", boundsText("__methBndMid"));
     byteConst(&e, "@bnd.rhead", boundsText("__methRngHead"));
@@ -1220,6 +1229,18 @@ local emitBoundsFail inout e:LlvmEmitter -> void {
     e.line("}");
     e.line("define internal void @__kiln_bounds_fail(i64 %i, i64 %n, ptr %loc, i64 %loclen, i64 %kind) noreturn cold noinline {");
     e.line("entry:");
+    if (spill != NO_SYM) {
+        e.line("  %spilled = load i8, ptr @__kiln_spilled");
+        e.line("  %fresh = icmp eq i8 %spilled, 0");
+        e.line("  br i1 %fresh, label %spill, label %report");
+        e.line("spill:");
+        e.line("  store i8 1, ptr @__kiln_spilled");
+        e.put("  %sp = call i64 @");
+        e.putString(quoted(nameOf(spill)));
+        e.line("()");
+        e.line("  br label %report");
+        e.line("report:");
+    }
     // The head: "index" for an index, "slice end" for an end, "slice start" for either start.
     e.line("  %isidx = icmp eq i64 %kind, 0");
     e.line("  %isend = icmp eq i64 %kind, 1");

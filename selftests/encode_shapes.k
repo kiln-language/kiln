@@ -12,13 +12,15 @@ pub enum Sym: long { }
 pub NO_SYM: Sym = -1;
 
 // The process's names, and the table one encoding writes them through: a name is written as its
-// table position + 1 (0 is no name), and the table is written once, beside the values.
+// table position + 1 (0 is no name), and the table is written once, beside the values. The table
+// keeps the text it is handed, a view, so `internName` is `unsafe`: every caller hands it a literal
+// or another table's entry, which live as long as the program.
 var gText: Vec<str> = vec![];
 var gOut: Vec<long> = vec![];        // by Sym: its table position, or -1
 var gTable: Vec<str> = vec![];
 var gIn: Vec<Sym> = vec![];          // by table position: the name it reads back as
 
-local internName s:str -> Sym {
+local unsafe internName s:str -> Sym {
     for i in 0..gText.len() { if (gText.get(i) == s) { return i as Sym; } }
     gText.push(s);
     return (gText.len() - 1) as Sym;
@@ -56,9 +58,9 @@ local sameBytes a:Vec<u8> b:Vec<u8> -> bool {
 }
 
 main -> int {
-    foo: Sym = internName("foo");
-    bar: Sym = internName("mod::bar");
-    internName("unused");
+    foo: Sym = NO_SYM;
+    bar: Sym = NO_SYM;
+    unsafe { foo = internName("foo"); bar = internName("mod::bar"); internName("unused"); }
     c: Chunk = Chunk { exprs: vec![], calls: vec![], args: vec![], names: vec![] };
     c.exprs.push(Expr { op: Op.Name, left: -1, right: -1, kind: Kind.Long, structName: NO_SYM,
                         isParen: false, payload: Payload.Name(foo) });
@@ -83,8 +85,10 @@ main -> int {
     // Read back as another process would: its own interner, already holding other names, so
     // every name has to come back through the table and not as the number it was.
     gText.clear();
-    internName("other");
-    for i in 0..gTable.len() { gIn.push(internName(gTable.get(i))); }
+    unsafe {
+        internName("other");
+        for i in 0..gTable.len() { gIn.push(internName(gTable.get(i))); }
+    }
     view: [u8] = "";
     unsafe { view = bytesOf(&first); }
     back: Result<Chunk, str> = decodeValue(view);

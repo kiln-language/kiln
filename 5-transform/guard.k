@@ -33,6 +33,52 @@ local fieldSteps path:Vec<Sym> -> long {
     return k - 1;
 }
 
+struct ViewState {
+    sum: Vec<long>,                // per function: where a view it returns may point (as `FnFact.views`)
+    need: Vec<bool>,               // per function: what it returns may hold a view
+    // Per function: bit k, it may keep a view parameter k holds in a place a lent parameter
+    // reaches (`FnFact.keeps`); and whether it is worth asking (`mayKeep`).
+    keep: Vec<long>, mayKeep: Vec<bool>, retKeep: long,
+    // Per function, the fields under a lent parameter a view it returns points into, beyond
+    // the bit `sum` has for it: (parameter, path below it) as a list; and those of this reading.
+    spHead: Vec<long>, spK: Vec<long>, spSuf: Vec<Sym>, spNext: Vec<long>, rsK: Vec<long>, rsSuf: Vec<Sym>,
+    // Per function, the functions whose readings asked for its summary: read again when it grows.
+    depHead: Vec<long>, depF: Vec<long>, depNext: Vec<long>, depSeen: HashMap<long, bool>,
+    changed: bool,
+    cur: long,                     // the function being read
+    last: bool,                    // the reading that refuses what breaks the rule
+    ret: long,                     // what its returns point at, as a summary
+    unsafeDepth: long,
+    grew: bool,                    // a local's set grew in this reading
+    // The atoms of the function being read: kind, the path (root first) in `aComps`, and whether
+    // unsafe code made it. `aByHash` and `aChain` find an atom again.
+    aKind: Vec<long>, aFirst: Vec<long>, aCount: Vec<long>, aVouch: Vec<bool>, aComps: Vec<Sym>,
+    aShown: Vec<long>,             // how much of the path a message says: the place the source named
+    aByHash: HashMap<long, long>, aChain: Vec<long>,
+    // Per local or by-value parameter, by name: the atoms its views may be, as a list.
+    lSlot: HashMap<long, long>, lName: Vec<Sym>, lHead: Vec<long>, lView: Vec<bool>,
+    nAtom: Vec<long>, nNext: Vec<long>, memb: HashMap<long, bool>,
+    // The function's parameters: name -> position, and whether the caller lends it.
+    pIx: HashMap<long, long>, pByRef: Vec<bool>,
+    // The hold walk: the local whose sources are held, its sources, and liveness at `break` and
+    // `continue`.
+    hl: Sym, hSrc: Vec<long>, report: bool, brk: bool, cont: bool
+}
+
+methods ViewState for Default {
+    new -> ViewState {
+        return ViewState { sum: vec![], need: vec![], keep: vec![], mayKeep: vec![], retKeep: 0, spHead: vec![],
+                           spK: vec![], spSuf: vec![], spNext: vec![], rsK: vec![], rsSuf: vec![],
+                           depHead: vec![], depF: vec![], depNext: vec![], depSeen: map![],
+                           changed: false, cur: -1, last: false, ret: 0,
+                           unsafeDepth: 0, grew: false, aKind: vec![], aFirst: vec![], aCount: vec![],
+                           aVouch: vec![], aComps: vec![], aShown: vec![], aByHash: map![], aChain: vec![],
+                           lSlot: map![], lName: vec![], lHead: vec![], lView: vec![], nAtom: vec![],
+                           nNext: vec![], memb: map![], pIx: map![], pByRef: vec![], hl: NO_SYM,
+                           hSrc: vec![], report: false, brk: false, cont: false };
+    }
+}
+
 pub struct ConstGuard {
     fnAt: HashMap<long, long>,      // resolved name -> `fns` index
     writes: Vec<long>,             // per function: bit k = writes through parameter k
@@ -156,7 +202,8 @@ pub struct ConstGuard {
     // Another object may call this one's functions or be called by them (`--lib`, `--use`; the
     // driver sets it from `gOpenObject`), so a dispatch or a call through a fn value may reach code
     // compiled after this, as it may in a package build (`gKlibMode`).
-    openObject: bool
+    openObject: bool,
+    vw: ViewState                  // the no-escape rule for views (`vwSummaries`, `vwCheck`)
 }
 
 local WP_DEPTH: long = 3;
@@ -184,7 +231,7 @@ methods ConstGuard for Default {
                             ppDepth: 0, hParam: -1, phHead: map![], phKind: vec![], phCall: vec![],
                             phPos: vec![], phNext: vec![], lendCall: vec![], lendPos: vec![], lendG: vec![],
                             lendAt: vec![], lendFn: vec![], lendWalkable: vec![], phMemo: map![], phTouched: vec![], phBusy: false,
-                            copyStore: map![], probing: false, openObject: false };
+                            copyStore: map![], probing: false, openObject: false, vw: ViewState.new() };
     }
 }
 
@@ -207,6 +254,7 @@ methods ConstGuard {
         self.promoteCopies(a);
         self.holdSelfLends(a);
         self.holdArms(a);
+        self.vwSummaries(a);
         n: long = a.blockLen(page);
         hold: Instant = monotonic();
         for k in 0..n {
@@ -220,6 +268,7 @@ methods ConstGuard {
             if (st.kind == StmtKind.VarDecl && !isExternGlobal(a.decls.get(st.at).name)) {
                 self.hFn = -1;
                 self.guardExpr(a, a.decls.get(st.at).init);
+                self.vwGlobalGuarded(a, st.at);
             }
         }
         self.holdLends(a);
@@ -836,6 +885,7 @@ methods ConstGuard {
         if (self.alias.len() > 0) { self.alias.clear(); }
         self.guardBlock(a, a.fns.get(at).body);
         self.holdFunction(a, at);
+        self.vwCheck(a, at);
     }
 
     index &self inout a:Ast -> void {
@@ -870,6 +920,16 @@ methods ConstGuard {
     // What this compile decided `at` writes through: the mask, and the dispatches whose answer a
     // dependent has to give again. For the facts a package build writes.
     writesOf &self at:long -> long { return self.writes.get(at); }
+    // What it may keep of what a parameter holds (`FnFact.keeps`).
+    keepsOf &self at:long -> long {
+        if (at < self.vw.keep.len()) { return self.vw.keep.get(at); }
+        return VIEWS_ALL;
+    }
+    // And where a view it returns may point (`FnFact.views`).
+    viewsOf &self at:long -> long {
+        if (at < self.vw.sum.len()) { return self.vw.sum.get(at); }
+        return VIEWS_ALL;
+    }
     depsOf &self at:long -> Vec<DepFact> {
         out: Vec<DepFact>;
         d: long = self.depHead.get(at);
@@ -3246,3 +3306,1324 @@ local argText own:Vec<Sym> held:Vec<Sym> -> str {
     if (own.len() > 0) { return lawText(own); }
     return pathText(held);
 }
+
+// ─── no escape of views ─────────────────────────────────────────────────────
+//
+// A `str`, a slice and a trait object are views: a pointer to bytes something else owns. One is
+// sound only while that owner keeps them where they are, so safe code may not let a view outlive
+// what it points into. Three places a view could do so:
+//
+//   - returned: a function may hand back a view of what a parameter holds or of its storage (the
+//     caller owns both), or of static data, but not one into its own locals or temporaries, nor
+//     into a parameter it took by value (it releases that when it returns);
+//   - stored: into a global only a view of static data or of a global's storage; into a place a
+//     parameter reaches (the caller's) also a view the caller handed in, but not one into a
+//     local, a temporary, or a parameter's own storage (that is keeping a borrow, rule (b));
+//   - held: a local whose views point into a place (`s = v.asSlice()`, a struct holding one, a
+//     `Vec<str>` it was pushed into) keeps that place borrowed while the local is live: the place
+//     may not be assigned, lent mutably, moved or released in that time.
+//
+// What a view may point at is followed as a set of atoms per expression (`vwSrc`): STORE(path),
+// into the storage of a place (a local, a parameter, a global, then fields); HELD(p), one of the
+// views parameter `p` holds (or is), which belong to the caller; FRAME, a temporary's slot. Static
+// data is no atom at all. A local's set is the union of everything stored into it, by an
+// assignment or by a call that may keep an argument's views in it (it writes the local, and
+// another argument holds a view). A call's result points where its callee's summary says
+// (`FnFact.views`): at what argument k holds, or into argument k's storage. The summaries are a
+// fixpoint over the program (`vwSummaries`), and a dependency's come from its facts.
+//
+// Code in `unsafe` is not held to any of this, and a view a local took there (`unsafe { v =
+// s.view(); }`) holds nothing: whoever wrote the block vouched for it (the interner keeps views
+// of strings it has moved into itself). Its atoms are still followed, so a safe function's
+// summary still says what an `unsafe` block inside it returns.
+
+pub VIEWS_ALL: long = 1 << 62;
+local VW_STORE: long = 0;
+local VW_HELD: long = 1;
+local VW_FRAME: long = 2;
+local VW_BITS: long = 31;          // parameters a summary can name, one bit each per kind
+
+// Whether a value of this type is, or holds, a view: a `str`, a slice, a trait object, or a struct
+// with one in a field or in a type argument (`Vec<str>`, `Option<str>`), at any depth. A fn
+// pointer names code, which is static, and a raw pointer is not a view to safe code.
+var gVwViewish: HashMap<long, bool> = map![];      // a struct's answer, once asked
+local vwViewish k:Lit n:Sym depth:long -> bool {
+    if (k == Lit.Str || k == Lit.Slice || k == Lit.TraitObj) { return true; }
+    if ((k != Lit.Struct && k != Lit.Ref) || n == NO_SYM || depth > 8) { return false; }
+    hit: Option<bool> = gVwViewish.find(n as long);
+    match hit { Some(x) { return x; } None { } }
+    got: bool = vwViewishNow(n, depth);
+    if (depth == 0) { gVwViewish.put(n as long, got); }
+    return got;
+}
+local vwViewishNow n:Sym depth:long -> bool {
+    at: long = gReg.findStructSym(n);
+    if (at >= 0) {
+        d: StructDef = gReg.structDef(at);
+        for i in 0..d.fieldCount {
+            f: FieldDef = gReg.fieldAt(d, i);
+            if (vwViewish(f.kind, f.structName, depth + 1)) { return true; }
+        }
+    }
+    r: long = gReg.findRequestSym(n);
+    if (r >= 0) {
+        q: GRequest = gReg.requestAt(r);
+        for i in 0..q.argCount {
+            t: TypeRef = gReg.gArgAt(q, i);
+            if (vwViewish(t.base, t.name, depth + 1)) { return true; }
+        }
+    }
+    return false;
+}
+
+// Whether the analysis follows what a value of this type points at: a view, or a raw pointer (in
+// `unsafe` code a view is made from one).
+local vwCarries k:Lit n:Sym -> bool {
+    return k == Lit.Ptr || vwViewish(k, n, 0);
+}
+
+// A local as a message says it, quoted: the name it was written with, or what a hidden local
+// holds.
+local vwLocalText n:Sym -> str {
+    s: str = lastComponentOf(nameOf(n));
+    if (strStartsWith(s, "__ret")) { return "the return value"; }
+    if (strStartsWith(s, "__")) { return "a temporary"; }
+    if (isHiddenName(n)) { return rootText(n); }
+    return keepString(format("`{}`", spokenName(n)));
+}
+
+// A hidden local the compiler made for a value with no name of its own.
+local vwTemporary n:Sym -> bool {
+    s: str = lastComponentOf(nameOf(n));
+    return strStartsWith(s, "__") || (isHiddenName(n) && !strStartsWith(s, "$match") && !strStartsWith(s, "$bmatch"));
+}
+
+methods ConstGuard {
+    // Every function's summary, to a fixpoint: a summary only grows, so the rounds end. One that
+    // has not settled by the bound answers "anywhere", which is never wrong, only strict.
+    vwSummaries &self inout a:Ast -> void {
+        self.vw.sum.clear(); self.vw.need.clear(); self.vw.keep.clear(); self.vw.mayKeep.clear();
+        self.vw.spHead.clear(); self.vw.spK.clear(); self.vw.spSuf.clear(); self.vw.spNext.clear();
+        self.vw.depHead.clear(); self.vw.depF.clear(); self.vw.depNext.clear();
+        if (self.vw.depSeen.len() > 0) { self.vw.depSeen.clear(); }
+        for i in 0..a.fns.len() {
+            f: FnNode = a.fns.get(i);
+            need: bool = vwCarries(f.returnKind, f.returnStruct);
+            may: bool = vwMayKeep(a, f);
+            s: long = 0;
+            kp: long = 0;
+            if (isExternFn(i)) {
+                fi: long = fnFactOf(i);
+                if (fi >= 0) { s = gFacts.fns.get(fi).views; kp = gFacts.fns.get(fi).keeps; }
+                else { s = VIEWS_ALL; kp = VIEWS_ALL; }
+                need = false;
+                may = false;
+            } else if (f.isTemplate || f.body < 0 || isUnchecked(i)) {
+                if (need) { s = VIEWS_ALL; }
+                if (may) { kp = VIEWS_ALL; }
+                need = false;
+                may = false;
+            }
+            self.vw.sum.push(s);
+            self.vw.need.push(need);
+            self.vw.keep.push(kp);
+            self.vw.mayKeep.push(may);
+            self.vw.spHead.push(-1);
+            self.vw.depHead.push(-1);
+        }
+        // A work list: every function once, then again whenever a summary its reading asked for
+        // grows.
+        queue: Vec<long>;
+        queued: Vec<bool>;
+        for i in 0..a.fns.len() {
+            on: bool = self.vw.need.get(i) || self.vw.mayKeep.get(i);
+            if (on) { queue.push(i); }
+            queued.push(on);
+        }
+        q: long = 0;
+        bound: long = 64 * (queue.len() + 1);
+        while (q < queue.len() && q < bound) {
+            f: long = queue.get(q);
+            q = q + 1;
+            queued.set(f, false);
+            self.vw.changed = false;
+            self.vwFunction(a, f, false);
+            if (!self.vw.changed) { continue; }
+            d: long = self.vw.depHead.get(f);
+            while (d >= 0) {
+                g: long = self.vw.depF.get(d);
+                if (!queued.get(g)) { queue.push(g); queued.set(g, true); }
+                d = self.vw.depNext.get(d);
+            }
+        }
+        self.vw.changed = q < queue.len();
+        if (self.vw.changed) {
+            for i in 0..a.fns.len() {
+                if (self.vw.need.get(i)) { self.vw.sum.set(i, VIEWS_ALL); }
+                if (self.vw.mayKeep.get(i)) { self.vw.keep.set(i, VIEWS_ALL); }
+            }
+        }
+    }
+
+    // The rule held in one function, once every summary is known (`guardOne`).
+    vwCheck &self inout a:Ast at:long -> void {
+        self.vwFunction(a, at, true);
+        if (!a.fns.get(at).isUnsafe) { self.vwHolds(a, at); }
+        if (self.alias.len() > 0) { self.alias.clear(); }
+    }
+
+    // A `var` global's initializer may not leave a view into the frame that runs it.
+    vwGlobalGuarded &self inout a:Ast at:long -> void {
+        d: VarDeclNode = a.decls.get(at);
+        if (d.init == NO_NODE) { return; }
+        gi: long = gReg.findGlobalSym(d.name);
+        if (gi < 0 || !gReg.globalDef(gi).isVar) { return; }
+        if (!canRecover()) { self.vwGlobalInit(a, d); return; }
+        unsafe { recover { self.vwGlobalInit(a, d); } else { } }
+    }
+    vwGlobalInit &self inout a:Ast d:VarDeclNode -> void {
+        self.vwBegin(a, -1);
+        atoms: Vec<long>;
+        self.vwSrc(a, d.init, &atoms);
+        for id in atoms {
+            if (self.vw.aKind.get(id) == VW_HELD) { continue; }
+            if (self.vw.aKind.get(id) == VW_STORE && gReg.findGlobalSym(self.vwRoot(id)) >= 0) { continue; }
+            failStr(format("cannot initialize the global `{}` with a view into a temporary\nnote: the temporary lives in the frame that runs the initializer, which is reused once it is done\nhelp: declare a global for the view to point at, and build the view from it",
+                           spokenName(d.name)));
+        }
+    }
+
+    // Reads function `at`: its locals' sets to a fixpoint, then once more to take its summary
+    // and, when `last`, to refuse a view that escapes.
+    vwFunction &self inout a:Ast at:long last:bool -> void {
+        self.vwBegin(a, at);
+        f: FnNode = a.fns.get(at);
+        // A reading in which no set grew saw every set whole, and what it found stands. One in
+        // which a set grew may have missed what a later statement adds, so it is read again;
+        // what it refused stays refused rightly, since sets only grow.
+        rounds: long = 0;
+        self.vw.grew = true;
+        while (self.vw.grew && rounds < 16) {
+            self.vw.grew = false;
+            self.vw.ret = 0;
+            self.vw.retKeep = 0;
+            self.vw.rsK.clear();
+            self.vw.rsSuf.clear();
+            self.vw.last = last;
+            self.vwRead(a, f);
+            rounds = rounds + 1;
+        }
+        self.vw.last = false;
+        if (last || at < 0) { return; }
+        unsettled: bool = self.vw.grew;
+        if (self.vw.need.get(at)) {
+            was: long = self.vw.sum.get(at);
+            now: long = was | self.vw.ret;
+            if (unsettled) { now = VIEWS_ALL; }
+            if (now != was) { self.vw.sum.set(at, now); self.vw.changed = true; }
+            for j in 0..self.vw.rsK.len() { self.vwNoteStorePath(at, self.vw.rsK.get(j), self.vw.rsSuf.get(j)); }
+        }
+        if (self.vw.mayKeep.get(at)) {
+            was: long = self.vw.keep.get(at);
+            now: long = was | self.vw.retKeep;
+            if (unsettled) { now = VIEWS_ALL; }
+            if (now != was) { self.vw.keep.set(at, now); self.vw.changed = true; }
+        }
+    }
+
+    // That a view `at` returns may point into parameter `k`'s place `suf` (fields below it).
+    vwNoteStorePath &self at:long k:long suf:Sym -> void {
+        p: long = self.vw.spHead.get(at);
+        while (p >= 0) {
+            if (self.vw.spK.get(p) == k && self.vw.spSuf.get(p) == suf) { return; }
+            p = self.vw.spNext.get(p);
+        }
+        self.vw.spK.push(k);
+        self.vw.spSuf.push(suf);
+        self.vw.spNext.push(self.vw.spHead.get(at));
+        self.vw.spHead.set(at, self.vw.spK.len() - 1);
+        self.vw.changed = true;
+    }
+
+    // What a call keeps: bit k, a view the `k`th argument holds may be kept in an argument the
+    // call writes. A dispatch keeps what any implementation does.
+    vwKeepsOf &self inout a:Ast c:CallNode -> long {
+        if (c.callee != NO_NODE || c.slot == SLOT_FNPTR) { return VIEWS_ALL; }
+        if (c.slot != NO_SLOT) {
+            out: long = 0;
+            ts: Vec<long> = self.dispatchTargets(a, c);
+            for t in ts { self.vwDepend(t); out = out | self.vw.keep.get(t); }
+            return out;
+        }
+        i: long = self.calleeAt(a, c);
+        if (i < 0 || i >= self.vw.keep.len()) { return VIEWS_ALL; }
+        self.vwDepend(i);
+        return self.vw.keep.get(i);
+    }
+
+    // Where a call's result may point, as a summary. A dispatch points where any implementation's
+    // does.
+    vwSumOf &self inout a:Ast c:CallNode -> long {
+        if (c.callee != NO_NODE || c.slot == SLOT_FNPTR) { return VIEWS_ALL; }
+        if (c.slot != NO_SLOT) {
+            out: long = 0;
+            ts: Vec<long> = self.dispatchTargets(a, c);
+            for t in ts { self.vwDepend(t); out = out | self.vw.sum.get(t); }
+            return out;
+        }
+        i: long = self.calleeAt(a, c);
+        if (i < 0 || i >= self.vw.sum.len()) { return VIEWS_ALL; }
+        self.vwDepend(i);
+        return self.vw.sum.get(i);
+    }
+
+
+    // The function being read asked for `callee`'s summary: when that grows, read it again.
+    vwDepend &self callee:long -> void {
+        f: long = self.vw.cur;
+        if (f < 0 || self.vw.last || callee < 0 || callee >= self.vw.depHead.len()) { return; }
+        if (!self.vw.need.get(callee) && !self.vw.mayKeep.get(callee)) { return; }
+        key: long = callee * 4194304 + f;
+        if (self.vw.depSeen.has(key)) { return; }
+        self.vw.depSeen.put(key, true);
+        self.vw.depF.push(f);
+        self.vw.depNext.push(self.vw.depHead.get(callee));
+        self.vw.depHead.set(callee, self.vw.depF.len() - 1);
+    }
+
+    vwRead &self inout a:Ast f:FnNode -> void {
+        if (self.alias.len() > 0) { self.alias.clear(); }
+        self.vw.unsafeDepth = 0;
+        if (f.isUnsafe) { self.vw.unsafeDepth = 1; }
+        self.vwBlock(a, f.body);
+    }
+
+    // Forget the last function's atoms and sets; know this one's parameters. A parameter the
+    // function has a copy of (a view, a scalar, a struct it takes) is a local from here on, which
+    // starts out holding what the caller handed in.
+    vwBegin &self inout a:Ast at:long -> void {
+        self.vw.cur = at;
+        self.vw.aKind.clear(); self.vw.aFirst.clear(); self.vw.aCount.clear(); self.vw.aVouch.clear();
+        self.vw.aComps.clear(); self.vw.aChain.clear(); self.vw.aShown.clear();
+        if (self.vw.aByHash.len() > 0) { self.vw.aByHash.clear(); }
+        if (self.vw.lSlot.len() > 0) { self.vw.lSlot.clear(); }
+        self.vw.lName.clear(); self.vw.lHead.clear(); self.vw.lView.clear();
+        self.vw.nAtom.clear(); self.vw.nNext.clear();
+        if (self.vw.memb.len() > 0) { self.vw.memb.clear(); }
+        if (self.vw.pIx.len() > 0) { self.vw.pIx.clear(); }
+        self.vw.pByRef.clear();
+        if (at < 0) { return; }
+        f: FnNode = a.fns.get(at);
+        for k in 0..f.argCount {
+            p: VarDeclNode = a.paramAt(f, k);
+            self.vw.pIx.put(p.name as long, k);
+            byRef: bool = p.kind == Lit.Ref || p.isArray;
+            self.vw.pByRef.push(byRef);
+            if (!byRef && vwCarries(p.kind, p.structName)) {
+                path: Vec<Sym>;
+                path.push(p.name);
+                s: long = self.vwSlot(p.name);
+                self.vw.lView.set(s, vwViewish(p.kind, p.structName, 0));
+                self.vwAdd(p.name, self.vwAtom(VW_HELD, path, false));
+            }
+        }
+    }
+
+    // ─── atoms and sets ─────────────────────────────────────────────────────
+
+    vwAtom &self kind:long path:Vec<Sym> vouch:bool -> long { return self.vwAtomShown(kind, path, vouch, path.len()); }
+    vwAtomShown &self kind:long path:Vec<Sym> vouch:bool shown:long -> long {
+        h: long = kind * 2 + 1;
+        if (vouch) { h = h + 7919; }
+        for s in path { h = h * 1000003 + (s as long); }
+        at: long = self.vw.aByHash.getOr(h, -1);
+        while (at >= 0) {
+            if (self.vwSame(at, kind, path, vouch)) { return at; }
+            at = self.vw.aChain.get(at);
+        }
+        id: long = self.vw.aKind.len();
+        self.vw.aKind.push(kind);
+        self.vw.aFirst.push(self.vw.aComps.len());
+        self.vw.aCount.push(path.len());
+        self.vw.aVouch.push(vouch);
+        self.vw.aShown.push(shown);
+        for s in path { self.vw.aComps.push(s); }
+        self.vw.aChain.push(self.vw.aByHash.getOr(h, -1));
+        self.vw.aByHash.put(h, id);
+        return id;
+    }
+
+    vwSame &self id:long kind:long path:Vec<Sym> vouch:bool -> bool {
+        if (self.vw.aKind.get(id) != kind || self.vw.aVouch.get(id) != vouch) { return false; }
+        if (self.vw.aCount.get(id) != path.len()) { return false; }
+        first: long = self.vw.aFirst.get(id);
+        for k in 0..path.len() { if (self.vw.aComps.get(first + k) != path.get(k)) { return false; } }
+        return true;
+    }
+
+    vwPath &self id:long -> Vec<Sym> {
+        out: Vec<Sym>;
+        first: long = self.vw.aFirst.get(id);
+        for k in 0..self.vw.aCount.get(id) { out.push(self.vw.aComps.get(first + k)); }
+        return out;
+    }
+
+    // The part of the path a message names: the place as the source wrote it.
+    vwShownPath &self id:long -> Vec<Sym> {
+        out: Vec<Sym>;
+        first: long = self.vw.aFirst.get(id);
+        n: long = self.vw.aShown.get(id);
+        if (n > self.vw.aCount.get(id) || n < 1) { n = self.vw.aCount.get(id); }
+        for k in 0..n { out.push(self.vw.aComps.get(first + k)); }
+        return out;
+    }
+
+    vwRoot &self id:long -> Sym {
+        if (self.vw.aCount.get(id) == 0) { return NO_SYM; }
+        return self.vw.aComps.get(self.vw.aFirst.get(id));
+    }
+
+    // The same atom as one `unsafe` code made.
+    vwVouched &self id:long -> long {
+        if (self.vw.aVouch.get(id)) { return id; }
+        return self.vwAtomShown(self.vw.aKind.get(id), self.vwPath(id), true, self.vw.aShown.get(id));
+    }
+
+    vwSlot &self n:Sym -> long {
+        hit: Option<long> = self.vw.lSlot.find(n as long);
+        match hit { Some(s) { return s; } None { } }
+        s: long = self.vw.lName.len();
+        self.vw.lName.push(n);
+        self.vw.lHead.push(-1);
+        self.vw.lView.push(false);
+        self.vw.lSlot.put(n as long, s);
+        return s;
+    }
+
+    vwAdd &self n:Sym id:long -> void {
+        s: long = self.vwSlot(n);
+        key: long = s * 1048576 + id;
+        if (self.vw.memb.has(key)) { return; }
+        self.vw.memb.put(key, true);
+        self.vw.nAtom.push(id);
+        self.vw.nNext.push(self.vw.lHead.get(s));
+        self.vw.lHead.set(s, self.vw.nAtom.len() - 1);
+        self.vw.grew = true;
+    }
+
+    // What `n` was given, made in `unsafe` code when the reading is inside it.
+    vwAddAll &self n:Sym atoms:Vec<long> -> void {
+        for id in atoms {
+            if (self.vw.unsafeDepth > 0) { self.vwAdd(n, self.vwVouched(id)); }
+            else { self.vwAdd(n, id); }
+        }
+    }
+
+    vwLocalAtoms &self n:Sym inout out:Vec<long> -> void {
+        hit: Option<long> = self.vw.lSlot.find(n as long);
+        s: long = -1;
+        match hit { Some(x) { s = x; } None { return; } }
+        at: long = self.vw.lHead.get(s);
+        while (at >= 0) { vwUnionOne(out, self.vw.nAtom.get(at)); at = self.vw.nNext.get(at); }
+    }
+
+    vwParamAt &self n:Sym -> long { return self.vw.pIx.getOr(n as long, -1); }
+
+    // A parameter the caller lends: its storage stays the caller's.
+    vwLent &self n:Sym -> bool {
+        k: long = self.vwParamAt(n);
+        return k >= 0 && self.vw.pByRef.get(k);
+    }
+
+    vwIsGlobal &self n:Sym -> bool { return gReg.findGlobalSym(n) >= 0; }
+}
+
+local vwUnionOne inout out:Vec<long> id:long -> void {
+    for x in out { if (x == id) { return; } }
+    out.push(id);
+}
+local vwUnion inout out:Vec<long> more:Vec<long> -> void {
+    for x in more { vwUnionOne(out, x); }
+}
+
+methods ConstGuard {
+    // ─── where a value's views point ────────────────────────────────────────
+
+    // The atoms the views in the value of `id` may be, added to `out`.
+    vwSrc &self inout a:Ast id:NodeId inout out:Vec<long> -> void {
+        if (id == NO_NODE) { return; }
+        e: Expr = a.expr(id);
+        if (e.op == Op.Assignment || !vwCarries(e.kind, e.structName)) { return; }
+        if (e.op == Op.Lvalue) {
+            match e.payload { Name(n) { self.vwHeldBy(n, out); } _ { } }
+            return;
+        }
+        if (e.op == Op.FunctionCall || e.op == Op.MethodCall) {
+            match e.payload { Call(c) { self.vwCallSrc(a, c, out); } _ { } }
+            return;
+        }
+        if (e.op == Op.ArrayIndex) {
+            match e.payload {
+                Index(i) {
+                    ix: IndexNode = a.indexes.get(i);
+                    t: Vec<long>;
+                    self.vwTarget(a, ix, &t);
+                    if (ix.whole) { vwUnion(out, t); } else { self.vwDeref(t, out); }
+                }
+                _ { }
+            }
+            return;
+        }
+        if (e.op == Op.MakeTraitObj) {
+            match e.payload { Sub(v) { self.vwStoreOf(a, v, out); self.vwSrc(a, v, out); } _ { } }
+            return;
+        }
+        if (e.op == Op.Deref) {
+            match e.payload {
+                Sub(v) { t: Vec<long>; self.vwPointee(a, v, &t); self.vwDeref(t, out); }
+                _ { }
+            }
+            return;
+        }
+        if (e.left != NO_NODE) { self.vwAddr(a, e.left, out); self.vwAddr(a, e.right, out); return; }
+        // A number made a pointer or a view again: it points where the number came from.
+        if (e.op == Op.Cast) {
+            match e.payload { Sub(v) { self.vwAddr(a, v, out); } _ { } }
+            return;
+        }
+        match e.payload {
+            Sub(v)   { self.vwSrc(a, v, out); }
+            Field(f) { self.vwSrc(a, a.fields.get(f).base, out); }
+            Lit(l) {
+                ln: LitNode = a.lits.get(l);
+                for k in 0..ln.initCount { self.vwSrc(a, a.inits.get(ln.firstInit + k).value, out); }
+                self.vwSrc(a, ln.rest, out);
+            }
+            _ { }
+        }
+    }
+
+    // The views a variable holds: a lent parameter's are the caller's, a global's are static,
+    // and a local's (or a copied parameter's) are its set.
+    vwHeldBy &self n:Sym inout out:Vec<long> -> void {
+        if (self.vwLent(n)) {
+            path: Vec<Sym>;
+            path.push(n);
+            vwUnionOne(out, self.vwAtom(VW_HELD, path, false));
+            return;
+        }
+        if (self.vwParamAt(n) < 0 && self.vwIsGlobal(n)) { return; }
+        self.vwLocalAtoms(n, out);
+    }
+
+    // Where what is indexed lies: a view's bytes are where the view points, a pointer's where it
+    // points, and an array's where the array is.
+    vwTarget &self inout a:Ast ix:IndexNode inout out:Vec<long> -> void {
+        if (ix.base == NO_NODE) {
+            path: Vec<Sym>;
+            path.push(ix.name);
+            vwUnionOne(out, self.vwAtom(VW_STORE, path, false));
+            self.vwHeldBy(ix.name, out);
+            return;
+        }
+        b: Expr = a.expr(ix.base);
+        if (b.kind == Lit.Str || b.kind == Lit.Slice) { self.vwSrc(a, ix.base, out); return; }
+        if (b.kind == Lit.Ptr) { self.vwPointee(a, ix.base, out); return; }
+        self.vwStoreOf(a, ix.base, out);
+    }
+
+    // Where a pointer points: a pointer variable where it was set to point, a struct's pointer
+    // field into what the struct owns, a view's own pointer where the view points.
+    vwPointee &self inout a:Ast p:NodeId inout out:Vec<long> -> void {
+        e: Expr = a.expr(p);
+        if (e.op == Op.FieldAccess) {
+            match e.payload {
+                Field(f) {
+                    base: Expr = a.expr(a.fields.get(f).base);
+                    if (base.kind == Lit.Str || base.kind == Lit.Slice) { self.vwSrc(a, a.fields.get(f).base, out); return; }
+                }
+                _ { }
+            }
+            self.vwStoreOf(a, p, out);
+            return;
+        }
+        self.vwSrc(a, p, out);
+    }
+
+    // Into the storage of the place `id` names; a value that is no place lies in a temporary.
+    vwStoreOf &self inout a:Ast id:NodeId inout out:Vec<long> -> void {
+        path: Vec<Sym>;
+        if (self.holdPath(a, id, NO_SYM, &path) && path.len() > 0) {
+            vwUnionOne(out, self.vwAtom(VW_STORE, path, false));
+            return;
+        }
+        empty: Vec<Sym>;
+        vwUnionOne(out, self.vwAtom(VW_FRAME, empty, false));
+    }
+
+    // From where a view points to what the place there holds: an element read out of it.
+    vwDeref &self atoms:Vec<long> inout out:Vec<long> -> void {
+        for id in atoms {
+            if (self.vw.aKind.get(id) != VW_STORE) { vwUnionOne(out, id); continue; }
+            r: Sym = self.vwRoot(id);
+            self.vwHeldBy(r, out);
+        }
+    }
+
+    // A call's result: where its callee's summary says, read at the arguments.
+    vwCallSrc &self inout a:Ast ci:long inout out:Vec<long> -> void {
+        c: CallNode = a.calls.get(ci);
+        sum: long = self.vwSumOf(a, c);
+        if (sum == 0) { return; }
+        callee: long = -1;
+        variadicAt: long = -1;
+        if (c.slot == NO_SLOT && c.callee == NO_NODE) {
+            callee = self.calleeAt(a, c);
+            if (callee >= 0) {
+                f: FnNode = a.fns.get(callee);
+                if (f.argCount > 0 && a.paramAt(f, f.argCount - 1).isVariadic) { variadicAt = f.argCount - 1; }
+            }
+        }
+        nodes: Vec<NodeId>;
+        if (c.receiver != NO_NODE) { nodes.push(c.receiver); }
+        for k in 0..c.argCount { nodes.push(a.argAt(c, k)); }
+        for k in 0..nodes.len() {
+            pos: long = k;
+            if (variadicAt >= 0 && pos > variadicAt) { pos = variadicAt; }
+            nk: NodeId = nodes.get(k);
+            if ((sum & VIEWS_ALL) != 0 || pos >= VW_BITS) {
+                self.vwSrc(a, nk, out);
+                kk: Lit = a.expr(nk).kind;
+                if (kk == Lit.Struct || kk == Lit.Ref) { self.vwStoreOf(a, nk, out); }
+                continue;
+            }
+            if (((sum >> pos) & 1) != 0) { self.vwSrc(a, nk, out); }
+            if (((sum >> (VW_BITS + pos)) & 1) != 0) { self.vwStoreAt(a, nk, callee, pos, out); }
+        }
+    }
+
+    // Into argument `nk`'s storage, at the fields the callee's summary names for its parameter
+    // `pos` (`address` handing back a view of `self.addrText` points there, not into all of `self`).
+    vwStoreAt &self inout a:Ast nk:NodeId callee:long pos:long inout out:Vec<long> -> void {
+        path: Vec<Sym>;
+        if (callee < 0 || callee >= self.vw.spHead.len() || !self.holdPath(a, nk, NO_SYM, &path) || path.len() == 0) {
+            self.vwStoreOf(a, nk, out);
+            return;
+        }
+        any: bool = false;
+        whole: bool = false;
+        p: long = self.vw.spHead.get(callee);
+        while (p >= 0) {
+            if (self.vw.spK.get(p) == pos) {
+                any = true;
+                suf: Sym = self.vw.spSuf.get(p);
+                if (nameOf(suf).len == 0) { whole = true; }
+                else {
+                    q: Vec<Sym> = path.clone();
+                    appendFields(&q, nameOf(suf));
+                    vwUnionOne(out, self.vwAtomShown(VW_STORE, q, false, path.len()));
+                }
+            }
+            p = self.vw.spNext.get(p);
+        }
+        if (!any || whole) { vwUnionOne(out, self.vwAtom(VW_STORE, path, false)); }
+    }
+}
+
+methods ConstGuard {
+    // ─── reading a body: what each local is given, and what escapes ─────────
+
+    vwBlock &self inout a:Ast b:long -> void {
+        if (b < 0) { return; }
+        for k in 0..a.blockLen(b) {
+            st: Stmt = a.stmtAt(b, k);
+            self.holdNote(a, st);
+            w: long = a.enterStmt(a.stmtIdAt(b, k));
+            self.vwStmt(a, st);
+            gPos = w;
+        }
+    }
+
+    vwStmt &self inout a:Ast st:Stmt -> void {
+        if (st.kind == StmtKind.VarDecl) {
+            d: VarDeclNode = a.decls.get(st.at);
+            s: long = self.vwSlot(d.name);
+            if (vwViewish(d.kind, d.structName, 0)) { self.vw.lView.set(s, true); }
+            if (d.init != NO_NODE) {
+                self.vwExpr(a, d.init);
+                atoms: Vec<long>;
+                self.vwValue(a, d.kind, d.init, &atoms);
+                self.vwAddAll(d.name, atoms);
+            }
+            return;
+        }
+        if (st.kind == StmtKind.Expr || st.kind == StmtKind.Call) { self.vwExpr(a, a.exprStmts.get(st.at).value); return; }
+        if (st.kind == StmtKind.Return) {
+            v: NodeId = a.returns.get(st.at).value;
+            if (v != NO_NODE) { self.vwExpr(a, v); self.vwReturn(a, v); }
+            return;
+        }
+        if (st.kind == StmtKind.If) {
+            at: long = st.at;
+            while (at >= 0) {
+                br: IfNode = a.ifs.get(at);
+                self.vwExpr(a, br.cond);
+                self.vwBlock(a, br.body);
+                at = br.elseIf;
+            }
+            return;
+        }
+        if (st.kind == StmtKind.While || st.kind == StmtKind.Recover) {
+            w: WhileNode = a.whiles.get(st.at);
+            self.vwExpr(a, w.cond); self.vwBlock(a, w.body); self.vwBlock(a, w.step);
+            return;
+        }
+        if (st.kind == StmtKind.Unsafe) {
+            self.vw.unsafeDepth = self.vw.unsafeDepth + 1;
+            self.vwBlock(a, a.blockStmts.get(st.at).body);
+            self.vw.unsafeDepth = self.vw.unsafeDepth - 1;
+            return;
+        }
+        if (st.kind == StmtKind.Loop || st.kind == StmtKind.Block) { self.vwBlock(a, a.blockStmts.get(st.at).body); return; }
+        if (st.kind == StmtKind.With) { self.vwBlock(a, a.withs.get(st.at).body); return; }
+        if (st.kind == StmtKind.Match) {
+            m: MatchNode = a.matches.get(st.at);
+            for k in 0..m.armCount {
+                self.vwExpr(a, a.arms.get(m.firstArm + k).test);
+                self.vwBlock(a, a.arms.get(m.firstArm + k).body);
+            }
+            return;
+        }
+        if (st.kind == StmtKind.Destructure) { self.vwExpr(a, a.destructures.get(st.at).value); return; }
+    }
+
+    // The assignments and calls in an expression, innermost first.
+    vwExpr &self inout a:Ast id:NodeId -> void {
+        if (id == NO_NODE) { return; }
+        e: Expr = a.expr(id);
+        if (e.op == Op.Assignment) {
+            self.vwExpr(a, e.left);
+            self.vwExpr(a, e.right);
+            self.vwAssign(a, e.left, e.right);
+            return;
+        }
+        if (e.left != NO_NODE) { self.vwExpr(a, e.left); self.vwExpr(a, e.right); return; }
+        match e.payload {
+            Call(ci) {
+                c: CallNode = a.calls.get(ci);
+                self.vwExpr(a, c.receiver);
+                for k in 0..c.argCount { self.vwExpr(a, a.argAt(c, k)); }
+                self.vwExpr(a, c.callee);
+                self.vwCallFlows(a, ci);
+            }
+            Sub(v)   { self.vwExpr(a, v); }
+            Field(f) { self.vwExpr(a, a.fields.get(f).base); }
+            Index(i) {
+                ix: IndexNode = a.indexes.get(i);
+                self.vwExpr(a, ix.base); self.vwExpr(a, ix.index);
+                self.vwExpr(a, ix.sliceStart); self.vwExpr(a, ix.sliceEnd);
+            }
+            Lit(l) {
+                ln: LitNode = a.lits.get(l);
+                for k in 0..ln.initCount { self.vwExpr(a, a.inits.get(ln.firstInit + k).value); }
+                self.vwExpr(a, ln.rest);
+            }
+            _ { }
+        }
+    }
+
+    // `place = value`: a local takes the value's atoms; a place the caller or a global owns is
+    // held to what may be kept there. A whole local is the local, whatever it was bound to.
+    vwAssign &self inout a:Ast left:NodeId right:NodeId -> void {
+        l: Expr = a.expr(left);
+        atoms: Vec<long>;
+        self.vwValue(a, l.kind, right, &atoms);
+        if (atoms.len() == 0) { return; }
+        if (l.op == Op.Lvalue) {
+            match l.payload {
+                Name(n) {
+                    if (!self.vwLent(n) && (self.vwParamAt(n) >= 0 || !self.vwIsGlobal(n))) { self.vwAddAll(n, atoms); return; }
+                }
+                _ { }
+            }
+        }
+        // An address kept as a number is followed only through locals, which is where `unsafe`
+        // code holds one on its way back to a pointer.
+        if (vwNumber(l.kind)) { return; }
+        path: Vec<Sym>;
+        if (!self.holdPath(a, left, NO_SYM, &path) || path.len() == 0) { return; }
+        self.vwStoreInto(a, path, atoms, -1);
+    }
+
+    // What a value stored into a place of kind `into` points at. A struct stored into a trait
+    // object becomes a view of it where it lies (`w = buf`), or of the temporary it is built in.
+    vwValue &self inout a:Ast into:Lit v:NodeId inout out:Vec<long> -> void {
+        e: Expr = a.expr(v);
+        if (into == Lit.TraitObj && e.kind == Lit.Struct) { self.vwStoreOf(a, v, out); }
+        if (vwNumber(into) && vwNumber(e.kind)) { self.vwAddr(a, v, out); return; }
+        self.vwSrc(a, v, out);
+    }
+
+    // Where a number may be the address of: `unsafe` code turns a pointer or a view's base into a
+    // number and back (`(s.ptr + start) as *u8` in `strSlice`), and the view it makes points
+    // where the number came from.
+    vwAddr &self inout a:Ast id:NodeId inout out:Vec<long> -> void {
+        if (id == NO_NODE) { return; }
+        e: Expr = a.expr(id);
+        if (vwCarries(e.kind, e.structName)) { self.vwSrc(a, id, out); return; }
+        if (!vwNumber(e.kind)) { return; }
+        if (e.op == Op.Lvalue) {
+            match e.payload {
+                Name(n) { if (self.vwParamAt(n) >= 0 || !self.vwIsGlobal(n)) { self.vwLocalAtoms(n, out); } }
+                _ { }
+            }
+            return;
+        }
+        if (e.op == Op.Cast) {
+            match e.payload { Sub(v) { self.vwAddr(a, v, out); } _ { } }
+            return;
+        }
+        if (e.op == Op.Addition || e.op == Op.Subtraction || e.op == Op.BitwiseAnd || e.op == Op.BitwiseOr) {
+            self.vwAddr(a, e.left, out);
+            self.vwAddr(a, e.right, out);
+        }
+    }
+
+    // A call that writes one argument may keep the views another hands it there (`v.push(s)`,
+    // `m.put(s, 1)`): the written place takes their atoms, as an assignment's would.
+    vwCallFlows &self inout a:Ast ci:long -> void {
+        c: CallNode = a.calls.get(ci);
+        nodes: Vec<NodeId>;
+        if (c.receiver != NO_NODE) { nodes.push(c.receiver); }
+        for k in 0..c.argCount { nodes.push(a.argAt(c, k)); }
+        if (nodes.len() < 2) { return; }
+        keeps: long = -1;               // asked only once a written argument can take a view
+        for k in 0..nodes.len() {
+            nk: NodeId = nodes.get(k);
+            ek: Expr = a.expr(nk);
+            if ((ek.kind != Lit.Struct && ek.kind != Lit.Ref) || !vwViewish(Lit.Struct, ek.structName, 0)) { continue; }
+            if (!self.calleeWrites(a, c, k)) { continue; }
+            if (keeps < 0) { keeps = self.vwKeepsOf(a, c); }
+            if (keeps == 0) { return; }
+            atoms: Vec<long>;
+            for j in 0..nodes.len() {
+                if (j == k) { continue; }
+                if ((keeps & VIEWS_ALL) != 0 || j >= VW_BITS || ((keeps >> j) & 1) != 0) { self.vwSrc(a, nodes.get(j), &atoms); }
+            }
+            if (atoms.len() == 0) { continue; }
+            path: Vec<Sym>;
+            if (!self.holdPath(a, nk, NO_SYM, &path) || path.len() == 0) { continue; }
+            self.vwStoreInto(a, path, atoms, ci);
+        }
+    }
+
+    vwStoreInto &self inout a:Ast path:Vec<Sym> atoms:Vec<long> ci:long -> void {
+        r: Sym = path.get(0);
+        k: long = self.vwParamAt(r);
+        if (k >= 0 && self.vw.pByRef.get(k)) { self.vwKeep(a, path, atoms, ci, false); return; }
+        if (k < 0 && self.vwIsGlobal(r)) { self.vwKeep(a, path, atoms, ci, true); return; }
+        self.vwAddAll(r, atoms);
+    }
+
+    // A store into what outlives the call: a global (`global`), or a place a lent parameter
+    // reaches. Both may keep a view of static data or of a global's storage; a parameter's place
+    // may also keep a view the caller handed in, which the function's summary then says it keeps
+    // (`keep`), so that its callers follow the view into what they lent it.
+    vwKeep &self inout a:Ast path:Vec<Sym> atoms:Vec<long> ci:long global:bool -> void {
+        for id in atoms {
+            if (!global && self.vw.aKind.get(id) == VW_HELD) {
+                k: long = self.vwParamAt(self.vwRoot(id));
+                if (k < 0 || k >= VW_BITS) { self.vw.retKeep = self.vw.retKeep | VIEWS_ALL; }
+                else { self.vw.retKeep = self.vw.retKeep | (1 << k); }
+                continue;
+            }
+            if (!self.vw.last || self.vw.unsafeDepth > 0) { continue; }
+            if (self.vw.aVouch.get(id) || self.vwStatic(id)) { continue; }
+            self.vwRefuseKeep(a, path, id, ci, global);
+        }
+    }
+
+    // A view into a global's storage: static as far as this rule goes.
+    vwStatic &self id:long -> bool {
+        if (self.vw.aKind.get(id) != VW_STORE) { return false; }
+        r: Sym = self.vwRoot(id);
+        return self.vwParamAt(r) < 0 && self.vwIsGlobal(r);
+    }
+
+    // `return value`: what it points at goes into the summary; what dies with the call is refused.
+    vwReturn &self inout a:Ast v:NodeId -> void {
+        e: Expr = a.expr(v);
+        if (!vwCarries(e.kind, e.structName)) { return; }
+        atoms: Vec<long>;
+        self.vwSrc(a, v, &atoms);
+        for id in atoms {
+            kind: long = self.vw.aKind.get(id);
+            r: Sym = self.vwRoot(id);
+            if (kind == VW_HELD) { self.vwRetBit(self.vwParamAt(r), 0); continue; }
+            if (self.vwStatic(id)) { continue; }
+            if (kind == VW_STORE && self.vwLent(r)) {
+                k: long = self.vwParamAt(r);
+                self.vwRetBit(k, VW_BITS);
+                // The fields below the parameter, said as `appendFields` reads them back.
+                s: String;
+                path: Vec<Sym> = self.vwPath(id);
+                for j in 1..path.len() {
+                    if (j > 1) { s.push('.'); }
+                    s.pushStr(nameOf(path.get(j)));
+                }
+                self.vw.rsK.push(k);
+                self.vw.rsSuf.push(internString(s));
+                continue;
+            }
+            if (self.vw.last && self.vw.unsafeDepth == 0 && !self.vw.aVouch.get(id)) { self.vwRefuseReturn(a, id); }
+        }
+    }
+
+    vwRetBit &self k:long shift:long -> void {
+        if (k < 0 || k >= VW_BITS) { self.vw.ret = self.vw.ret | VIEWS_ALL; return; }
+        self.vw.ret = self.vw.ret | (1 << (shift + k));
+    }
+
+    // ─── the words ──────────────────────────────────────────────────────────
+
+    vwFnText &self inout a:Ast -> str {
+        if (self.vw.cur < 0) { return "the initializer"; }
+        return lastComponentOf(fnText(a.fns.get(self.vw.cur).name));
+    }
+
+    // What an atom is, as the head of a refusal says it: "a view into `v`", "a view of `s`".
+    vwSubject &self id:long -> str {
+        kind: long = self.vw.aKind.get(id);
+        if (kind == VW_FRAME) { return "a view into a temporary"; }
+        r: Sym = self.vwRoot(id);
+        if (kind == VW_HELD) { return keepString(format("a view of `{}`", spokenName(r))); }
+        if (vwTemporary(r)) { return "a view into a temporary"; }
+        return keepString(format("a view into `{}`", lawText(self.vwShownPath(id))));
+    }
+
+    // Why it may not go where it was going: whose it is, and when that ends; `tail` says what
+    // outlives that, where it matters.
+    vwWhy &self inout a:Ast id:long tail:str -> str {
+        f: str = self.vwFnText(a);
+        kind: long = self.vw.aKind.get(id);
+        r: Sym = self.vwRoot(id);
+        if (kind == VW_FRAME || vwTemporary(r)) {
+            return keepString(format("the temporary is gone once `{}` is done with it{}", f, tail));
+        }
+        if (kind == VW_HELD) {
+            return keepString(format("`{}` is a parameter of `{}`: what it points at belongs to the caller, which may release it while the global still holds the view", spokenName(r), f));
+        }
+        if (self.vwLent(r)) {
+            return keepString(format("`{}` is lent to `{}` only for the call, and a safe function may not keep what it is lent", spokenName(r), f));
+        }
+        if (self.vwParamAt(r) >= 0) {
+            return keepString(format("`{}` is handed to `{}` by value, and `{}` releases it when it returns{}", spokenName(r), f, f, tail));
+        }
+        return keepString(format("`{}` belongs to `{}` and is released when it returns{}", spokenName(r), f, tail));
+    }
+
+    vwRefuseReturn &self inout a:Ast id:long -> void {
+        failStr(format("cannot return {} from `{}`\nnote: {}\nhelp: return an owned value instead, or take what the view points into as a parameter the caller lends",
+                       self.vwSubject(id), self.vwFnText(a), self.vwWhy(a, id, ", so the view would point at freed memory")));
+    }
+
+    vwRefuseKeep &self inout a:Ast path:Vec<Sym> id:long ci:long global:bool -> void {
+        place: str = keepString(format("`{}`", pathText(path)));
+        if (global) { place = keepString(format("the global `{}`", pathText(path))); }
+        tail: str = ", while the global outlives it";
+        if (!global) { tail = keepString(format(", while `{}` belongs to the caller", spokenName(path.get(0)))); }
+        why: str = self.vwWhy(a, id, tail);
+        if (ci >= 0) {
+            why = keepString(format("{}\nnote: it is handed to `{}`, which may keep it in {}", why, calledName(a.calls.get(ci)), place));
+        }
+        help: str = "help: store an owned copy instead, or a view of static data (a literal or a global)";
+        if (!global && self.vw.aKind.get(id) == VW_STORE && self.vwLent(self.vwRoot(id))) {
+            help = keepString(format("help: store an owned copy instead, or declare `{}` `unsafe` to vouch for it", self.vwFnText(a)));
+        }
+        failStr(format("cannot store {} in {}\nnote: {}\n{}", self.vwSubject(id), place, why, help));
+    }
+}
+
+methods ConstGuard {
+    // ─── a view local holds what it points into ─────────────────────────────
+
+    // Every local whose views point into a place keeps that place still while the local is live:
+    // read backwards, a write of the place where the local is read later (or by the same call
+    // that reads it) is refused.
+    vwHolds &self inout a:Ast at:long -> void {
+        body: long = a.fns.get(at).body;
+        for s in 0..self.vw.lName.len() {
+            n: Sym = self.vw.lName.get(s);
+            // A loop's own view of its collection: `for` holds that already, and says so better.
+            if (!self.vw.lView.get(s) || strStartsWith(lastComponentOf(nameOf(n)), "$for")) { continue; }
+            self.vw.hSrc.clear();
+            p: long = self.vw.lHead.get(s);
+            while (p >= 0) {
+                id: long = self.vw.nAtom.get(p);
+                if (self.vw.aKind.get(id) == VW_STORE && !self.vw.aVouch.get(id)) { self.vw.hSrc.push(id); }
+                p = self.vw.nNext.get(p);
+            }
+            if (self.vw.hSrc.len() == 0) { continue; }
+            self.vw.hl = n;
+            self.vw.report = true;
+            self.vw.unsafeDepth = 0;
+            self.vw.brk = false;
+            self.vw.cont = false;
+            self.vwLiveBlock(a, body, false);
+        }
+        self.vw.report = false;
+        self.vw.hl = NO_SYM;
+    }
+
+    // Whether the local is live at the start of block `b`, given whether it is live after it.
+    vwLiveBlock &self inout a:Ast b:long out:bool -> bool {
+        if (b < 0) { return out; }
+        live: bool = out;
+        k: long = a.blockLen(b) - 1;
+        while (k >= 0) {
+            w: long = a.enterStmt(a.stmtIdAt(b, k));
+            live = self.vwLiveStmt(a, a.stmtAt(b, k), live);
+            gPos = w;
+            k = k - 1;
+        }
+        return live;
+    }
+
+    vwLiveStmt &self inout a:Ast st:Stmt after:bool -> bool {
+        if (st.kind == StmtKind.VarDecl) {
+            d: VarDeclNode = a.decls.get(st.at);
+            if (d.name == self.vw.hl) { self.vwConflicts(a, d.init, false); return self.vwUses(a, d.init); }
+            self.vwConflicts(a, d.init, after);
+            return after || self.vwUses(a, d.init);
+        }
+        if (st.kind == StmtKind.Expr || st.kind == StmtKind.Call) {
+            v: NodeId = a.exprStmts.get(st.at).value;
+            ev: Expr = a.expr(v);
+            // The local given a new value: what it held before is not read again.
+            if (ev.op == Op.Assignment && self.vwIsL(a, ev.left)) {
+                self.vwConflicts(a, ev.right, false);
+                return self.vwUses(a, ev.right);
+            }
+            self.vwConflicts(a, v, after);
+            return after || self.vwUses(a, v);
+        }
+        if (st.kind == StmtKind.Return) {
+            v: NodeId = a.returns.get(st.at).value;
+            self.vwConflicts(a, v, false);
+            return self.vwUses(a, v);
+        }
+        if (st.kind == StmtKind.Break) { return self.vw.brk; }
+        if (st.kind == StmtKind.Continue) { return self.vw.cont; }
+        if (st.kind == StmtKind.If) {
+            ats: Vec<long>;
+            at: long = st.at;
+            while (at >= 0) { ats.push(at); at = a.ifs.get(at).elseIf; }
+            next: bool = after;
+            j: long = ats.len() - 1;
+            while (j >= 0) {
+                nd: IfNode = a.ifs.get(ats.get(j));
+                next = self.vwBranch(a, nd.cond, nd.body, after, next);
+                j = j - 1;
+            }
+            return next;
+        }
+        if (st.kind == StmtKind.Match) {
+            m: MatchNode = a.matches.get(st.at);
+            next: bool = after;
+            j: long = m.armCount - 1;
+            while (j >= 0) {
+                arm: ArmNode = a.arms.get(m.firstArm + j);
+                next = self.vwBranch(a, arm.test, arm.body, after, next);
+                j = j - 1;
+            }
+            return next;
+        }
+        if (st.kind == StmtKind.While) {
+            w: WhileNode = a.whiles.get(st.at);
+            return self.vwLiveLoop(a, w.cond, w.body, w.step, after, false);
+        }
+        if (st.kind == StmtKind.Loop) {
+            return self.vwLiveLoop(a, NO_NODE, a.blockStmts.get(st.at).body, -1, after, true);
+        }
+        if (st.kind == StmtKind.Recover) {
+            w: WhileNode = a.whiles.get(st.at);
+            handlerIn: bool = self.vwLiveBlock(a, w.step, after);
+            bodyIn: bool = self.vwLiveBlock(a, w.body, after || handlerIn);
+            return bodyIn || handlerIn;
+        }
+        if (st.kind == StmtKind.Unsafe) {
+            self.vw.unsafeDepth = self.vw.unsafeDepth + 1;
+            r: bool = self.vwLiveBlock(a, a.blockStmts.get(st.at).body, after);
+            self.vw.unsafeDepth = self.vw.unsafeDepth - 1;
+            return r;
+        }
+        if (st.kind == StmtKind.Block) { return self.vwLiveBlock(a, a.blockStmts.get(st.at).body, after); }
+        if (st.kind == StmtKind.With) { return self.vwLiveBlock(a, a.withs.get(st.at).body, after); }
+        if (st.kind == StmtKind.Destructure) {
+            v: NodeId = a.destructures.get(st.at).value;
+            self.vwConflicts(a, v, after);
+            return after || self.vwUses(a, v);
+        }
+        if (st.kind == StmtKind.Asm) {
+            n: AsmNode = a.asms.get(st.at);
+            used: bool = after;
+            for k in 0..n.pieceCount {
+                pc: AsmPiece = a.asmPieces.get(n.firstPiece + k);
+                if (pc.kind == AsmKind.In && self.vwUses(a, pc.value)) { used = true; }
+            }
+            return used;
+        }
+        return after;
+    }
+
+    // One branch of an `if` chain or a `match`: its test, then its block, or on to the next test
+    // (`next`, live before it). A test that always holds (an `else`, the last arm) has no next.
+    vwBranch &self inout a:Ast cond:NodeId body:long after:bool next:bool -> bool {
+        bodyIn: bool = self.vwLiveBlock(a, body, after);
+        if (cond == NO_NODE) { return bodyIn; }
+        c: Expr = a.expr(cond);
+        afterCond: bool = bodyIn || next;
+        if (c.op == Op.Literal) {
+            match c.payload { Num(x) { if (x != 0) { afterCond = bodyIn; } } _ { } }
+        }
+        self.vwConflicts(a, cond, afterCond);
+        return afterCond || self.vwUses(a, cond);
+    }
+
+    // A loop: liveness at its head to a fixpoint (it only grows, so two readings settle it),
+    // quietly, then once more with refusals on.
+    vwLiveLoop &self inout a:Ast cond:NodeId body:long step:long after:bool forever:bool -> bool {
+        saveB: bool = self.vw.brk;
+        saveC: bool = self.vw.cont;
+        saveR: bool = self.vw.report;
+        self.vw.report = false;
+        head: bool = false;
+        for round in 0..4 {
+            h: bool = self.vwLoopOnce(a, cond, body, step, after, head, forever);
+            if (h == head) { break; }
+            head = h;
+        }
+        self.vw.report = saveR;
+        if (saveR) { self.vwLoopOnce(a, cond, body, step, after, head, forever); }
+        self.vw.brk = saveB;
+        self.vw.cont = saveC;
+        return head;
+    }
+
+    vwLoopOnce &self inout a:Ast cond:NodeId body:long step:long after:bool head:bool forever:bool -> bool {
+        self.vw.brk = after;
+        stepIn: bool = self.vwLiveBlock(a, step, head);
+        self.vw.cont = stepIn;
+        bodyIn: bool = self.vwLiveBlock(a, body, stepIn);
+        if (forever) { return bodyIn; }
+        afterCond: bool = bodyIn || after;
+        self.vwConflicts(a, cond, afterCond);
+        return afterCond || self.vwUses(a, cond);
+    }
+
+    vwIsL &self inout a:Ast id:NodeId -> bool {
+        if (id == NO_NODE) { return false; }
+        e: Expr = a.expr(id);
+        if (e.op != Op.Lvalue) { return false; }
+        match e.payload { Name(n) { return n == self.vw.hl; } _ { } }
+        return false;
+    }
+
+    // Whether an expression reads the local.
+    vwUses &self inout a:Ast id:NodeId -> bool {
+        if (id == NO_NODE) { return false; }
+        e: Expr = a.expr(id);
+        if (e.op == Op.Lvalue) {
+            match e.payload { Name(n) { return n == self.vw.hl; } _ { } }
+            return false;
+        }
+        if (e.left != NO_NODE && (self.vwUses(a, e.left) || self.vwUses(a, e.right))) { return true; }
+        match e.payload {
+            Call(ci) {
+                c: CallNode = a.calls.get(ci);
+                if (self.vwUses(a, c.receiver) || self.vwUses(a, c.callee)) { return true; }
+                for k in 0..c.argCount { if (self.vwUses(a, a.argAt(c, k))) { return true; } }
+            }
+            Sub(v)   { return self.vwUses(a, v); }
+            Field(f) { return self.vwUses(a, a.fields.get(f).base); }
+            Index(i) {
+                ix: IndexNode = a.indexes.get(i);
+                if (ix.base == NO_NODE && ix.name == self.vw.hl) { return true; }
+                return self.vwUses(a, ix.base) || self.vwUses(a, ix.index)
+                    || self.vwUses(a, ix.sliceStart) || self.vwUses(a, ix.sliceEnd);
+            }
+            Lit(l) {
+                ln: LitNode = a.lits.get(l);
+                for k in 0..ln.initCount { if (self.vwUses(a, a.inits.get(ln.firstInit + k).value)) { return true; } }
+                return self.vwUses(a, ln.rest);
+            }
+            _ { }
+        }
+        return false;
+    }
+
+    // The source a place overlaps, or -1.
+    vwOverlap &self path:Vec<Sym> -> long {
+        for id in self.vw.hSrc { if (pathsOverlap(path, self.vwPath(id))) { return id; } }
+        return -1;
+    }
+
+    // The writes in an expression: refused when one reaches a held place and the local is live
+    // after the statement (`live`), or is read by the very call that writes.
+    vwConflicts &self inout a:Ast id:NodeId live:bool -> void {
+        if (id == NO_NODE || !self.vw.report || self.vw.unsafeDepth > 0) { return; }
+        e: Expr = a.expr(id);
+        if (e.op == Op.Assignment) {
+            if (!self.vwIsL(a, e.left)) {
+                path: Vec<Sym>;
+                if (live && self.holdPath(a, e.left, NO_SYM, &path)) {
+                    s: long = self.vwOverlap(path);
+                    if (s >= 0) { self.vwRefuseHold(a, s, "assigned to", false, false); }
+                }
+                self.vwMoveConflict(a, e.right, live);
+            }
+            self.vwConflicts(a, e.left, live);
+            self.vwConflicts(a, e.right, live);
+            return;
+        }
+        if (e.left != NO_NODE) { self.vwConflicts(a, e.left, live); self.vwConflicts(a, e.right, live); return; }
+        match e.payload {
+            Call(ci) {
+                self.vwCallConflicts(a, ci, live);
+                c: CallNode = a.calls.get(ci);
+                self.vwConflicts(a, c.receiver, live);
+                for k in 0..c.argCount { self.vwConflicts(a, a.argAt(c, k), live); }
+                self.vwConflicts(a, c.callee, live);
+            }
+            Sub(v)   { self.vwConflicts(a, v, live); }
+            Field(f) { self.vwConflicts(a, a.fields.get(f).base, live); }
+            Index(i) {
+                ix: IndexNode = a.indexes.get(i);
+                self.vwConflicts(a, ix.base, live); self.vwConflicts(a, ix.index, live);
+                self.vwConflicts(a, ix.sliceStart, live); self.vwConflicts(a, ix.sliceEnd, live);
+            }
+            Lit(l) {
+                ln: LitNode = a.lits.get(l);
+                for k in 0..ln.initCount { self.vwConflicts(a, a.inits.get(ln.firstInit + k).value, live); }
+                self.vwConflicts(a, ln.rest, live);
+            }
+            _ { }
+        }
+    }
+
+    vwCallConflicts &self inout a:Ast ci:long live:bool -> void {
+        c: CallNode = a.calls.get(ci);
+        nodes: Vec<NodeId>;
+        if (c.receiver != NO_NODE) { nodes.push(c.receiver); }
+        for k in 0..c.argCount { nodes.push(a.argAt(c, k)); }
+        drop: bool = c.receiver != NO_NODE && c.argCount == 0 && strEndsWith(nameOf(c.name), "_drop");
+        anyUse: bool = false;
+        for k in 0..nodes.len() {
+            nk: NodeId = nodes.get(k);
+            same: bool = self.vwCallUses(a, nodes, k);
+            if (same) { anyUse = true; }
+            if ((live || same) && !self.vwIsL(a, nk) && self.holdCalleeWrites(a, c, k)) {
+                np: Vec<Sym>;
+                if (self.holdPath(a, nk, NO_SYM, &np)) {
+                    srcs: Vec<long> = self.vw.hSrc.clone();
+                    for id in srcs {
+                        sp: Vec<Sym> = self.vwPath(id);
+                        if (!pathsOverlap(np, sp)) { continue; }
+                        hit: bool = true;
+                        // Only the fields the callee writes count, where the argument is a
+                        // strict prefix of the place held (`self` for `self.text`).
+                        if (np.len() < sp.len() && !drop) {
+                            hit = false;
+                            qs: Vec<Sym> = self.calleePaths(a, c, k);
+                            for q in qs {
+                                np2: Vec<Sym> = np.clone();
+                                appendFields(&np2, nameOf(q));
+                                if (pathsOverlap(np2, sp)) { hit = true; }
+                            }
+                        }
+                        if (hit) {
+                            how: str = keepString(format("handed to `{}`, which writes it", calledName(c)));
+                            self.vwRefuseHold(a, id, how, same && !live, drop);
+                        }
+                    }
+                }
+            }
+            if (self.holdCalleeTakes(a, c, k)) { self.vwMoveConflict(a, nk, live || same); }
+        }
+        // A `var` global held: the call may write it by name.
+        if (!live && !anyUse) { return; }
+        held: Vec<long> = self.vw.hSrc.clone();
+        for id in held {
+            r: Sym = self.vwRoot(id);
+            if (self.vwParamAt(r) >= 0 || !isVarGlobalName(r)) { continue; }
+            if (self.callWritesGlobal(a, c, self.placeOfPath(self.vwPath(id)))) {
+                how: str = keepString(format("written by `{}`, which this calls", calledName(c)));
+                self.vwRefuseHold(a, id, how, false, false);
+            }
+        }
+    }
+
+    // Whether an argument other than the `k`th hands the call a view of the local.
+    vwCallUses &self inout a:Ast nodes:Vec<NodeId> k:long -> bool {
+        for j in 0..nodes.len() {
+            if (j == k) { continue; }
+            e: Expr = a.expr(nodes.get(j));
+            if (vwCarries(e.kind, e.structName) && self.vwUses(a, nodes.get(j))) { return true; }
+        }
+        return false;
+    }
+
+    vwMoveConflict &self inout a:Ast place:NodeId live:bool -> void {
+        if (!live || place == NO_NODE || self.vwIsL(a, place)) { return; }
+        e: Expr = a.expr(place);
+        if (e.op != Op.Lvalue && e.op != Op.FieldAccess) { return; }
+        if (e.kind != Lit.Struct || !gReg.needsDrop(e.structName)) { return; }
+        path: Vec<Sym>;
+        if (!self.holdPath(a, place, NO_SYM, &path)) { return; }
+        s: long = self.vwOverlap(path);
+        if (s < 0) { return; }
+        src: str = self.vwSourceText(s);
+        l: str = vwLocalText(self.vw.hl);
+        failStr(format("cannot move {} while {} views it\nnote: {} points into {} and is used after this\nhelp: finish with {} first, or copy what it views into an owned value",
+                       src, l, l, src, l));
+    }
+
+    vwSourceText &self id:long -> str {
+        if (vwTemporary(self.vwRoot(id))) { return "a temporary"; }
+        return keepString(format("`{}`", pathText(self.vwShownPath(id))));
+    }
+
+    vwRefuseHold &self inout a:Ast id:long how:str same:bool drop:bool -> void {
+        src: str = self.vwSourceText(id);
+        l: str = vwLocalText(self.vw.hl);
+        if (drop && vwTemporary(self.vwRoot(id))) {
+            failStr(format("cannot release a temporary while {} views it\nnote: the temporary is released at the end of the statement that made it, and {} is used after that\nhelp: bind the value to a local first, so it lives as long as {} is used",
+                           l, l, l));
+        }
+        if (drop) {
+            failStr(format("cannot release {} while {} views it\nnote: {} goes out of scope here, and {} points into it and is used after this\nhelp: declare {} where it outlives every use of {}, or copy what {} views into an owned value",
+                           src, l, src, l, src, l, l));
+        }
+        why: str = keepString(format("{} points into {} and is used after this, and the change could move or release what it points at", l, src));
+        if (same) { why = keepString(format("{} is handed to the same call, which could move or release what it points at while reading it", l)); }
+        failStr(format("cannot change {} while {} views it\nnote: it is {}\nnote: {}\nhelp: finish with {} first, or copy what it views into an owned value",
+                       src, l, how, why, l));
+    }
+}
+
+// Whether a function could keep a view one parameter holds in a place another reaches: it has a
+// lent parameter, and a parameter that is or holds a view.
+local vwMayKeep inout a:Ast f:FnNode -> bool {
+    if (f.argCount < 2) { return false; }
+    lent: bool = false;
+    carries: bool = false;
+    for k in 0..f.argCount {
+        p: VarDeclNode = a.paramAt(f, k);
+        if (p.kind == Lit.Ref || p.isArray) { lent = true; }
+        if (vwCarries(p.kind, p.structName)) { carries = true; }
+    }
+    return lent && carries;
+}
+
+// A type an address may be kept in as a number.
+local vwNumber k:Lit -> bool { return k == Lit.Long || k == Lit.U64; }

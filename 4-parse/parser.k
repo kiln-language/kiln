@@ -2537,7 +2537,7 @@ methods Parser {
         return false;
     }
 
-    // `@init @fini @panic @recover`, each at most once, before a top-level function.
+    // `@init @fini @panic @recover @spill`, each at most once, before a top-level function.
     parseAttrs &self -> long {
         attrs: long = 0;
         while (self.check(Tok.AtSign)) {
@@ -2549,7 +2549,8 @@ methods Parser {
             else if (n == "fini") { bit = FN_FINI; }
             else if (n == "panic") { bit = FN_PANIC; }
             else if (n == "recover") { bit = FN_RECOVER; }
-            else { self.err(format("unknown attribute `@{}`\nnote: a function may be marked `@init`, `@fini`, `@panic` or `@recover`", n)); }
+            else if (n == "spill") { bit = FN_SPILL; }
+            else { self.err(format("unknown attribute `@{}`\nnote: a function may be marked `@init`, `@fini`, `@panic`, `@recover` or `@spill`", n)); }
             if ((attrs & bit) != 0) { self.err(format("duplicate attribute `@{}`", n)); }
             attrs = attrs | bit;
         }
@@ -2560,7 +2561,7 @@ methods Parser {
     applyAttrs &self st:long attrs:long -> void {
         s: Stmt = self.ast.stmts.get(st);
         if (s.kind != StmtKind.FunctionDef) {
-            self.err(stringOf("an attribute (`@init`, `@fini`, `@panic` or `@recover`) can only mark a function definition"));
+            self.err(stringOf("an attribute (`@init`, `@fini`, `@panic`, `@recover` or `@spill`) can only mark a function definition"));
         }
         f: FnNode = self.ast.fns.get(s.at);
         n: str = lastComponentOf(nameOf(f.name));
@@ -2587,6 +2588,12 @@ methods Parser {
                 ok = p.kind == Lit.Long && !p.isVariadic;
             }
             if (!ok) { self.err(format("wrong signature for the `@recover` function `{}`\nhelp: declare it as `{} rec:long -> long {{ ... }}`", n, n)); }
+        }
+        // The `@spill` function is called with nothing to hand it, from a bounds failure's report.
+        if ((attrs & FN_SPILL) != 0) {
+            if (f.argCount != 0 || f.returnKind != Lit.Void || isNeverFn(f) || f.body < 0 || f.isTemplate) {
+                self.err(format("wrong signature for the `@spill` function `{}`\nnote: it takes no parameters, returns nothing, has a body and is not generic\nhelp: declare it as `{} -> void {{ ... }}`", n, n));
+            }
         }
         f.attrs = f.attrs | attrs;
         self.ast.fns.set(s.at, f);

@@ -45,7 +45,11 @@ pub struct Opt {
     urBase: long,           // and where the renumbered run starts
 
     // Counters, for `--trace-opt`.
-    nPromoted: long, nCopies: long, nImm: long, nFused: long, nJumps: long, nDead: long
+    nPromoted: long, nCopies: long, nImm: long, nFused: long, nJumps: long, nDead: long, nRetarget: long,
+    lpH: long, lpT: long, lpS: long, lpJ: long, lpX: long, fsOk: bool, nFusedLoops: long,
+    nPulled: long,          // call results read from where they arrive (`pullResults`)
+    nOffsets: long, nShiftMuls: long, nNarrow: long,  // `narrowStores`, `foldOffsets`, `shiftMuls`
+    lfAt: Vec<long>, lfBlk: Vec<long>, lfSeq: long    // `retargetAndFuse`: per temp, its last write in the block being read
 }
 
 pub var gTraceOpt: bool = false;
@@ -60,11 +64,39 @@ pub var gAsmOutOff: bool = false;
 // A counted loop of a few straight-line instructions run two turns at a time (`unrollLoop`,
 // `--no-unroll`).
 pub var gUnrollOff: bool = false;
+// `--no-retarget`: a copy's source is left computed aside and moved (`retargetCopies`).
+pub var gRetargetOff: bool = false;
+// `--no-convert-copy`: a conversion that keeps every bit is not taken for a copy by
+// `retargetCopies`, and one stored only at its own width or narrower is still made
+// (`narrowStores`).
+pub var gConvertCopyOff: bool = false;
+// `--no-fold-offsets`: an address the scaler left as a sum with a constant is computed and then
+// read through (`foldOffsets`).
+pub var gFoldOffsetsOff: bool = false;
+// `--no-shift-mul`: a shift by a constant before a product by a constant stays (`shiftMuls`).
+pub var gShiftMulOff: bool = false;
+// `--no-pull-result`: a call's result read a few instructions later stays read there
+// (`pullResults`).
+pub var gPullResultOff: bool = false;
+// `--no-fuse`: two loops over one range stay two (`fuseOne`).
+pub var gFuseOff: bool = false;
+
+// Where `countedLoop` found a loop's parts, by index into its function: the header label, the
+// test, the step, the jump back and the exit label.
+local LP_H: long = 0;
+local LP_T: long = 1;
+local LP_S: long = 2;
+local LP_J: long = 3;
+local LP_X: long = 4;
 // A branch decided again once dead definitions are gone, a fused compare and branch of two
 // constants among them (`foldConstBranches`, `--no-refold`).
 pub var gRefoldOff: bool = false;
 // The most instructions, the counter's step among them, a body two turns are made of may have.
 local UNROLL_MAX: long = 12;
+// How far apart (in the function's run, deleted instructions counted), within one block,
+// `narrowStores`, `foldOffsets` and `shiftMuls` look for the two
+// instructions they join.
+local LATE_NEAR: long = 16;
 var gUnrollSeq: long = 0;
 
 methods Opt for Default {
@@ -72,7 +104,9 @@ methods Opt for Default {
         return Opt { uses: vec![], defs: vec![], defAt: vec![], base: 0,
                      slotTemp: map![], pinned: map![], named: map![],
                      cpStamp: vec![], cpTo: vec![], cpVer: vec![], vStamp: vec![], vCount: vec![], blkSeq: 0, afterInline: false, ddStack: vec![], ddAgain: false, urMap: vec![], urBase: 0,
-                     nPromoted: 0, nCopies: 0, nImm: 0, nFused: 0, nJumps: 0, nDead: 0 };
+                     nPromoted: 0, nCopies: 0, nImm: 0, nFused: 0, nJumps: 0, nDead: 0, nRetarget: 0,
+                     lpH: 0, lpT: 0, lpS: 0, lpJ: 0, lpX: 0, fsOk: false, nFusedLoops: 0, nPulled: 0,
+                     nOffsets: 0, nShiftMuls: 0, nNarrow: 0, lfAt: vec![], lfBlk: vec![], lfSeq: 0 };
     }
 }
 
@@ -141,7 +175,633 @@ methods Opt {
 
     // ─── loops that only clear a range ──────────────────────────────────────
 
+    // The last write of `t` in the block `retargetAndFuse` is walking, when it is at most `LATE_NEAR`
+    // instructions before `i`; -1 otherwise.
+    lateDef &self t:Temp i:long -> long {
+        r: long = t - self.base;
+        if (t == NO_TEMP || r < 0 || r >= self.lfAt.len() || self.lfBlk.get(r) != self.lfSeq) { return -1; }
+        d: long = self.lfAt.get(r);
+        if (i - d > LATE_NEAR) { return -1; }
+        return d;
+    }
+
+    // The one instruction (its index in the function's run) that writes `t`, when exactly one
+    // does and it comes before `i`; -1 otherwise.
+    defBefore &self t:Temp i:long -> long {
+        r: long = t - self.base;
+        if (t == NO_TEMP || r < 0 || r >= self.defs.len() || self.defs.get(r) != 1) { return -1; }
+        d: long = self.defAt.get(r);
+        if (d < 0 || d >= i) { return -1; }
+        return d;
+    }
+
+    // Whether instructions `from` to `to - 1` of the function's run stay in one block and leave
+    // `t` alone.
+    sameBlockKeeps &self inout p:IRProgram fn:IRFunc t:Temp from:long to:long -> bool {
+        for j in from..to {
+            ix: long = fn.firstInstr + j;
+            if (blockEnds(p.code[ix].op) || p.code[ix].dst == t) { return false; }
+        }
+        return true;
+    }
+
+    // `t = y + k` (or `y - k`), then `[t + o]` later in the same block with `y` not written in
+    // between: `[y + k + o]`, and the sum goes once nothing reads it. `Flow.foldAddresses` does
+    // this before the scaler, which is what takes a conversion to a pointer out from between the
+    // two (`*((s + 8) as *u64)` converts the sum first), so a copied `copy16` still added 8 and
+    // loaded.
+    foldOffsets &self inout p:IRProgram fn:IRFunc -> bool {
+        changed: bool = false;
+        for i in 0..fn.instrCount {
+            at: long = fn.firstInstr + i;
+            o: IROp = p.code[at].op;
+            if (o != IROp.PtrLoad && o != IROp.PtrStore) { continue; }
+            t: Temp = p.code[at].a;
+            di: long = self.defBefore(t, i);
+            if (di >= 0 && i - di > LATE_NEAR) { continue; }
+            if (di < 0) { continue; }
+            d: long = fn.firstInstr + di;
+            od: IROp = p.code[d].op;
+            if ((od != IROp.Add && od != IROp.Sub) || !p.code[d].bIsImm || p.code[d].a == NO_TEMP || p.code[d].a == t
+                || widthOf(p.code[d].kind) != 8 || isFloat(p.code[d].kind)) { continue; }
+            y: Temp = p.code[d].a;
+            k: long = p.code[d].bImm;
+            if (k < 0 - 2147483648 || k > 2147483647) { continue; }
+            if (od == IROp.Sub) { k = 0 - k; }
+            sum: long = p.code[at].imm + k;
+            if (sum < 0 - 2147483648 || sum > 2147483647) { continue; }
+            if (!self.sameBlockKeeps(p, fn, y, di + 1, i)) { continue; }
+            p.code[at].a = y;
+            p.code[at].imm = sum;
+            r: long = t - self.base;
+            self.uses.set(r, self.uses.get(r) - 1);
+            if (self.uses.get(r) == 0) {
+                p.code.set(d, instr(IROp.Nop));
+                self.defs.set(r, 0);
+            }
+            self.nOffsets = self.nOffsets + 1;
+            changed = true;
+        }
+        return changed;
+    }
+
+    // `s = z << k; m = s * c`, with `c` a constant and each of `s` and `c` read only there, and
+    // `z` not written between the two in their block: `m = z * c'` with `c'` = `c << k`, the
+    // shift gone (a hash's `(x << 24) * prime`). Both are the product modulo 2^64 at a full word.
+    shiftMuls &self inout p:IRProgram fn:IRFunc -> bool {
+        changed: bool = false;
+        for i in 0..fn.instrCount {
+            at: long = fn.firstInstr + i;
+            if (p.code[at].op != IROp.Mul || p.code[at].bIsImm || widthOf(p.code[at].kind) != 8 || isFloat(p.code[at].kind)) { continue; }
+            s: Temp = p.code[at].a;
+            c: Temp = p.code[at].b;
+            if (!self.shiftConstPair(p, fn, s, c, i)) {
+                s = p.code[at].b;
+                c = p.code[at].a;
+                if (!self.shiftConstPair(p, fn, s, c, i)) { continue; }
+            }
+            ds: long = fn.firstInstr + self.defBefore(s, i);
+            dc: long = fn.firstInstr + self.defBefore(c, i);
+            p.code[dc].imm = p.code[dc].imm << (p.code[ds].bImm % 64);
+            p.code[at].a = p.code[ds].a;
+            p.code[at].b = c;
+            p.code.set(ds, instr(IROp.Nop));
+            rs: long = s - self.base;
+            self.defs.set(rs, 0);
+            self.uses.set(rs, 0);
+            self.nShiftMuls = self.nShiftMuls + 1;
+            changed = true;
+        }
+        return changed;
+    }
+
+    // Whether `s` and `c`, read by the product at `i`, are what `shiftMuls` takes.
+    shiftConstPair &self inout p:IRProgram fn:IRFunc s:Temp c:Temp i:long -> bool {
+        if (s == c) { return false; }
+        ds: long = self.defBefore(s, i);
+        dc: long = self.defBefore(c, i);
+        if (ds < 0 || dc < 0 || i - ds > LATE_NEAR || self.useCount(s) != 1 || self.useCount(c) != 1) { return false; }
+        sh: long = fn.firstInstr + ds;
+        k: long = fn.firstInstr + dc;
+        if (p.code[sh].op != IROp.Shl || !p.code[sh].bIsImm || p.code[sh].a == NO_TEMP || p.code[sh].a == s
+            || widthOf(p.code[sh].kind) != 8 || isFloat(p.code[sh].kind)) { return false; }
+        if (p.code[k].op != IROp.Const || widthOf(p.code[k].kind) != 8 || isFloat(p.code[k].kind)) { return false; }
+        return self.sameBlockKeeps(p, fn, p.code[sh].a, ds + 1, i);
+    }
+
     // Over every function, once element addresses are one addressing mode each (`scale.k`).
+    // After `flow.k` and the scaler, per function: a conversion stored only at its width or
+    // narrower (`narrowStores`), a constant added to an address and then read through
+    // (`foldOffsets`), a shift by a constant before a product by a constant (`shiftMuls`), copies
+    // whose source can be computed straight into their destination (`retargetCopies`), then pairs
+    // of loops run as one (`fuseOne`), on one count of uses, taken only for a function that has
+    // a candidate for one of them. A candidate for the first three is two instructions within
+    // `LATE_NEAR` of each other, found in the same walk from the last write of each temp by an
+    // instruction they start from (`lfAt`, stamped with the function in `lfBlk`, so nothing is
+    // cleared between functions); each checks its blocks itself.
+    retargetAndFuse &self inout p:IRProgram -> void {
+        for f in 0..p.funcs.len() {
+            fn: IRFunc = p.funcs.get(f);
+            if (fn.instrCount == 0) { continue; }
+            self.base = fn.firstTemp;
+            copies: bool = false;
+            jumps: long = 0;
+            nt: long = fn.tempCount - fn.firstTemp;
+            late: bool = nt > 0 && !(gConvertCopyOff && gFoldOffsetsOff && gShiftMulOff);
+            if (late) {
+                growLongs(&self.lfAt, nt);
+                growLongs(&self.lfBlk, nt);
+                self.lfSeq = self.lfSeq + 1;
+            }
+            narrow: bool = false;
+            mem: bool = false;
+            mul: bool = false;
+            for i in 0..fn.instrCount {
+                ix: long = fn.firstInstr + i;
+                o: IROp = p.code[ix].op;
+                if (o == IROp.Jmp) { jumps = jumps + 1; }
+                if (late) {
+                    if (o == IROp.Add || o == IROp.Sub || o == IROp.Shl || o == IROp.Convert) {
+                        r: long = p.code[ix].dst - fn.firstTemp;
+                        if (p.code[ix].dst != NO_TEMP && r >= 0 && r < nt) { self.lfAt.set(r, i); self.lfBlk.set(r, self.lfSeq); }
+                    } else if (o == IROp.PtrLoad || o == IROp.PtrStore) {
+                        if (!mem && !gFoldOffsetsOff) {
+                            d: long = self.lateDef(p.code[ix].a, i);
+                            mem = d >= 0 && p.code[fn.firstInstr + d].op != IROp.Shl && p.code[fn.firstInstr + d].op != IROp.Convert
+                                  && p.code[fn.firstInstr + d].bIsImm;
+                        }
+                        if (o == IROp.PtrStore && !narrow && !gConvertCopyOff && !p.code[ix].bIsImm) {
+                            d: long = self.lateDef(p.code[ix].b, i);
+                            narrow = d >= 0 && p.code[fn.firstInstr + d].op == IROp.Convert;
+                        }
+                    } else if (o == IROp.Mul && !mul && !gShiftMulOff && !p.code[ix].bIsImm) {
+                        da: long = self.lateDef(p.code[ix].a, i);
+                        db: long = self.lateDef(p.code[ix].b, i);
+                        mul = (da >= 0 && p.code[fn.firstInstr + da].op == IROp.Shl && p.code[fn.firstInstr + da].bIsImm)
+                              || (db >= 0 && p.code[fn.firstInstr + db].op == IROp.Shl && p.code[fn.firstInstr + db].bIsImm);
+                    }
+                }
+                if (!(o == IROp.Mov || (o == IROp.Convert && !gConvertCopyOff && sameBits(p.code[ix].fromKind, p.code[ix].toKind)))
+                    || copies || gRetargetOff) { continue; }
+                // A copy of what one of the few instructions before it computed.
+                y: Temp = p.code[ix].a;
+                q: long = i - 1;
+                while (q >= 0 && q >= i - 8 && !blockEnds(p.code[fn.firstInstr + q].op)) {
+                    if (p.code[fn.firstInstr + q].dst == y) { copies = true; break; }
+                    q = q - 1;
+                }
+            }
+            fuse: bool = !gFuseOff && jumps >= 2;
+            if (!copies && !fuse && !narrow && !mem && !mul) { continue; }
+            self.countUses(p, fn);
+            if (narrow && self.narrowStores(p, fn)) { self.countUses(p, fn); }
+            if (mem && self.foldOffsets(p, fn)) { self.countUses(p, fn); }
+            if (mul && self.shiftMuls(p, fn)) { self.countUses(p, fn); }
+            if (copies && self.retargetCopies(p, fn) && fuse) { self.countUses(p, fn); }
+            rounds: long = 0;
+            while (fuse && rounds < 4 && self.fuseOne(p, fn)) {
+                rounds = rounds + 1;
+                self.countUses(p, fn);
+            }
+        }
+    }
+
+    // `y = <op>; ...; x = mov y; ... y ...` in one block, with `y` written there alone and read
+    // nowhere else, and `x` neither read nor written between: `x = <op>; ...; ... x ...`, the
+    // copy gone. Propagating copies points what reads `x` after the copy at `y` instead, which
+    // keeps both alive across the copy and leaves a `mov` the allocator cannot take back: `n`'s
+    // new value computed aside, moved into `n`, and the loop's test reading the value aside.
+    retargetCopies &self inout p:IRProgram fn:IRFunc -> bool {
+        changed: bool = false;
+        for i in 0..fn.instrCount {
+            m: long = fn.firstInstr + i;
+            // A conversion that leaves the canonical word as it is (`sameBits`: `n as long` of a
+            // `u32`) is a copy too: what computes `y` computes `x`'s word, written into `x`.
+            cv: bool = p.code[m].op == IROp.Convert && !gConvertCopyOff && sameBits(p.code[m].fromKind, p.code[m].toKind);
+            if (p.code[m].op != IROp.Mov && !cv) { continue; }
+            x: Temp = p.code[m].dst;
+            y: Temp = p.code[m].a;
+            ry: long = y - self.base;
+            rx: long = x - self.base;
+            if (x == NO_TEMP || y == NO_TEMP || x == y || ry < 0 || rx < 0 || ry >= self.defs.len() || rx >= self.defs.len()) { continue; }
+            if (self.defs.get(ry) != 1) { continue; }
+            if (cv && (p.code[m].fromKind != p.kindOf(y) || p.code[m].toKind != p.kindOf(x))) { continue; }
+            if (!cv && (p.kindOf(x) != p.kindOf(y) || p.code[m].kind != p.kindOf(x))) { continue; }
+            di: long = self.defAt.get(ry);
+            if (di < 0 || di >= i) { continue; }
+            d: long = fn.firstInstr + di;
+            od: IROp = p.code[d].op;
+            if (od == IROp.Call || od == IROp.CallIndirect || od == IROp.Asm || od == IROp.Atomic || od == IROp.Nop
+                || (od == IROp.Load && p.code[d].paramSeed) || p.code[d].kind != p.kindOf(y)) { continue; }
+            // Between the two: one block, and nothing that reads or writes `x`.
+            ok: bool = true;
+            seen: long = 1;              // the copy's own read of `y`
+            j: long = d + 1;
+            while (ok && j < m) {
+                if (blockEnds(p.code[j].op) || p.code[j].dst == x || readsTemp(p, j, x)) { ok = false; }
+                seen = seen + countReads(p, j, y);
+                j = j + 1;
+            }
+            if (!ok) { continue; }
+            // After it, to the block's end or the next write of `x`: every other read of `y`.
+            after: long = m + 1;
+            end: long = fn.firstInstr + fn.instrCount;
+            while (after < end && !blockEnds(p.code[after].op) && p.code[after].dst != x) {
+                seen = seen + countReads(p, after, y);
+                after = after + 1;
+            }
+            // The instruction that ends the run (a branch or return reading `y`, or the next
+            // write of `x`, which reads before it writes) reads the value too.
+            if (after < end) { seen = seen + countReads(p, after, y); }
+            if (seen != self.uses.get(ry)) { continue; }
+            // Every read of `y` is in reach: `x` holds its value from `d` on.
+            p.code[d].dst = x;
+            for k in d + 1..after + 1 {
+                if (k >= end) { break; }
+                if (p.code[k].a == y) { p.code[k].a = x; }
+                if (!p.code[k].bIsImm && p.code[k].b == y) { p.code[k].b = x; }
+                if (p.code[k].x == y) { p.code[k].x = x; }
+                na: long = p.code[k].argCount;
+                for q in 0..na {
+                    if (p.args.get(p.code[k].firstArg + q) == y) { p.args.set(p.code[k].firstArg + q, x); }
+                }
+            }
+            p.code.set(m, instr(IROp.Nop));
+            self.defs.set(ry, 0);
+            self.uses.set(ry, 0);
+            self.nRetarget = self.nRetarget + 1;
+            changed = true;
+        }
+        return changed;
+    }
+
+    // `x = convert y` between integer types, with `x` read only as the value of stores through a
+    // pointer no wider than `x`'s type, each later in the same block with `y` not written in
+    // between: each store takes `y` instead, and the conversion goes. A store writes the value's
+    // low bytes, and converting keeps the low bytes of the type converted to (`h[i] = n as u32`
+    // stores `n`'s low half either way). `x` is written once, here, so its reads are these.
+    narrowStores &self inout p:IRProgram fn:IRFunc -> bool {
+        changed: bool = false;
+        end: long = fn.firstInstr + fn.instrCount;
+        for i in 0..fn.instrCount {
+            m: long = fn.firstInstr + i;
+            if (p.code[m].op != IROp.Convert) { continue; }
+            fk: Lit = p.code[m].fromKind;
+            tk: Lit = p.code[m].toKind;
+            if (!(isInteger(fk) || fk == Lit.Ptr) || !(isInteger(tk) || tk == Lit.Ptr)) { continue; }
+            x: Temp = p.code[m].dst;
+            y: Temp = p.code[m].a;
+            rx: long = x - self.base;
+            if (x == NO_TEMP || y == NO_TEMP || x == y || rx < 0 || rx >= self.defs.len() || self.defs.get(rx) != 1) { continue; }
+            want: long = self.uses.get(rx);
+            if (want < 1) { continue; }
+            w: long = widthOf(tk);
+            // The stores, to the block's end or the next write of `y`.
+            found: long = 0;
+            j: long = m + 1;
+            while (j < end && j <= m + LATE_NEAR && found < want && !blockEnds(p.code[j].op) && p.code[j].dst != y) {
+                if (p.code[j].op == IROp.PtrStore && !p.code[j].bIsImm && p.code[j].b == x && p.code[j].a != x
+                    && p.code[j].x != x && !isFloat(p.code[j].kind) && widthOf(p.code[j].kind) <= w) {
+                    found = found + 1;
+                }
+                j = j + 1;
+            }
+            if (found != want) { continue; }
+            for k in m + 1..j {
+                if (p.code[k].op == IROp.PtrStore && !p.code[k].bIsImm && p.code[k].b == x) { p.code[k].b = y; }
+            }
+            p.code.set(m, instr(IROp.Nop));
+            self.defs.set(rx, 0);
+            self.uses.set(rx, 0);
+            self.nNarrow = self.nNarrow + 1;
+            changed = true;
+        }
+        return changed;
+    }
+
+    // ─── two loops over one range, run as one ─────────────────────────────────
+
+    // The first pair of loops in `fn` that can run as one, made one: true, or false for none.
+    //
+    //     HA: if (i >= n) goto XA; A; i = i + 1; goto HA; XA:
+    //     mid
+    //     HB: if (j >= m) goto XB; B; j = j + 1; goto HB; XB:
+    //
+    // becomes, where `j` starts where `i` does, `m` holds what `n` does, and neither body can
+    // tell the other ran (`fusible`):
+    //
+    //     mid, what of it does not wait for A
+    //     HA: if (i >= n) goto XA; A; B (reading i for j); i = i + 1; goto HA; XA:
+    //     mid, what of it reads what A left
+    //
+    // `higher` folds a vector and then counts in it, each turn of the rounds: one pass over it.
+    fuseOne &self inout p:IRProgram fn:IRFunc -> bool {
+        i: long = 0;
+        while (i < fn.instrCount) {
+            if (p.code[fn.firstInstr + i].op == IROp.Label && self.countedLoop(p, fn, i)) {
+                a: Vec<long>;
+                self.lpCopy(&a);
+                k: long = a.get(LP_X) + 1;
+                while (k < fn.instrCount && p.code[fn.firstInstr + k].op != IROp.Label) { k = k + 1; }
+                if (k < fn.instrCount && self.countedLoop(p, fn, k)) {
+                    b: Vec<long>;
+                    self.lpCopy(&b);
+                    if (self.fusible(p, fn, &a, &b)) {
+                        self.fuse(p, fn, &a, &b);
+                        self.nFusedLoops = self.nFusedLoops + 1;
+                        return true;
+                    }
+                }
+                i = a.get(LP_X);
+            }
+            i = i + 1;
+        }
+        return false;
+    }
+
+    // Whether a loop starts at label `h` (an index into `fn`), `fuseOne`'s shape: its test at the
+    // top (`i >= n` on an integer), the counter stepped by one as the body's last instruction,
+    // the jump back, and the exit label right after; the body neither calls, nor writes memory,
+    // nor branches anywhere but within itself, and its labels and the loop's own are named only
+    // by the loop. The places found go to `lpH`..`lpX`, the counter and bound to `lpCtr`, `lpN`.
+    countedLoop &self inout p:IRProgram fn:IRFunc h:long -> bool {
+        f0: long = fn.firstInstr;
+        hn: Sym = p.code[f0 + h].name;
+        t: long = h + 1;
+        while (t < fn.instrCount && p.code[f0 + t].op == IROp.Nop) { t = t + 1; }
+        if (t >= fn.instrCount) { return false; }
+        if (p.code[f0 + t].op != IROp.Jcc || p.code[f0 + t].cmpOp != IROp.CmpGe || isFloat(p.code[f0 + t].kind)) { return false; }
+        ctr: Temp = p.code[f0 + t].a;
+        xn: Sym = p.code[f0 + t].name;
+        if (ctr == NO_TEMP || ctr < self.base) { return false; }
+        if (!p.code[f0 + t].bIsImm && (p.code[f0 + t].b == ctr || p.code[f0 + t].b == NO_TEMP)) { return false; }
+        // The jump back: the first `jmp H` after the test.
+        j: long = t + 1;
+        while (j < fn.instrCount && !(p.code[f0 + j].op == IROp.Jmp && p.code[f0 + j].name == hn)) { j = j + 1; }
+        if (j >= fn.instrCount) { return false; }
+        x: long = j + 1;
+        while (x < fn.instrCount && p.code[f0 + x].op == IROp.Nop) { x = x + 1; }
+        if (x >= fn.instrCount || p.code[f0 + x].op != IROp.Label || p.code[f0 + x].name != xn) { return false; }
+        s: long = j - 1;
+        while (s > t && p.code[f0 + s].op == IROp.Nop) { s = s - 1; }
+        if (s <= t) { return false; }
+        st: Instr = p.code.get(f0 + s);
+        if (st.op != IROp.Add || st.dst != ctr || st.a != ctr || !st.bIsImm || st.bImm != 1 || st.kind != p.code[f0 + t].kind) { return false; }
+        // The body: nothing that calls, writes memory or leaves; the counter written only by the step.
+        for q in t + 1..s {
+            o: IROp = p.code[f0 + q].op;
+            if (o == IROp.Nop) { continue; }
+            if (o == IROp.Call || o == IROp.CallIndirect || o == IROp.Asm || o == IROp.Atomic || o == IROp.RecoverPush
+                || o == IROp.FaultEdge || o == IROp.Ret || o == IROp.RetVoid || o == IROp.Store || o == IROp.PtrStore
+                || o == IROp.ArrStore || o == IROp.AggCopy || o == IROp.AggZero || o == IROp.MemCopy || o == IROp.Jmp) { return false; }
+            if (p.code[f0 + q].dst == ctr) { return false; }
+            if (!p.code[f0 + t].bIsImm && p.code[f0 + q].dst == p.code[f0 + t].b) { return false; }
+            if (isBranch(o) && !self.labelWithin(p, fn, p.code[f0 + q].name, t + 1, s)) { return false; }
+            if (o == IROp.Label && self.namedOutside(p, fn, p.code[f0 + q].name, t + 1, s)) { return false; }
+        }
+        if (self.namedOutside(p, fn, hn, h, j) || self.namedOutside(p, fn, xn, t, t)) { return false; }
+        self.lpH = h;
+        self.lpT = t;
+        self.lpS = s;
+        self.lpJ = j;
+        self.lpX = x;
+        return true;
+    }
+
+    // Whether label `n` is written at an index in `from..to` of `fn`.
+    labelWithin &self inout p:IRProgram fn:IRFunc n:Sym from:long to:long -> bool {
+        for q in from..to {
+            if (p.code[fn.firstInstr + q].op == IROp.Label && p.code[fn.firstInstr + q].name == n) { return true; }
+        }
+        return false;
+    }
+
+    lpCopy &self inout v:Vec<long> -> void {
+        v.clear();
+        v.push(self.lpH);
+        v.push(self.lpT);
+        v.push(self.lpS);
+        v.push(self.lpJ);
+        v.push(self.lpX);
+    }
+
+    // Whether loops `a` and `b` (`countedLoop`'s places) may run as one. Their counters start at
+    // one constant and step by one, their bounds hold one value that neither loop nor what lies
+    // between them writes; what lies between is straight-line code that writes no memory, and
+    // each of its instructions either waits for A (reads what A writes, and is then read by
+    // neither loop) or does not (and touches nothing A reads or writes); neither body reads or
+    // writes what the other writes; and at most one of them can stop the program (a bounds
+    // check, a division by what may be zero), so a failure is reported where it was.
+    fusible &self inout p:IRProgram fn:IRFunc inout a:Vec<long> inout b:Vec<long> -> bool {
+        f0: long = fn.firstInstr;
+        ta: Instr = p.code.get(f0 + a.get(LP_T));
+        tb: Instr = p.code.get(f0 + b.get(LP_T));
+        ia: Temp = ta.a;
+        ib: Temp = tb.a;
+        if (ta.kind != tb.kind) { return false; }
+        // One counter for both (two `for i` loops whose `i` became one temp) is set again
+        // between them, to where it started.
+        same: bool = ia == ib;
+        // The bounds: one constant, or copies of one temp nothing in either loop or between writes.
+        if (ta.bIsImm != tb.bIsImm) { return false; }
+        if (ta.bIsImm && ta.bImm != tb.bImm) { return false; }
+        if (!ta.bIsImm) {
+            ra: Temp = self.fuseRoot(p, fn, ta.b, a.get(LP_H));
+            rb: Temp = self.fuseRoot(p, fn, tb.b, b.get(LP_H));
+            if (ra == NO_TEMP || ra != rb) { return false; }
+            for q in a.get(LP_H)..b.get(LP_X) {
+                d: Temp = p.code[f0 + q].dst;
+                if (d != NO_TEMP && (d == ra || d == ta.b || d == tb.b)) {
+                    // The copy that sets B's bound, between the loops, is the one write allowed.
+                    if (!(d == tb.b && q > a.get(LP_X) && q < b.get(LP_H) && p.code[f0 + q].op == IROp.Mov)) { return false; }
+                }
+            }
+        }
+        // The counters: each starts at the same constant, B's set between the loops and read by
+        // nothing outside B; A's set just before A.
+        ca: long = self.startConst(p, fn, ia, a.get(LP_H), 0);
+        if (!self.fsOk) { return false; }
+        cb: long = self.startConst(p, fn, ib, b.get(LP_H), a.get(LP_X) + 1);
+        if (!self.fsOk || ca != cb) { return false; }
+        // B's own counter goes, so nothing outside B may read or write it. One counter for both
+        // leaves the fused loop where B would have left it (the bounds are one value), so then
+        // anything may.
+        for q in 0..fn.instrCount {
+            if (same) { break; }
+            if (q >= b.get(LP_H) && q <= b.get(LP_X)) { continue; }
+            if (countReads(p, f0 + q, ib) > 0) { return false; }
+            if (p.code[f0 + q].dst == ib && !(q > a.get(LP_X) && q < b.get(LP_H))) { return false; }
+        }
+        // What each body writes, and what it reads.
+        wa: Vec<Temp>;
+        wb: Vec<Temp>;
+        self.writtenIn(p, fn, a.get(LP_T) + 1, a.get(LP_S), &wa);
+        self.writtenIn(p, fn, b.get(LP_T) + 1, b.get(LP_S), &wb);
+        for t in wa { if (t == ib || self.readIn(p, fn, b.get(LP_T), b.get(LP_S), t) || self.inList(&wb, t)) { return false; } }
+        for t in wb { if (t == ia || self.readIn(p, fn, a.get(LP_T), a.get(LP_S), t)) { return false; } }
+        if (!same && self.readIn(p, fn, b.get(LP_T) + 1, b.get(LP_S), ia)) { return false; }
+        if (self.mayTrap(p, fn, a.get(LP_T) + 1, a.get(LP_S)) && self.mayTrap(p, fn, b.get(LP_T) + 1, b.get(LP_S))) { return false; }
+        // Between the loops: each instruction waits for A or not.
+        late: Vec<Temp>;          // what the instructions that wait for A write
+        for q in a.get(LP_X) + 1..b.get(LP_H) {
+            in: Instr = p.code.get(f0 + q);
+            if (in.op == IROp.Nop) { continue; }
+            if (!(in.op == IROp.Const || in.op == IROp.Mov || isArith(in.op) || isCompare(in.op) || in.op == IROp.BNot
+                  || in.op == IROp.Convert || in.op == IROp.PtrLoad || in.op == IROp.Load || in.op == IROp.AddrOf
+                  || in.op == IROp.StrLitVal || in.op == IROp.StrAddr || in.op == IROp.AggSlot)) { return false; }
+            if ((in.op == IROp.Div || in.op == IROp.Mod) && !(in.bIsImm && in.bImm != 0 && in.bImm != -1)) { return false; }
+            if (in.dst == NO_TEMP) { return false; }
+            if (in.dst == ib && in.op == IROp.Const) { continue; }
+            waits: bool = in.dst == ia || self.readsAny(p, f0 + q, &wa) || self.readsAny(p, f0 + q, &late) || countReads(p, f0 + q, ia) > 0;
+            if (waits) {
+                if (in.dst == ib || self.readIn(p, fn, b.get(LP_T), b.get(LP_S), in.dst) || self.inList(&wb, in.dst)) { return false; }
+                late.push(in.dst);
+            } else {
+                if (self.readIn(p, fn, a.get(LP_T), a.get(LP_S), in.dst) || self.inList(&wa, in.dst) || self.inList(&late, in.dst)) { return false; }
+            }
+        }
+        // And what waits must not be overwritten by what moves ahead of it.
+        for q in a.get(LP_X) + 1..b.get(LP_H) {
+            d: Temp = p.code[f0 + q].dst;
+            if (d == NO_TEMP || self.inList(&late, d)) { continue; }
+            for r in a.get(LP_X) + 1..b.get(LP_H) {
+                if (self.inList(&late, p.code[f0 + r].dst) && countReads(p, f0 + r, d) > 0) { return false; }
+            }
+        }
+        return true;
+    }
+
+    // The temp a bound `t` copies (through copies, each its temp's one write in `fn`), or `t`.
+    fuseRoot &self inout p:IRProgram fn:IRFunc t0:Temp h:long -> Temp {
+        t: Temp = t0;
+        hops: long = 0;
+        while (hops < 6) {
+            r: long = t - self.base;
+            if (r < 0 || r >= self.defs.len() || self.defs.get(r) != 1) { return t; }
+            d: long = self.defAt.get(r);
+            if (d < 0 || p.code[fn.firstInstr + d].op != IROp.Mov) { return t; }
+            t = p.code[fn.firstInstr + d].a;
+            hops = hops + 1;
+        }
+        return t;
+    }
+
+    // The constant counter `c` holds as it reaches the loop at `h`: its last write before `h`,
+    // looking back no further than `from` and through nothing but straight-line code. `fsOk`
+    // says whether one was found.
+    startConst &self inout p:IRProgram fn:IRFunc c:Temp h:long from:long -> long {
+        self.fsOk = false;
+        q: long = h - 1;
+        while (q >= from) {
+            ix: long = fn.firstInstr + q;
+            o: IROp = p.code[ix].op;
+            if (o == IROp.Label || isBranch(o) || o == IROp.Call || o == IROp.CallIndirect || o == IROp.Asm) { return 0; }
+            if (p.code[ix].dst == c) {
+                if (o != IROp.Const) { return 0; }
+                self.fsOk = true;
+                return p.code[ix].imm;
+            }
+            q = q - 1;
+        }
+        return 0;
+    }
+
+    // The temps written in `from..to` of `fn`, into `out`.
+    writtenIn &self inout p:IRProgram fn:IRFunc from:long to:long inout out:Vec<Temp> -> void {
+        for q in from..to {
+            d: Temp = p.code[fn.firstInstr + q].dst;
+            if (d != NO_TEMP && !self.inList(&out, d)) { out.push(d); }
+        }
+    }
+
+    // Whether anything in `from..to` (inclusive of `from`) reads `t`.
+    readIn &self inout p:IRProgram fn:IRFunc from:long to:long t:Temp -> bool {
+        for q in from..to { if (countReads(p, fn.firstInstr + q, t) > 0) { return true; } }
+        return false;
+    }
+
+    readsAny &self inout p:IRProgram ix:long inout ts:Vec<Temp> -> bool {
+        for t in ts { if (countReads(p, ix, t) > 0) { return true; } }
+        return false;
+    }
+
+    inList &self inout ts:Vec<Temp> t:Temp -> bool {
+        for u in ts { if (u == t) { return true; } }
+        return false;
+    }
+
+    // Whether something in `from..to` can stop the program: a bounds check, a division by what
+    // may be zero (or by -1, whose quotient can overflow).
+    mayTrap &self inout p:IRProgram fn:IRFunc from:long to:long -> bool {
+        for q in from..to {
+            ix: long = fn.firstInstr + q;
+            o: IROp = p.code[ix].op;
+            if (o == IROp.Bounds) { return true; }
+            if ((o == IROp.Div || o == IROp.Mod) && !(p.code[ix].bIsImm && p.code[ix].bImm != 0 && p.code[ix].bImm != -1)) { return true; }
+        }
+        return false;
+    }
+
+    // Whether nothing in `fn` reads `t` but the instructions at `t1` and `s1`.
+    readOnlyBy &self inout p:IRProgram fn:IRFunc t:Temp t1:long s1:long -> bool {
+        for q in 0..fn.instrCount {
+            if (q == t1 || q == s1) { continue; }
+            if (countReads(p, fn.firstInstr + q, t) > 0) { return false; }
+        }
+        return true;
+    }
+
+    // Writes the fused loop over the two loops' instructions (`fuseOne`), the rest left as Nops.
+    fuse &self inout p:IRProgram fn:IRFunc inout a:Vec<long> inout b:Vec<long> -> void {
+        f0: long = fn.firstInstr;
+        ta0: long = f0 + a.get(LP_T);
+        tb0: long = f0 + b.get(LP_T);
+        ia: Temp = p.code[ta0].a;
+        ib: Temp = p.code[tb0].a;
+        wa: Vec<Temp>;
+        self.writtenIn(p, fn, a.get(LP_T) + 1, a.get(LP_S), &wa);
+        early: Vec<Instr>;
+        late: Vec<Instr>;
+        lateT: Vec<Temp>;
+        for q in a.get(LP_X) + 1..b.get(LP_H) {
+            in: Instr = p.code.get(f0 + q);
+            if (in.op == IROp.Nop) { continue; }
+            if (in.dst == ib) { continue; }
+            // What only B's test read (its bound's copy) goes with it.
+            if (self.readOnlyBy(p, fn, in.dst, b.get(LP_T), b.get(LP_S))) { continue; }
+            if (in.dst == ia || self.readsAny(p, f0 + q, &wa) || self.readsAny(p, f0 + q, &lateT) || countReads(p, f0 + q, ia) > 0) {
+                late.push(in);
+                lateT.push(in.dst);
+            } else {
+                early.push(in);
+            }
+        }
+        out: Vec<Instr>;
+        for e in early { out.push(e); }
+        for q in a.get(LP_H)..a.get(LP_S) {
+            in: Instr = p.code.get(f0 + q);
+            if (in.op != IROp.Nop) { out.push(in); }
+        }
+        for q in b.get(LP_T) + 1..b.get(LP_S) {
+            in: Instr = p.code.get(f0 + q);
+            if (in.op == IROp.Nop) { continue; }
+            if (in.a == ib) { in.a = ia; }
+            if (!in.bIsImm && in.b == ib) { in.b = ia; }
+            if (in.x == ib) { in.x = ia; }
+            out.push(in);
+        }
+        for q in a.get(LP_S)..a.get(LP_X) + 1 {
+            in: Instr = p.code.get(f0 + q);
+            if (in.op != IROp.Nop) { out.push(in); }
+        }
+        for l in late { out.push(l); }
+        k: long = 0;
+        for q in a.get(LP_H)..b.get(LP_X) + 1 {
+            if (k < out.len()) { p.code.set(f0 + q, out.get(k)); } else { p.code.set(f0 + q, instr(IROp.Nop)); }
+            k = k + 1;
+        }
+    }
+
     fillLoopsAll &self inout p:IRProgram -> void {
         for f in 0..p.funcs.len() {
             fn: IRFunc = p.funcs.get(f);
@@ -165,6 +825,58 @@ methods Opt {
     // (`urTemp`), with room for the temps each extra copy of a body gets: a temp the body writes
     // before it reads and nothing outside reads (`urLocal`) is a new one in each copy, so that each
     // copy's live ranges end where that copy ends, as the allocator's single span per temp needs.
+    // A call's result read by one instruction a few places after the call, with only arithmetic
+    // between that neither reads what that instruction writes nor writes what it reads: the reader
+    // moved up to just after the call. There it reads the result where the call left it, in `rax`
+    // (`RegAlloc.markRaxPairs`), instead of from a copy the result needed in a register of its own
+    // to wait in. `fib`'s loop adds each call's result to its sum this way.
+    pullResults &self inout p:IRProgram -> void {
+        if (gPullResultOff) { return; }
+        for f in 0..p.funcs.len() {
+            fn: IRFunc = p.funcs.get(f);
+            if (fn.instrCount == 0 || fn.holdsRecover) { continue; }
+            self.base = fn.firstTemp;
+            counted: bool = false;
+            for i in 0..fn.instrCount {
+                c: Instr = p.code.get(fn.firstInstr + i);
+                if (c.op != IROp.Call || c.dst == NO_TEMP || c.noReturn || isFloat(c.kind)) { continue; }
+                if (!counted) { self.countUses(p, fn); counted = true; }
+                if (self.useCount(c.dst) != 1) { continue; }
+                // The reader, past at most four instructions that only compute on temps.
+                at: long = -1;
+                passed: long = 0;
+                j: long = i + 1;
+                while (j < fn.instrCount && passed <= 4) {
+                    w: Instr = p.code.get(fn.firstInstr + j);
+                    if (w.op != IROp.Nop) {
+                        if (w.a == c.dst || (!w.bIsImm && w.b == c.dst) || w.x == c.dst) { at = j; break; }
+                        if (!pullOver(w) || w.dst == c.dst) { break; }
+                        passed = passed + 1;
+                    }
+                    j = j + 1;
+                }
+                if (at < 0 || passed == 0) { continue; }
+                e: Instr = p.code.get(fn.firstInstr + at);
+                if (!pullReader(e)) { continue; }
+                free: bool = true;
+                for k in i + 1..at {
+                    w: Instr = p.code.get(fn.firstInstr + k);
+                    if (w.op == IROp.Nop) { continue; }
+                    if (w.dst != NO_TEMP && (w.dst == e.a || (!e.bIsImm && w.dst == e.b) || w.dst == e.x || w.dst == e.dst)) { free = false; }
+                    if (w.a == e.dst || (!w.bIsImm && w.b == e.dst) || w.x == e.dst) { free = false; }
+                }
+                if (!free) { continue; }
+                k: long = at;
+                while (k > i + 1) {
+                    p.code.set(fn.firstInstr + k, p.code.get(fn.firstInstr + k - 1));
+                    k = k - 1;
+                }
+                p.code.set(fn.firstInstr + i + 1, e);
+                self.nPulled = self.nPulled + 1;
+            }
+        }
+    }
+
     unrollAll &self inout p:IRProgram -> void {
         for f in 0..p.funcs.len() {
             fn: IRFunc = p.funcs.get(f);
@@ -597,6 +1309,7 @@ methods Opt {
         for i in 0..fn.instrCount {
             ix: long = fn.firstInstr + i;
             self.noteUse(p.code[ix].a);
+            if (p.code[ix].x != NO_TEMP) { self.noteUse(p.code[ix].x); }
             if (!p.code[ix].bIsImm) { self.noteUse(p.code[ix].b); }
             na: long = p.code[ix].argCount;
             if (na > 0) {
@@ -1392,4 +2105,54 @@ local constCompare op:IROp k:Lit a:long b:long -> bool {
     if (op == IROp.CmpLe) { return x <= y; }
     if (op == IROp.CmpGt) { return x > y; }
     return x >= y;
+}
+
+// Whether instruction `ix` reads temp `t`, and how many times.
+local countReads inout p:IRProgram ix:long t:Temp -> long {
+    if (t == NO_TEMP) { return 0; }
+    c: long = 0;
+    if (p.code[ix].a == t) { c = c + 1; }
+    if (!p.code[ix].bIsImm && p.code[ix].b == t) { c = c + 1; }
+    if (p.code[ix].x == t) { c = c + 1; }
+    na: long = p.code[ix].argCount;
+    for k in 0..na { if (p.args.get(p.code[ix].firstArg + k) == t) { c = c + 1; } }
+    np: long = p.code[ix].pieceCount;
+    for k in 0..np { if (p.asmVals.get(p.code[ix].firstPiece + k) == t) { c = c + 1; } }
+    return c;
+}
+local readsTemp inout p:IRProgram ix:long t:Temp -> bool { return countReads(p, ix, t) > 0; }
+
+// Where a run of straight-line code ends: a label, a branch, a return, a fault edge, or an `asm`
+// block, which may write temps it names.
+// What a call's reader may be moved up over (`pullResults`): arithmetic on temps, which cannot
+// fault, read memory or branch.
+local pullOver in:Instr -> bool {
+    o: IROp = in.op;
+    if (in.dst == NO_TEMP || isFloat(in.kind)) { return false; }
+    return o == IROp.Const || o == IROp.Mov || o == IROp.Add || o == IROp.Sub || o == IROp.Mul
+        || o == IROp.BAnd || o == IROp.BOr || o == IROp.BXor || o == IROp.Shl || o == IROp.Shr
+        || o == IROp.BNot || o == IROp.Lea || isCompare(o);
+}
+// A reader worth moving: one that can take the result from `rax` (`RegAlloc.raxReader`).
+local pullReader in:Instr -> bool {
+    o: IROp = in.op;
+    if (in.dst == NO_TEMP || isFloat(in.kind)) { return false; }
+    return o == IROp.Mov || o == IROp.Add || o == IROp.Sub || o == IROp.Mul || o == IROp.BAnd
+        || o == IROp.BOr || o == IROp.BXor || o == IROp.Lea;
+}
+
+local blockEnds o:IROp -> bool {
+    return o == IROp.Label || isBranch(o) || o == IROp.Ret || o == IROp.RetVoid || o == IROp.FaultEdge || o == IROp.Asm;
+}
+
+// Whether converting from integer type `f` to integer type `t` leaves the canonical word as it is,
+// so the conversion is a copy (what `emitIntConvert` writes as one): to a full word; widening from
+// an unsigned type or to a signed one; or between types of one width and signedness.
+local sameBits f:Lit t:Lit -> bool {
+    if (!(isInteger(f) || f == Lit.Ptr) || !(isInteger(t) || t == Lit.Ptr)) { return false; }
+    w: long = widthOf(t);
+    fw: long = widthOf(f);
+    toU: bool = typeInfo(t).unsignedNum;
+    fromU: bool = typeInfo(f).unsignedNum;
+    return w >= 8 || (fw < w && (fromU || !toU)) || (fw == w && fromU == toU);
 }

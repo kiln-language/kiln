@@ -7,7 +7,7 @@
 // at their only call site, a callee's leading `if (test) { return; }` where the rest of its body
 // stays a call, and a self call in return position as a jump back to the top. In a loop, a body
 // whose copy would make no call at all is copied with its own calls copied in turn (`callFree`).
-#include <{ir, opt}>
+#include <{ir, opt, flow}>
 #include <parse::{types, upstream}>
 #include <support::compiler>
 #include <stdlib::{fmt, map, mem, option, string, vec}>
@@ -27,6 +27,41 @@ pub var gSpliceSlotsOff: bool = false;
 // `--no-accumulate`: a call whose result its caller only combines with a value and returns
 // stays a call (`accOf`).
 pub var gAccumulateOff: bool = false;
+// `--no-fold-inline`: a call is weighed by its callee's whole body only, never by what the
+// constants it is handed leave of that body (`foldedSize`).
+pub var gFoldInlineOff: bool = false;
+
+// `--no-self-inline`: a function's call to itself stays a call (`selfInline`).
+pub var gSelfInlineOff: bool = false;
+// `--no-partial-inline`: a call in a loop to a body too large to copy stays a call, even where the
+// body's head returns by a short path (`partialPlan`).
+pub var gPartialInlineOff: bool = false;
+
+// Partial inlining: at most this many instructions of a callee's head (labels aside) are copied
+// to a call in a loop, its loops and the rest left to a call of the whole function.
+local PARTIAL_MAX: long = 32;
+// The general registers the allocator hands out (eight caller-saved, four callee-saved): a head is
+// copied only where what the caller holds there and what the head holds at once fit in them.
+local PARTIAL_REGS: long = 12;
+// What `partialPlan` marks each instruction of a callee: copied, a point where the copy leaves
+// for the call (or something only such a path reads, so left out), or not reached.
+local PT_NONE: long = 0;
+local PT_COPY: long = 1;
+local PT_EXIT: long = 2;
+// `--no-merge-acc`: a copy of a function's body made at its own call keeps an accumulator of
+// its own, added into the caller's once at its end (`srMergeAt`).
+pub var gMergeAccOff: bool = false;
+
+// A function at most this large that calls itself has that call replaced by a copy of its body,
+// and the copy's by another, while the copies stay within `SELF_BUDGET` instructions all told.
+local SELF_MAX_INSTRS: long = 32;
+local SELF_DEPTH: long = 2;
+local SELF_BUDGET: long = 160;
+
+// A body up to this size is weighed again at a call that hands it a constant (a number, a string
+// literal, a slice of known length), by the instructions those constants leave reachable and not
+// folded away (`foldedSize`). A larger body is not weighed at all, which bounds the walk.
+local FOLD_MAX_INSTRS: long = 96;
 
 // The identity of an operator `accOf` accumulates with.
 local accIdentity op:IROp -> long {
@@ -127,8 +162,68 @@ pub struct Relayout {
     // The function being walked accumulates its own calls' results (`accOf`): the operands' kind;
     // and, for the site `accSite` last answered, its operator's index, its other operand, and
     // whether that operand is an immediate.
-    accKind: Lit, accAt: long, accOther: Temp, accImm: bool, nAccs: long
+    accKind: Lit, accAt: long, accOther: Temp, accImm: bool, nAccs: long,
+    // ─── a callee weighed by what its constant arguments leave of it ────────
+    // Per temp of the old image, the one instruction that writes it, -1 for none, -2 for several:
+    // `foldedSize` trusts a value only through a temp written once. The calls whose bodies are
+    // being copied, outermost first, by index into the old image (`ctxIx`, beside `stack`), and
+    // the call being weighed or copied now (`callIx`).
+    defIx: Vec<long>, ctxIx: Vec<long>, callIx: long, cv: long, nFolded: long,
+    fvVal: HashMap<long, long>, fvHas: HashMap<long, bool>,
+    // The last body weighed that way and the call it was weighed at, and what each of its
+    // instructions becomes in the copy made there (`splice` reads it, once).
+    fdPlan: Vec<long>, fdFor: long, fdCall: long,
+    // ─── a function's own calls copied into it (`selfInline`) ──────────────
+    // The body as written, its accumulator (NO_TEMP when the copies keep their own) and that
+    // accumulator's operator, and how many functions were given copies.
+    srBody: Vec<Instr>, srAcc: Temp, srOp: IROp, nSelf: long, srLeadJ: long, srLeadR: long,
+    // ─── a callee's head copied, the rest a call (`partialPlan`) ───────────
+    // Per function, where its marks start in `ptMarks` (one `PT_*` per instruction), -1 for a body
+    // with no such head, -2 before it is asked; and how many calls were given a head.
+    ptAt: Vec<long>, ptMarks: Vec<long>, nPartial: long,
+    // Per function, the most temps its copied head holds at once (`partialPlan`).
+    ptPeak: Vec<long>,
+    // For the caller `ptCaller` (-1 for none yet): each temp's first and last mention, by its
+    // index in the old image, and its loops (header and back branch); for `liveAt`.
+    ptCaller: long, ptFirst: Vec<long>, ptLast: Vec<long>, ptLoopH: Vec<long>, ptLoopJ: Vec<long>,
+    // The top-level call whose body `splice` is copying, by the caller and its index.
+    ptSiteF: long, ptSiteK: long
 }
+
+// Whether an instruction of this kind may write memory, or call what does.
+local writesMemory o:IROp -> bool {
+    return o == IROp.Store || o == IROp.PtrStore || o == IROp.ArrStore || o == IROp.AggCopy || o == IROp.AggZero
+        || o == IROp.MemCopy || o == IROp.Call || o == IROp.CallIndirect || o == IROp.Asm || o == IROp.Atomic
+        || o == IROp.RecoverPush;
+}
+
+// What a body `selfInline` copies may hold: computing on its temps, reads and writes through
+// pointers and globals, branches. A call (other than to itself, which the caller counts), a
+// frame slot, an `asm` block or a `recover` record keeps the body as it is.
+local selfCopyable o:IROp seed:bool global:bool -> bool {
+    if (o == IROp.Load) { return seed || global; }
+    if (o == IROp.Store) { return global; }
+    return o == IROp.Const || o == IROp.Mov || isArith(o) || o == IROp.BNot || isCompare(o)
+        || o == IROp.Convert || o == IROp.Ret || o == IROp.RetVoid || o == IROp.Label || isBranch(o)
+        || o == IROp.PtrLoad || o == IROp.PtrStore || o == IROp.Bounds || o == IROp.StrAddr
+        || o == IROp.StrLitVal || o == IROp.FnAddr || o == IROp.VtableAddr;
+}
+
+// What a callee's copied head may hold (`partialPlan`): computing on temps, reads through
+// pointers and of globals, checks, branches and returns. Nothing that writes or calls, and no
+// frame slot, so the call of the whole function the copy leaves for may do the same work again.
+local partialPure in:Instr -> bool {
+    o: IROp = in.op;
+    if (o == IROp.Load) { return in.isGlobal && !in.paramSeed; }
+    return o == IROp.Nop || o == IROp.Const || o == IROp.Mov || isArith(o) || o == IROp.BNot || isCompare(o)
+        || o == IROp.Convert || o == IROp.PtrLoad || o == IROp.Label || isBranch(o) || o == IROp.Ret
+        || o == IROp.RetVoid || o == IROp.Bounds || o == IROp.StrLitVal || o == IROp.StrAddr || o == IROp.FnAddr;
+}
+
+// What `foldedSize` found each instruction of a body to become in the copy at that call.
+local FD_COPY: long = 0;
+local FD_DROP: long = 1;
+local FD_JUMP: long = 2;
 
 methods Relayout for Default {
     new -> Relayout {
@@ -141,7 +236,13 @@ methods Relayout for Default {
                           seeds: vec![], loopy: vec![], cfMemo: vec![], cfLoop: vec![], labelAt: map![], labelStamp: 0,
                           shortH: vec![], shortJ: vec![], curDepth: 0, forceNest: false, forceGuard: false,
                           nBodies: 0, nSites: 0, nTails: 0, nSingle: 0, nGuardBodies: 0, nGuards: 0, nCallFree: 0, nClosed: 0,
-                          accKind: Lit.Long, accAt: -1, accOther: NO_TEMP, accImm: false, nAccs: 0 };
+                          accKind: Lit.Long, accAt: -1, accOther: NO_TEMP, accImm: false, nAccs: 0,
+                          defIx: vec![], ctxIx: vec![], callIx: -1, cv: 0, nFolded: 0, fvVal: map![], fvHas: map![],
+                          fdPlan: vec![], fdFor: -1, fdCall: -1,
+                          srBody: vec![], srAcc: NO_TEMP, srOp: IROp.Nop, nSelf: 0, srLeadJ: -1, srLeadR: -1,
+                          ptAt: vec![], ptMarks: vec![], nPartial: 0, ptPeak: vec![],
+                          ptCaller: -1, ptFirst: vec![], ptLast: vec![], ptLoopH: vec![], ptLoopJ: vec![],
+                          ptSiteF: -1, ptSiteK: -1 };
     }
 }
 
@@ -282,7 +383,9 @@ methods Relayout {
                     continue;
                 }
                 self.topCaller = f;
+                self.callIx = fn.firstInstr + k;
                 at: long = self.inlineTarget(p, f, in);
+                if (at < 0 && depths.get(k) > 0) { at = self.foldTarget(p, f, in); }
                 // A call in a `recover` body stays a call: its fault edge says the handler may follow
                 // it, which a copy of its body would have to say after each of its own calls.
                 faulty: bool = k + 1 < fn.instrCount && p.code[fn.firstInstr + k + 1].op == IROp.FaultEdge;
@@ -312,6 +415,8 @@ methods Relayout {
                     self.curDepth = depths.get(k);
                     self.forceNest = true;
                     self.forceGuard = true;
+                    self.ptSiteF = f;
+                    self.ptSiteK = k;
                     self.splice(p, at, in, 0);
                     self.forceNest = false;
                     self.forceGuard = false;
@@ -327,11 +432,20 @@ methods Relayout {
                     self.nestBudget = 0;
                     if (self.sites.get(at) == 1) { self.nestBudget = MAX_SINGLE_INSTRS; }
                     self.curDepth = depths.get(k);
+                    self.ptSiteF = f;
+                    self.ptSiteK = k;
                     self.splice(p, at, in, 0);
                 }
                 else if (!faulty && self.guardTarget(p, in) >= 0) { self.spliceGuard(p, self.guardTarget(p, in), in, 0); }
+                // In a loop, a callee's head that returns by a short path, copied, the rest a call.
+                else if (!faulty && depths.get(k) > 0 && !towardNever(p, fn, k) && self.partialTarget(p, in) >= 0
+                         && (self.code.len() - firstInstr) + (fn.instrCount - k) + PARTIAL_MAX <= MAX_SINGLE_CALLER
+                         && self.headFits(p, f, k, self.ptPeak.get(self.partialTarget(p, in)))) {
+                    self.spliceHead(p, self.partialTarget(p, in), in, 0);
+                }
                 else { self.copyInstr(p, in); }
             }
+            if (!gSelfInlineOff) { self.selfInline(p, fn, firstInstr, firstTemp, acc, accOp); }
             // The promotion reservations, so nothing is left holding an id from the old
             // numbering. One the optimizer declined is renumbered too and stays unused, which
             // costs an entry in the tables and nothing else.
@@ -364,7 +478,305 @@ methods Relayout {
         if (gTraceOpt) {
             eprintln("inline: {} bodies eligible ({} for their one call site), copied into {} call sites; {} self tail calls made jumps; {} early-return tests copied to {} call sites; {} call-free copies in loops; {} copies closing a loop",
                      self.nBodies, self.nSingle, self.nSites, self.nTails, self.nGuardBodies, self.nGuards, self.nCallFree, self.nClosed);
+            eprintln("inline: {} calls copied for what their constant arguments leave of the callee; {} functions given copies of themselves", self.nFolded, self.nSelf);
+            eprintln("inline: {} calls in loops given their callee's head, the rest a call", self.nPartial);
         }
+    }
+
+    // ─── a small function's own calls, copied into it ───────────────────────
+
+    // `fn`'s body as just written (from `firstInstr` in `code`), when what is left of its
+    // recursion is a call to itself: that call replaced by a copy of the body, and the copy's own
+    // call by a second copy, as deep as `SELF_DEPTH` and `SELF_BUDGET` allow. `fib` after the
+    // accumulator transform makes one call per turn of its loop; with two levels copied in, each
+    // call it still makes does the work of three levels of the recursion, as gcc's recursive
+    // inlining has it. The body must do nothing but compute on its parameters, read and write
+    // through pointers and globals, and call itself: no other call (a `Drop` among them), no
+    // frame slot, no `asm`, no `recover`. `acc` is the accumulator the transform made (`accOf`),
+    // or NO_TEMP.
+    selfInline &self inout p:IRProgram fn:IRFunc firstInstr:long firstTemp:Temp acc:Temp accOp:IROp -> void {
+        if (fn.isMain || fn.holdsRecover || fn.imported) { return; }
+        n: long = self.code.len() - firstInstr;
+        size: long = 0;
+        sites: long = 0;
+        for k in 0..n {
+            ix: long = firstInstr + k;
+            o: IROp = self.code[ix].op;
+            if (o == IROp.Nop) { continue; }
+            size = size + 1;
+            if (o == IROp.Call && self.code[ix].name == fn.name && !self.code[ix].noReturn) { sites = sites + 1; continue; }
+            if (!selfCopyable(o, self.code[ix].paramSeed, self.code[ix].isGlobal)) { return; }
+        }
+        if (sites == 0 || size > SELF_MAX_INSTRS) { return; }
+        depth: long = 0;
+        total: long = size;
+        grow: long = size;
+        while (depth < SELF_DEPTH) {
+            grow = grow * sites;
+            if (total + grow > SELF_BUDGET) { break; }
+            total = total + grow;
+            depth = depth + 1;
+        }
+        if (depth == 0) { return; }
+        self.srBody.clear();
+        for k in 0..n { self.srBody.push(self.code.get(firstInstr + k)); }
+        self.srAcc = NO_TEMP;
+        if (!gMergeAccOff && acc != NO_TEMP && accOp != IROp.Nop && !isFloat(self.accKind)) { self.srAcc = acc; }
+        self.srOp = accOp;
+        self.code.truncate(firstInstr);
+        self.srLead();
+        self.selfCopy(p, fn.name, 0, depth, firstTemp, self.kinds.len(), instr(IROp.Nop), NO_TEMP, false, NO_TEMP, 0);
+        self.nSelf = self.nSelf + 1;
+    }
+
+    // One copy of `srBody` at nesting `level` (0 is the body itself, written back as it was),
+    // its temps `t0..tEnd` fresh past level 0, its parameters bound to `call`'s arguments, and its
+    // returns made `res = value` and a jump past the copy. `merge`: the caller only adds the
+    // result into the accumulator `srAcc`, so the copy adds into it itself (`--no-merge-acc`).
+    selfCopy &self inout p:IRProgram fname:Sym level:long depth:long t0:Temp tEnd:Temp call:Instr res:Temp merge:bool accT:Temp own:long -> void {
+        tm: Vec<Temp>;
+        for t in t0..tEnd {
+            if (level == 0) { tm.push(t); } else { tm.push(NO_TEMP); }
+        }
+        if (merge) { tm.set(self.srAcc - t0, accT); }
+        lm: HashMap<long, Sym>;
+        seq: long = 0;
+        endL: Sym = NO_SYM;
+        leadL: Sym = NO_SYM;
+        nb: long = self.srBody.len();
+        // The order the copy is written in: the body's, but in a copy the leading early return
+        // (`leadReturn`'s test and the return it guards) is turned round, its return written last,
+        // so the way into the body's loop falls through and that return needs no jump out.
+        order: Vec<long>;
+        for k in 0..nb { order.push(k); }
+        if (level > 0) {
+            self.labelSeq = self.labelSeq + 1;
+            seq = self.labelSeq;
+            endL = madeName(".SE", seq, "");
+            if (self.srLeadJ >= 0) {
+                leadL = madeName(".SL", seq, "");
+                order.clear();
+                for k in 0..self.srLeadJ + 1 { order.push(k); }
+                for k in self.srLeadR + 1..nb { order.push(k); }
+                order.push(-1);
+                for k in self.srLeadJ + 1..self.srLeadR + 1 { order.push(k); }
+            }
+        }
+        lastAt: long = order.len() - 1;
+        while (lastAt > 0) {
+            ki: long = order.get(lastAt);
+            if (ki < 0 || self.srBody[ki].op != IROp.Nop) { break; }
+            lastAt = lastAt - 1;
+        }
+        skip: Vec<long>;
+        seen: long = 0;
+        for at in 0..order.len() {
+            k: long = order.get(at);
+            if (k < 0) {
+                lb: Instr = instr(IROp.Label);
+                lb.name = leadL;
+                self.code.push(lb);
+                continue;
+            }
+            in: Instr = self.srBody.get(k);
+            if (in.op == IROp.Nop) { continue; }
+            if (level > 0 && in.op == IROp.Load && in.paramSeed) {
+                arg: Temp = self.args.get(call.firstArg + seen);
+                bit: long = (own >> seen) & 1;
+                seen = seen + 1;
+                // A parameter the body never writes is the argument; so is one the body writes
+                // whose argument was computed for this call alone.
+                if (!self.srWrites(in.dst, k) || bit == 1) { tm.set(in.dst - t0, arg); continue; }
+                mv: Instr = instr(IROp.Mov);
+                mv.dst = self.srTemp(&tm, t0, in.dst);
+                mv.a = arg;
+                mv.kind = in.kind;
+                mv.structName = in.structName;
+                self.code.push(mv);
+                continue;
+            }
+            if (level > 0 && (in.op == IROp.Ret || in.op == IROp.RetVoid)) {
+                if (in.op == IROp.Ret && (res != NO_TEMP || merge)) {
+                    v: Temp = self.srTemp(&tm, t0, in.a);
+                    up: Instr = instr(IROp.Mov);
+                    up.kind = in.kind;
+                    up.a = v;
+                    up.dst = res;
+                    // Merged, a result already holding the accumulator is its new value, and any
+                    // other is added into it.
+                    if (merge) {
+                        up.dst = accT;
+                        if (!self.srAccResult(in.a)) {
+                            up.op = self.srOp;
+                            up.a = accT;
+                            up.b = v;
+                        }
+                    }
+                    self.code.push(up);
+                }
+                if (at != lastAt) {
+                    j: Instr = instr(IROp.Jmp);
+                    j.name = endL;
+                    self.code.push(j);
+                }
+                continue;
+            }
+            if (in.op == IROp.Call && in.name == fname && !in.noReturn && level < depth) {
+                m: long = self.srMergeAt(k);
+                c: Instr = in;
+                c.firstArg = self.args.len();
+                mine: long = 0;
+                for a in 0..in.argCount {
+                    u: Temp = self.args.get(in.firstArg + a);
+                    self.args.push(self.srTemp(&tm, t0, u));
+                    twice: bool = false;
+                    for b in 0..in.argCount { if (b != a && self.args.get(in.firstArg + b) == u) { twice = true; } }
+                    if (!twice && self.srOnly(u, k)) { mine = mine | (1 << a); }
+                }
+                r: Temp = NO_TEMP;
+                if (m >= 0) { skip.push(m); } else { r = self.srTemp(&tm, t0, in.dst); }
+                self.selfCopy(p, fname, level + 1, depth, t0, tEnd, c, r, m >= 0, self.srTemp(&tm, t0, self.srAcc), mine);
+                continue;
+            }
+            dropped: bool = false;
+            for s in skip { if (s == k) { dropped = true; } }
+            if (dropped) { continue; }
+            // A merged copy starts from the accumulator it adds into, not from its identity.
+            if (merge && in.op == IROp.Const && in.dst == self.srAcc) { continue; }
+            out: Instr = in;
+            out.dst = self.srTemp(&tm, t0, in.dst);
+            out.a = self.srTemp(&tm, t0, in.a);
+            if (!in.bIsImm) { out.b = self.srTemp(&tm, t0, in.b); }
+            out.x = self.srTemp(&tm, t0, in.x);
+            if (level > 0 && (in.op == IROp.Label || isBranch(in.op)) && in.name != NO_SYM) {
+                hit: Option<Sym> = lm.find(in.name as long);
+                match hit {
+                    Some(s) { out.name = s; }
+                    None {
+                        made: Sym = madeNameLabel(seq, in.name);
+                        lm.put(in.name as long, made);
+                        out.name = made;
+                    }
+                }
+            }
+            // The leading test, turned round to reach its return, which now comes last.
+            if (leadL != NO_SYM && k == self.srLeadJ) {
+                out.cmpOp = negateCompare(in.cmpOp);
+                out.name = leadL;
+            }
+            if (in.argCount > 0) {
+                out.firstArg = self.args.len();
+                for a in 0..in.argCount { self.args.push(self.srTemp(&tm, t0, self.args.get(in.firstArg + a))); }
+            }
+            self.code.push(out);
+        }
+        if (level > 0) {
+            lb: Instr = instr(IROp.Label);
+            lb.name = endL;
+            self.code.push(lb);
+        }
+    }
+
+    // Whether temp `u` of the body is written once and read only by the instruction at `k`.
+    srOnly &self u:Temp k:long -> bool {
+        if (u == NO_TEMP) { return false; }
+        defs: long = 0;
+        for j in 0..self.srBody.len() {
+            if (self.srBody[j].op == IROp.Nop) { continue; }
+            if (self.srBody[j].dst == u) { defs = defs + 1; }
+            if (j == k) { continue; }
+            if (self.srBody[j].a == u || (!self.srBody[j].bIsImm && self.srBody[j].b == u) || self.srBody[j].x == u) { return false; }
+            for a in 0..self.srBody[j].argCount { if (self.args.get(self.srBody[j].firstArg + a) == u) { return false; } }
+        }
+        return defs == 1;
+    }
+
+    // The leading early return of the body, as `leadReturn` left it: past the parameter seeds an
+    // integer `jcc P`, the return's own straight-line instructions ending in a `ret`, then `P:`.
+    // Into `srLeadJ` and `srLeadR` (the test and the `ret`), or -1.
+    srLead &self -> void {
+        self.srLeadJ = -1;
+        self.srLeadR = -1;
+        nb: long = self.srBody.len();
+        s: long = 0;
+        while (s < nb && (self.srBody[s].op == IROp.Nop || (self.srBody[s].op == IROp.Load && self.srBody[s].paramSeed))) { s = s + 1; }
+        if (s >= nb || self.srBody[s].op != IROp.Jcc || isFloat(self.srBody[s].kind)) { return; }
+        r: long = s + 1;
+        while (r < nb && self.srBody[r].op != IROp.Ret && self.srBody[r].op != IROp.RetVoid) {
+            o: IROp = self.srBody[r].op;
+            if (o == IROp.Label || isBranch(o) || o == IROp.Call) { return; }
+            r = r + 1;
+        }
+        if (r >= nb) { return; }
+        q: long = r + 1;
+        while (q < nb && self.srBody[q].op == IROp.Nop) { q = q + 1; }
+        if (q >= nb || self.srBody[q].op != IROp.Label || self.srBody[q].name != self.srBody[s].name) { return; }
+        self.srLeadJ = s;
+        self.srLeadR = r;
+    }
+
+    // `t` in the copy `tm` maps: a temp of the body (`t0` on) fresh in the copy, made on first
+    // mention with the original's type; anything else as it is.
+    srTemp &self inout tm:Vec<Temp> t0:Temp t:Temp -> Temp {
+        if (t == NO_TEMP || t < t0 || t - t0 >= tm.len()) { return t; }
+        got: Temp = tm.get(t - t0);
+        if (got != NO_TEMP) { return got; }
+        made: Temp = self.kinds.len();
+        self.kinds.push(self.kinds.get(t));
+        self.structs.push(self.structs.get(t));
+        self.pointees.push(self.pointees.get(t));
+        tm.set(t - t0, made);
+        return made;
+    }
+
+    // Whether the body writes `t` anywhere but at `k`.
+    srWrites &self t:Temp k:long -> bool {
+        for j in 0..self.srBody.len() {
+            if (j != k && self.srBody[j].dst == t && self.srBody[j].op != IROp.Nop) { return true; }
+        }
+        return false;
+    }
+
+    // Whether `t` is written once, by `srAcc <op> x`: a return of what was accumulated.
+    srAccResult &self t:Temp -> bool {
+        w: long = -1;
+        for j in 0..self.srBody.len() {
+            if (self.srBody[j].dst == t && self.srBody[j].op != IROp.Nop) {
+                if (w >= 0) { return false; }
+                w = j;
+            }
+        }
+        return w >= 0 && self.srBody[w].op == self.srOp && self.srBody[w].a == self.srAcc;
+    }
+
+    // Where the result of the self call at `k` is added into the accumulator, when that is all
+    // that becomes of it: the one read of its result anywhere in the body, `srAcc = srAcc <op> r`
+    // after it, with no label between and nothing between reading or writing the accumulator.
+    // -1 otherwise.
+    srMergeAt &self k:long -> long {
+        if (self.srAcc == NO_TEMP) { return -1; }
+        r: Temp = self.srBody[k].dst;
+        if (r == NO_TEMP) { return -1; }
+        at: long = -1;
+        for j in 0..self.srBody.len() {
+            if (self.srBody[j].op == IROp.Nop || j == k) { continue; }
+            if (self.srBody[j].dst == r) { return -1; }
+            reads: bool = self.srBody[j].a == r || (!self.srBody[j].bIsImm && self.srBody[j].b == r) || self.srBody[j].x == r;
+            for a in 0..self.srBody[j].argCount { if (self.args.get(self.srBody[j].firstArg + a) == r) { reads = true; } }
+            if (!reads) { continue; }
+            if (at >= 0 || j < k) { return -1; }
+            at = j;
+        }
+        if (at < 0) { return -1; }
+        add: Instr = self.srBody.get(at);
+        if (add.op != self.srOp || add.dst != self.srAcc || add.a != self.srAcc || add.bIsImm || add.b != r) { return -1; }
+        for j in k + 1..at {
+            o: IROp = self.srBody[j].op;
+            if (o == IROp.Nop) { continue; }
+            if (o == IROp.Label || isBranch(o) || self.srBody[j].dst == self.srAcc || self.srBody[j].a == self.srAcc
+                || (!self.srBody[j].bIsImm && self.srBody[j].b == self.srAcc) || self.srBody[j].x == self.srAcc) { return -1; }
+        }
+        return at;
     }
 
     // ─── self tail calls ─────────────────────────────────────────────────────
@@ -599,12 +1011,18 @@ methods Relayout {
         self.loopy.clear();
         self.cfMemo.clear();
         self.cfLoop.clear();
+        self.ptAt.clear();
+        self.ptMarks.clear();
+        self.ptPeak.clear();
+        self.ptCaller = -1;
         for f in 0..p.funcs.len() {
             self.fnOf.put((p.funcs.get(f).name) as long, f);
             self.orig.push(p.funcs.get(f));
             self.sites.push(0);
             self.seeds.push(self.seedCount(p, p.funcs.get(f)));
             self.loopy.push(-1);
+            self.ptAt.push(-2);
+            self.ptPeak.push(0);
             for k in 0..MAX_INLINE_DEPTH * 2 { self.cfMemo.push(CF_UNKNOWN); self.cfLoop.push(false); }
         }
         // Every call naming a function, and every place its address is taken (a copy of the body
@@ -616,6 +1034,25 @@ methods Relayout {
                 if ((in.op != IROp.Call && in.op != IROp.FnAddr) || in.name == NO_SYM) { continue; }
                 hit: Option<long> = self.fnOf.find(in.name as long);
                 match hit { Some(g) { self.sites.set(g, self.sites.get(g) + 1); } None { } }
+            }
+        }
+        // What writes each temp, for weighing a body by its constant arguments. An `asm` block's
+        // outputs are not a `dst`, so each counts as a second writer.
+        self.defIx.clear();
+        if (!gFoldInlineOff) {
+            self.defIx.reserve(p.tempKinds.len());
+            for t in 0..p.tempKinds.len() { self.defIx.push(-1); }
+            for ix in 0..p.code.len() {
+                d: Temp = p.code[ix].dst;
+                if (d != NO_TEMP && d < self.defIx.len()) {
+                    if (self.defIx.get(d) == -1) { self.defIx.set(d, ix); } else { self.defIx.set(d, -2); }
+                }
+                if (p.code[ix].op == IROp.Asm) {
+                    for k in 0..p.code[ix].pieceCount {
+                        v: Temp = p.asmVals.get(p.code[ix].firstPiece + k);
+                        if (v >= 0 && v < self.defIx.len()) { self.defIx.set(v, -2); }
+                    }
+                }
             }
         }
         for f in 0..p.funcs.len() {
@@ -1155,6 +1592,293 @@ methods Relayout {
         self.nGuards = self.nGuards + 1;
     }
 
+    // ─── a callee's head copied, the rest of it a call ───────────────────────
+
+    // The function a call in a loop goes to when only its head is to be copied (`partialPlan`),
+    // or -1: a body no other rule copies, not the caller's own, not one being copied around it.
+    partialTarget &self inout p:IRProgram in:Instr -> long {
+        if (gPartialInlineOff || in.noReturn) { return -1; }
+        g: long = self.calleeAt(in);
+        if (g < 0 || g == self.topCaller || self.canInline.get(g)) { return -1; }
+        for s in self.stack { if (s == g) { return -1; } }
+        if (self.partialPlan(p, g) < 0) { return -1; }
+        return g;
+    }
+
+    // Where body `g`'s head is marked in `ptMarks`, or -1 when it has none worth copying. The head
+    // is what a walk from the top reaches along branches forward, up to the first instruction that
+    // is not pure (a store, a call, a frame slot) or that a loop holds: there the copy leaves for a
+    // call of the whole function, which does the head's work again from the start. That is sound
+    // because nothing before it changed anything: the head only computes, reads memory and
+    // branches. It is worth copying when it holds a `return` (a short path that needs no call),
+    // leaves for the call somewhere, and fits `PARTIAL_MAX`. Pure instructions just before a point
+    // where the copy leaves are read only past it, so they are marked to be left out.
+    //
+    // `bytesEqual` is the shape: two lengths compared, then a loop of words for long slices, one
+    // pair of loads for 4 to 7 bytes, a loop of bytes for the rest. Its copy compares the lengths
+    // and the short slices in place, and calls only for the long and the very short ones.
+    partialPlan &self inout p:IRProgram g:long -> long {
+        got: long = self.ptAt.get(g);
+        if (got != -2) { return got; }
+        self.ptAt.set(g, -1);
+        fn: IRFunc = self.orig.get(g);
+        if (fn.isMain || fn.instrCount == 0) { return -1; }
+        n: long = fn.instrCount;
+        // Labels by place, and every instruction a loop holds (from a label to a branch back to it).
+        self.labelStamp = self.labelStamp + 1;
+        stamp: long = self.labelStamp << 32;
+        looped: Vec<long>;
+        for i in 0..n + 1 { looped.push(0); }
+        for i in 0..n {
+            in: Instr = p.code.get(fn.firstInstr + i);
+            if (in.op == IROp.Label) { self.labelAt.put(in.name as long, stamp + i); continue; }
+            if (!isBranch(in.op)) { continue; }
+            at: long = self.labelAt.getOr(in.name as long, 0);
+            if (at < stamp) { continue; }
+            looped.set(at - stamp, looped.get(at - stamp) + 1);
+            looped.set(i + 1, looped.get(i + 1) - 1);
+        }
+        run: long = 0;
+        for i in 0..n { run = run + looped.get(i); looped.set(i, run); }
+        // Forward targets, now that every label is known.
+        for i in 0..n {
+            in: Instr = p.code.get(fn.firstInstr + i);
+            if (in.op == IROp.Label) { self.labelAt.put(in.name as long, stamp + i); }
+        }
+        base: long = self.ptMarks.len();
+        for i in 0..n { self.ptMarks.push(PT_NONE); }
+        first: long = 0;
+        while (first < n && (p.code[fn.firstInstr + first].op == IROp.Nop
+               || (p.code[fn.firstInstr + first].op == IROp.Load && p.code[fn.firstInstr + first].paramSeed))) {
+            first = first + 1;
+        }
+        size: long = 0;
+        rets: long = 0;
+        exits: long = 0;
+        work: Vec<long>;
+        work.push(first);
+        while (work.len() > 0 && size <= PARTIAL_MAX) {
+            i: long = work.pop();
+            runFrom: long = i;      // the pure instructions since the last label or branch
+            going: bool = true;
+            while (going) {
+                if (i >= n) { exits = exits + 1; going = false; continue; }
+                if (self.ptMarks.get(base + i) == PT_COPY) { going = false; continue; }
+                in: Instr = p.code.get(fn.firstInstr + i);
+                if (looped.get(i) > 0 || !partialPure(in)) {
+                    // The copy leaves here; what was computed since the last label or branch is
+                    // read only past this point, so it is left out with it.
+                    exits = exits + 1;
+                    self.ptMarks.set(base + i, PT_EXIT);
+                    for k in runFrom..i {
+                        o: IROp = p.code[fn.firstInstr + k].op;
+                        if (self.ptMarks.get(base + k) == PT_COPY && o != IROp.Nop) {
+                            self.ptMarks.set(base + k, PT_EXIT);
+                            size = size - 1;
+                        }
+                    }
+                    going = false;
+                    continue;
+                }
+                self.ptMarks.set(base + i, PT_COPY);
+                o: IROp = in.op;
+                if (o == IROp.Nop) { i = i + 1; continue; }
+                if (o == IROp.Label) { runFrom = i + 1; i = i + 1; continue; }
+                if (o == IROp.Ret || o == IROp.RetVoid) { size = size + 1; rets = rets + 1; going = false; continue; }
+                size = size + 1;
+                if (isBranch(o)) {
+                    at: long = self.labelAt.getOr(in.name as long, 0);
+                    if (at < stamp) { size = PARTIAL_MAX + 1; going = false; continue; }
+                    work.push(at - stamp);
+                    if (o == IROp.Jmp) { going = false; continue; }
+                    runFrom = i + 1;
+                }
+                i = i + 1;
+            }
+        }
+        if (gTraceOpt) { eprintln("inline-head: {} size {} returns {} ways out {}", nameOf(fn.name), size, rets, exits); }
+        if (size > PARTIAL_MAX || rets == 0 || exits == 0) {
+            self.ptMarks.truncate(base);
+            return -1;
+        }
+        // The most head temps live at once, each from its first mention in the copy to its last.
+        temps: Vec<Temp>;
+        firstAt: Vec<long>;
+        lastAt: Vec<long>;
+        for i in 0..n {
+            if (self.ptMarks.get(base + i) != PT_COPY) { continue; }
+            in: Instr = p.code.get(fn.firstInstr + i);
+            for q in 0..3 {
+                t: Temp = in.dst;
+                if (q == 1) { t = in.a; }
+                if (q == 2) { t = in.b; if (in.bIsImm) { t = NO_TEMP; } }
+                if (t == NO_TEMP) { continue; }
+                at: long = -1;
+                for w in 0..temps.len() { if (temps.get(w) == t) { at = w; } }
+                if (at < 0) { temps.push(t); firstAt.push(i); lastAt.push(i); } else { lastAt.set(at, i); }
+            }
+        }
+        peak: long = 0;
+        for i in 0..n {
+            if (self.ptMarks.get(base + i) != PT_COPY) { continue; }
+            here: long = 0;
+            for w in 0..temps.len() { if (firstAt.get(w) <= i && lastAt.get(w) >= i) { here = here + 1; } }
+            if (here > peak) { peak = here; }
+        }
+        self.ptPeak.set(g, peak);
+        self.ptAt.set(g, base);
+        return base;
+    }
+
+    // `f(args)`, where `partialPlan` found f a head worth copying, becomes that head, copied here
+    // over the arguments, its returns giving the call's result, and every way out of it a jump to
+    // the call itself, kept after it:
+    //
+    //     <head: computes, reads, branches; each return: dst = v; jmp .PEn>
+    //     .PSn: dst = f(args)
+    //     .PEn:
+    spliceHead &self inout p:IRProgram g:long call:Instr via:long -> void {
+        fn: IRFunc = self.orig.get(g);
+        base: long = self.ptAt.get(g);
+        dst: Temp = self.callerTemp(p, call.dst, via);
+        outerSeq: long = self.curSeq;
+        outerLabel: long = self.curLabel;
+        self.spliceSeq = self.spliceSeq + 1;
+        self.labelSeq = self.labelSeq + 1;
+        self.curSeq = self.spliceSeq;
+        self.curLabel = self.labelSeq;
+        self.lmap.clear();
+        slow: Sym = madeName(".PS", self.labelSeq, "");
+        endL: Sym = madeName(".PE", self.labelSeq, "");
+        seen: long = 0;
+        // Whether the instruction just copied can run on into the next one.
+        open: bool = false;
+        for i in 0..fn.instrCount {
+            in: Instr = p.code.get(fn.firstInstr + i);
+            if (in.op == IROp.Nop) { continue; }
+            if (in.op == IROp.Load && in.paramSeed) {
+                argT: Temp = self.callerTemp(p, p.args.get(call.firstArg + seen), via);
+                seen = seen + 1;
+                if (!self.writesAgain(p, fn, in.dst, i)) {
+                    self.smap.set(in.dst, argT);
+                    self.smapGen.set(in.dst, self.curSeq);
+                } else {
+                    mv: Instr = instr(IROp.Mov);
+                    mv.dst = self.spliceTemp(p, in.dst);
+                    mv.a = argT;
+                    mv.kind = in.kind;
+                    mv.structName = in.structName;
+                    self.code.push(mv);
+                }
+                open = true;
+                continue;
+            }
+            if (self.ptMarks.get(base + i) != PT_COPY) {
+                if (open) { self.pushJump(slow); }
+                open = false;
+                continue;
+            }
+            if (in.op == IROp.Ret) {
+                if (dst != NO_TEMP) {
+                    mv: Instr = instr(IROp.Mov);
+                    mv.dst = dst;
+                    mv.a = self.spliceTemp(p, in.a);
+                    mv.kind = in.kind;
+                    mv.structName = in.structName;
+                    self.code.push(mv);
+                }
+                self.pushJump(endL);
+                open = false;
+                continue;
+            }
+            if (in.op == IROp.RetVoid) { self.pushJump(endL); open = false; continue; }
+            if (isBranch(in.op) && !self.headLabel(p, fn, base, in.name)) {
+                j: Instr = in;
+                j.a = self.spliceTemp(p, in.a);
+                if (!in.bIsImm) { j.b = self.spliceTemp(p, in.b); }
+                j.name = slow;
+                self.code.push(j);
+                open = in.op != IROp.Jmp;
+                continue;
+            }
+            self.spliceInstr(p, in);
+            open = in.op != IROp.Jmp;
+        }
+        if (open) { self.pushJump(slow); }
+        self.curSeq = outerSeq;
+        self.curLabel = outerLabel;
+        self.lmap.clear();
+        lb: Instr = instr(IROp.Label);
+        lb.name = slow;
+        self.code.push(lb);
+        if (via == 0) { self.copyInstr(p, call); } else { self.spliceInstr(p, call); }
+        le: Instr = instr(IROp.Label);
+        le.name = endL;
+        self.code.push(le);
+        self.nPartial = self.nPartial + 1;
+    }
+
+    // Whether a head with `peak` temps live at once fits beside what caller `f` holds at its old
+    // instruction `k` (`liveAt`): within the registers the allocator hands out. A head that pushes
+    // the loop's own values to the frame costs the loop more than the call it saves.
+    headFits &self inout p:IRProgram f:long k:long peak:long -> bool {
+        return self.liveAt(p, f, k) + peak <= PARTIAL_REGS;
+    }
+
+    // About how many of caller `f`'s values are live at its old instruction `k`: mentioned before
+    // it and after it, or before the innermost loop holding it and inside or past that loop (live
+    // round the loop). Read off the linear order, so an estimate.
+    liveAt &self inout p:IRProgram f:long k:long -> long {
+        fn: IRFunc = self.orig.get(f);
+        if (self.ptCaller != f) {
+            self.ptCaller = f;
+            self.ptFirst.clear(); self.ptLast.clear(); self.ptLoopH.clear(); self.ptLoopJ.clear();
+            for t in fn.firstTemp..fn.tempCount { self.ptFirst.push(-1); self.ptLast.push(-1); }
+            self.labelStamp = self.labelStamp + 1;
+            stamp: long = self.labelStamp << 32;
+            for i in 0..fn.instrCount {
+                in: Instr = p.code.get(fn.firstInstr + i);
+                self.ptNote(fn, in.dst, i);
+                self.ptNote(fn, in.a, i);
+                if (!in.bIsImm) { self.ptNote(fn, in.b, i); }
+                for q in 0..in.argCount { self.ptNote(fn, p.args.get(in.firstArg + q), i); }
+                for q in 0..in.pieceCount { self.ptNote(fn, p.asmVals.get(in.firstPiece + q), i); }
+                if (in.op == IROp.Label) { self.labelAt.put(in.name as long, stamp + i); }
+                else if (isBranch(in.op)) {
+                    at: long = self.labelAt.getOr(in.name as long, 0);
+                    if (at >= stamp) { self.ptLoopH.push(at - stamp); self.ptLoopJ.push(i); }
+                }
+            }
+        }
+        h: long = -1;
+        for q in 0..self.ptLoopH.len() {
+            if (self.ptLoopH.get(q) <= k && self.ptLoopJ.get(q) >= k && self.ptLoopH.get(q) > h) { h = self.ptLoopH.get(q); }
+        }
+        live: long = 0;
+        for r in 0..self.ptFirst.len() {
+            fd: long = self.ptFirst.get(r);
+            lu: long = self.ptLast.get(r);
+            if (fd < 0 || fd >= k) { continue; }
+            if (lu > k || (h >= 0 && fd < h && lu >= h)) { live = live + 1; }
+        }
+        return live;
+    }
+    ptNote &self fn:IRFunc t:Temp i:long -> void {
+        if (t == NO_TEMP || t < fn.firstTemp || t >= fn.tempCount) { return; }
+        r: long = t - fn.firstTemp;
+        if (self.ptFirst.get(r) < 0) { self.ptFirst.set(r, i); }
+        self.ptLast.set(r, i);
+    }
+
+    // Whether label `l` of body `fn` is one its copied head keeps (else a branch to it leaves).
+    headLabel &self inout p:IRProgram fn:IRFunc base:long l:Sym -> bool {
+        for i in 0..fn.instrCount {
+            in: Instr = p.code.get(fn.firstInstr + i);
+            if (in.op == IROp.Label && in.name == l) { return self.ptMarks.get(base + i) == PT_COPY; }
+        }
+        return false;
+    }
+
     // ─── copying one body into its caller ────────────────────────────────────
 
     // The callee's instructions, with its temps freshened, its labels renamed, its parameters
@@ -1174,11 +1898,19 @@ methods Relayout {
         self.curLabel = self.labelSeq;
         self.lmap.clear();
         self.stack.push(at);
+        self.ctxIx.push(self.callIx);
         self.nSites = self.nSites + 1;
         endL: Sym = madeName(".IE", self.curLabel, "");
         depth0: long = self.curDepth;
         bodyDepths: Vec<long>;
         if (!gLoopInlineOff && self.loopyOf(p, at)) { self.loopDepths(p, fn, &bodyDepths); }
+        // A body weighed at this very call by what its constants leave of it is copied as that:
+        // what no path reaches left out, and each branch they decide made a jump or dropped.
+        plan: Vec<long>;
+        if (self.fdFor == at && self.fdCall == self.callIx) {
+            for k in 0..self.fdPlan.len() { plan.push(self.fdPlan.get(k)); }
+            self.fdFor = -1;
+        }
 
         seen: long = 0;
         i: long = 0;
@@ -1186,6 +1918,14 @@ methods Relayout {
             in: Instr = p.code.get(fn.firstInstr + i);
             i = i + 1;
             if (in.op == IROp.Nop) { continue; }
+            if (plan.len() > 0) {
+                if (plan.get(i - 1) == FD_DROP) { continue; }
+                if (plan.get(i - 1) == FD_JUMP) {
+                    j: Instr = instr(IROp.Jmp);
+                    j.name = in.name;
+                    in = j;
+                }
+            }
             // A parameter arrives as a value here rather than in a register, so its seed becomes
             // a copy out of the argument. The caller's argument temps are its own, and go through
             // the caller's map.
@@ -1245,6 +1985,7 @@ methods Relayout {
             }
             // A call in the copied body is copied in turn, where the original caller's would be.
             if (in.op == IROp.Call && self.stack.len() < MAX_INLINE_DEPTH) {
+                self.callIx = fn.firstInstr + i - 1;
                 // How many loops hold it: those around this splice, and the body's own.
                 here: long = depth0;
                 if (bodyDepths.len() > 0) { here = depth0 + bodyDepths.get(i - 1); }
@@ -1267,6 +2008,12 @@ methods Relayout {
                 // the callee is copied as a call to it would be.
                 if (inner >= 0 && (self.code.len() - self.spliceStart) + self.sizes.get(inner) > self.nestBudget
                     && !(self.forwards.get(at) && self.sizes.get(inner) <= MAX_INLINE_INSTRS)) { inner = -1; }
+                // A body the constants it is handed leave small is copied whatever the budget:
+                // what it brings is about what the call took.
+                if (inner < 0 && !self.forceNest) {
+                    if (here > 0) { inner = self.foldTarget(p, self.topCaller, in); }
+                    if (inner >= 0 && towardNever(p, fn, i - 1)) { inner = -1; }
+                }
                 if (inner >= 0) {
                     self.curDepth = here;
                     self.splice(p, inner, in, self.curSeq);
@@ -1302,12 +2049,23 @@ methods Relayout {
                 self.spliceGuard(p, self.guardTarget(p, in), in, self.curSeq);
                 continue;
             }
+            // In a loop, a callee's head that returns by a short path (`partialPlan`).
+            if (in.op == IROp.Call && self.partialTarget(p, in) >= 0) {
+                held: long = depth0;
+                if (bodyDepths.len() > 0) { held = depth0 + bodyDepths.get(i - 1); }
+                if (held > 0 && !towardNever(p, fn, i - 1) && self.ptSiteF >= 0
+                    && self.headFits(p, self.ptSiteF, self.ptSiteK, self.ptPeak.get(self.partialTarget(p, in)))) {
+                    self.spliceHead(p, self.partialTarget(p, in), in, self.curSeq);
+                    continue;
+                }
+            }
             self.spliceInstr(p, in);
         }
         end: Instr = instr(IROp.Label);
         end.name = endL;
         self.code.push(end);
         self.stack.pop();
+        self.ctxIx.pop();
         self.aggName.truncate(aggBase);
         self.aggTemp.truncate(aggBase);
         self.aggSeq.truncate(aggBase);
@@ -1356,6 +2114,353 @@ methods Relayout {
         if (at < 0) { return -1; }
         for s in self.stack { if (s == at) { return -1; } }
         return at;
+    }
+
+    // ─── a body weighed by what its constant arguments leave of it ──────────
+
+    // Where a call that hands its callee a constant should be copied from, or -1. The callee is
+    // weighed as LLVM's inliner weighs one: by the instructions left reachable and not folded once
+    // its parameters hold what this call passes (`foldedSize`). `bytesEqual(s[..4], "key=")`
+    // leaves its four-byte test and nothing of its two loops. The constants must decide at least
+    // one of its branches, or the copy saves nothing a whole-size copy would not.
+    foldTarget &self inout p:IRProgram caller:long in:Instr -> long {
+        self.fdFor = -1;
+        if (gFoldInlineOff || in.op != IROp.Call || in.noReturn || self.defIx.len() == 0) { return -1; }
+        g: long = self.calleeAt(in);
+        if (g < 0 || g == caller) { return -1; }
+        for s in self.stack { if (s == g) { return -1; } }
+        // Nothing on the way to a panic: a body copied there saves a call that runs once.
+        for c in self.ctxIx { if (p.code[c].noReturn) { return -1; } }
+        // A body small enough to copy whole is left to the rules for those, which weigh what each
+        // copy brings into the copies around it.
+        sz: long = self.sizes.get(g);
+        if (self.canInline.get(g) || sz < 0 || sz > FOLD_MAX_INSTRS || self.stack.len() + 1 >= MAX_INLINE_DEPTH) { return -1; }
+        if (!self.constArg(p, in)) { return -1; }
+        c: long = self.foldedSize(p, g);
+        if (c < 0 || c > MAX_INLINE_INSTRS) { self.fdFor = -1; return -1; }
+        self.fdCall = self.callIx;
+        self.nFolded = self.nFolded + 1;
+        return g;
+    }
+
+    // The body at nesting level `lvl`: 0 is the function being copied, k the k-th splice in it.
+    levelFirst &self lvl:long -> long {
+        if (lvl == 0) { return self.orig.get(self.topCaller).firstInstr; }
+        return self.orig.get(self.stack.get(lvl - 1)).firstInstr;
+    }
+
+    // Which parameter the seed at `d` (in the body at level `lvl`) is: how many seeds come before it.
+    seedIndex &self inout p:IRProgram d:long lvl:long -> long {
+        j: long = 0;
+        for ix in self.levelFirst(lvl)..d {
+            if (p.code[ix].op == IROp.Load && p.code[ix].paramSeed) { j = j + 1; }
+        }
+        return j;
+    }
+
+    // The argument the seed at `d` was bound to, a temp of the body one level out, or NO_TEMP.
+    seedArg &self inout p:IRProgram d:long lvl:long -> Temp {
+        if (lvl == 0) { return NO_TEMP; }
+        j: long = self.seedIndex(p, d, lvl);
+        cix: long = self.ctxIx.get(lvl - 1);
+        if (j >= p.code[cix].argCount) { return NO_TEMP; }
+        return p.args.get(p.code[cix].firstArg + j);
+    }
+
+    // Whether some argument of `in` is, through copies, views and the parameters of the bodies
+    // being copied, a constant, a string literal's pair or a scratch slot the caller filled.
+    constArg &self inout p:IRProgram in:Instr -> bool {
+        for j in 0..in.argCount {
+            t: Temp = p.args.get(in.firstArg + j);
+            lvl: long = self.stack.len();
+            hops: long = 0;
+            while (hops < 12 && t >= 0 && t < self.defIx.len() && self.defIx.get(t) >= 0) {
+                d: long = self.defIx.get(t);
+                o: IROp = p.code[d].op;
+                if (o == IROp.Const || o == IROp.StrLitVal || o == IROp.AggSlot) { return true; }
+                if (o == IROp.Mov || addressConvert(p.code.get(d))) { t = p.code[d].a; }
+                else if (o == IROp.Load && p.code[d].paramSeed) { t = self.seedArg(p, d, lvl); lvl = lvl - 1; }
+                else { t = NO_TEMP; }
+                hops = hops + 1;
+            }
+        }
+        return false;
+    }
+
+    // How many instructions a copy of `g` at the call `callIx` keeps once its parameters hold what
+    // the call passes: a branch those values decide costs nothing and its other side is not
+    // reached, an instruction whose value they decide folds to a constant, and a view conversion
+    // is a move. -1 when a loop stays reachable or nothing is decided. The walk is linear, over
+    // at most `FOLD_MAX_INSTRS` instructions, and each value is traced at most a dozen steps.
+    foldedSize &self inout p:IRProgram g:long -> long {
+        fn: IRFunc = self.orig.get(g);
+        self.stack.push(g);
+        self.ctxIx.push(self.callIx);
+        self.fvVal.clear();
+        self.fvHas.clear();
+        lvl: long = self.stack.len();
+        self.labelStamp = self.labelStamp + 1;
+        stamp: long = self.labelStamp << 32;
+        cost: long = 0;
+        decided: long = 0;
+        live: bool = true;
+        bad: bool = false;
+        // What the copy of each instruction becomes (`fdPlan`): FD_COPY, FD_DROP (no path reaches
+        // it, or a branch that is never taken) or FD_JUMP (a branch always taken).
+        self.fdPlan.clear();
+        for k in 0..fn.instrCount { self.fdPlan.push(FD_DROP); }
+        i: long = 0;
+        while (i < fn.instrCount && !bad && cost <= MAX_INLINE_INSTRS) {
+            ix: long = fn.firstInstr + i;
+            i = i + 1;
+            o: IROp = p.code[ix].op;
+            if (o == IROp.Nop) { continue; }
+            if (o == IROp.Label) {
+                // Reached by a branch from a reachable place: live again. Passed: a branch to it
+                // from here on goes back, which is a loop.
+                if (self.labelAt.getOr(p.code[ix].name as long, 0) == stamp + 1) { live = true; }
+                self.labelAt.put(p.code[ix].name as long, stamp + 2);
+                if (live) { self.fdPlan.set(i - 1, FD_COPY); }
+                continue;
+            }
+            if (!live) { continue; }
+            self.fdPlan.set(i - 1, FD_COPY);
+            if (o == IROp.Load && p.code[ix].paramSeed) { continue; }
+            if (o == IROp.Jmp) {
+                if (self.foldReach(p.code[ix].name, stamp)) { bad = true; }
+                live = false;
+                continue;
+            }
+            if (o == IROp.Jcc || o == IROp.Jz) {
+                k: long = self.branchFold(p, ix, lvl);
+                if (k == 0) { decided = decided + 1; self.fdPlan.set(i - 1, FD_DROP); continue; }
+                if (k == 1) { decided = decided + 1; live = false; self.fdPlan.set(i - 1, FD_JUMP); }
+                else { cost = cost + 1; }
+                if (self.foldReach(p.code[ix].name, stamp)) { bad = true; }
+                continue;
+            }
+            if (o == IROp.Ret || o == IROp.RetVoid) { cost = cost + 1; live = false; continue; }
+            if (addressConvert(p.code.get(ix))) { continue; }
+            d: Temp = p.code[ix].dst;
+            if (d != NO_TEMP && o != IROp.Call && self.foldVal(p, d, lvl, 0)) { continue; }
+            cost = cost + 1;
+        }
+        self.stack.pop();
+        self.ctxIx.pop();
+        if (bad || decided == 0 || i < fn.instrCount) { return -1; }
+        self.fdFor = g;
+        return cost;
+    }
+
+    // A branch to `name` in the walk stamped `stamp`: true when it goes back to a label already
+    // passed, else the label is noted as reached.
+    foldReach &self name:Sym stamp:long -> bool {
+        st: long = self.labelAt.getOr(name as long, 0);
+        if (st == stamp + 2) { return true; }
+        self.labelAt.put(name as long, stamp + 1);
+        return false;
+    }
+
+    // Whether the branch at `ix` is decided: 1 taken, 0 not, -1 not known.
+    branchFold &self inout p:IRProgram ix:long lvl:long -> long {
+        k: Lit = p.code[ix].kind;
+        if (isFloat(k)) { return -1; }
+        if (!self.foldVal(p, p.code[ix].a, lvl, 0)) { return -1; }
+        va: long = self.cv;
+        if (p.code[ix].op == IROp.Jz) {
+            if (va == 0) { return 1; }
+            return 0;
+        }
+        vb: long = p.code[ix].bImm;
+        if (!p.code[ix].bIsImm) {
+            if (!self.foldVal(p, p.code[ix].b, lvl, 0)) { return -1; }
+            vb = self.cv;
+        }
+        if (compareHolds(p.code[ix].cmpOp, va, vb, kindUnsigned(k))) { return 1; }
+        return 0;
+    }
+
+    // The value `t` holds, into `cv`, when it is known whatever path led there: a constant
+    // through temps written once, the parameters of the bodies being copied (`lvl` is the body
+    // `t` belongs to), integer arithmetic at its type's width, a string literal's length and
+    // what the caller stored into a scratch slot it passes. The copy at this call leaves out
+    // what these values say no path reaches, so each step holds for every execution.
+    // Each temp's answer is kept for the rest of the walk (`fvVal`, `fvHas`), since a body's
+    // values share their operands and would otherwise be traced again from every reader.
+    foldVal &self inout p:IRProgram t:Temp lvl:long depth:long -> bool {
+        if (depth > 12 || t < 0 || t >= self.defIx.len()) { return false; }
+        key: long = t * 8 + lvl;
+        has: Option<bool> = self.fvHas.find(key);
+        match has {
+            Some(k) {
+                if (!k) { return false; }
+                self.cv = self.fvVal.getOr(key, 0);
+                return true;
+            }
+            None { }
+        }
+        ok: bool = self.foldValOf(p, t, lvl, depth);
+        self.fvHas.put(key, ok);
+        if (ok) { self.fvVal.put(key, self.cv); }
+        return ok;
+    }
+
+    foldValOf &self inout p:IRProgram t:Temp lvl:long depth:long -> bool {
+        d: long = self.defIx.get(t);
+        if (d < 0) { return false; }
+        o: IROp = p.code[d].op;
+        k: Lit = p.code[d].kind;
+        if (o == IROp.Const) { self.cv = p.code[d].imm; return true; }
+        if (o == IROp.Mov) { return self.foldVal(p, p.code[d].a, lvl, depth + 1); }
+        if (o == IROp.Load && p.code[d].paramSeed) {
+            if (lvl == 0) { return false; }
+            return self.foldVal(p, self.seedArg(p, d, lvl), lvl - 1, depth + 1);
+        }
+        if (o == IROp.PtrLoad && p.code[d].x == NO_TEMP && (k == Lit.Long || k == Lit.Ptr)) {
+            return self.foldField(p, p.code[d].a, p.code[d].imm, lvl, d, depth + 1);
+        }
+        if (isFloat(k)) { return false; }
+        if (!(o == IROp.Add || o == IROp.Sub || o == IROp.Mul || o == IROp.BAnd || o == IROp.BOr
+              || o == IROp.BXor || isCompare(o))) { return false; }
+        a: Temp = p.code[d].a;
+        // `a - (a - b)`, a view's length after its start (`s[s.len - n..]`), with `a` unknown.
+        if (o == IROp.Sub && kindWidth(k) == 8 && !p.code[d].bIsImm && p.code[d].b >= 0 && p.code[d].b < self.defIx.len()) {
+            e: long = self.defIx.get(p.code[d].b);
+            if (e >= 0 && p.code[e].op == IROp.Sub && kindWidth(p.code[e].kind) == 8 && self.sameValue(p, p.code[e].a, a)) {
+                if (p.code[e].bIsImm) { self.cv = p.code[e].bImm; return true; }
+                return self.foldVal(p, p.code[e].b, lvl, depth + 1);
+            }
+        }
+        if (!self.foldVal(p, a, lvl, depth + 1)) { return false; }
+        va: long = self.cv;
+        vb: long = p.code[d].bImm;
+        if (!p.code[d].bIsImm) {
+            if (!self.foldVal(p, p.code[d].b, lvl, depth + 1)) { return false; }
+            vb = self.cv;
+        }
+        if (isCompare(o)) {
+            self.cv = 0;
+            if (compareHolds(o, va, vb, kindUnsigned(k))) { self.cv = 1; }
+            return true;
+        }
+        r: long = 0;
+        if (o == IROp.Add) { r = va + vb; }
+        else if (o == IROp.Sub) { r = va - vb; }
+        else if (o == IROp.Mul) { r = va * vb; }
+        else if (o == IROp.BAnd) { r = va & vb; }
+        else if (o == IROp.BOr) { r = va | vb; }
+        else { r = va ^ vb; }
+        self.cv = canon(k, r);
+        return true;
+    }
+
+    // The eight bytes at `off` of the pair or slot address `a` points at, read at `at` (an index
+    // into the body at level `lvl`): a string literal's length, or what the store to that slot
+    // just before `at` wrote. Between the two there may be no label and nothing that could write
+    // memory but other stores to the same slot; and where the address came in as a parameter,
+    // nothing in that body before `at` either.
+    foldField &self inout p:IRProgram a0:Temp off:long lvl0:long at0:long depth:long -> bool {
+        a: Temp = a0;
+        lvl: long = lvl0;
+        at: long = at0;
+        hops: long = 0;
+        // A literal's pair is never written, wherever it was passed through. A slot is, so every
+        // body it came in through must have done nothing that could write memory first.
+        noisy: bool = false;
+        while (hops < 12) {
+            if (a < 0 || a >= self.defIx.len() || self.defIx.get(a) < 0) { return false; }
+            d: long = self.defIx.get(a);
+            o: IROp = p.code[d].op;
+            if (o == IROp.StrLitVal) {
+                if (off != 8) { return false; }
+                self.cv = literalLength(nameOf(p.strings.get(p.code[d].imm)));
+                return true;
+            }
+            if (o == IROp.AggSlot) {
+                if (noisy) { return false; }
+                first: long = self.levelFirst(lvl);
+                ix: long = at - 1;
+                while (ix >= first && ix >= at - 48) {
+                    q: IROp = p.code[ix].op;
+                    if (q == IROp.PtrStore && self.sameSlot(p, p.code[ix].a, p.code[d].imm)) {
+                        if (p.code[ix].x != NO_TEMP) { return false; }
+                        dist: long = p.code[ix].imm - off;
+                        if (dist == 0) {
+                            if (kindWidth(p.code[ix].kind) != 8) { return false; }
+                            if (p.code[ix].bIsImm) { self.cv = p.code[ix].bImm; return true; }
+                            return self.foldVal(p, p.code[ix].b, lvl, depth + 1);
+                        }
+                        if (dist > -8 && dist < 8) { return false; }
+                    }
+                    else if (q == IROp.Label || writesMemory(q)) { return false; }
+                    ix = ix - 1;
+                }
+                return false;
+            }
+            if (o == IROp.Mov || addressConvert(p.code.get(d))) { a = p.code[d].a; }
+            else if (o == IROp.Load && p.code[d].paramSeed) {
+                if (lvl == 0) { return false; }
+                if (!self.quietBefore(p, self.levelFirst(lvl), at)) { noisy = true; }
+                a = self.seedArg(p, d, lvl);
+                at = self.ctxIx.get(lvl - 1);
+                lvl = lvl - 1;
+            }
+            else { return false; }
+            hops = hops + 1;
+        }
+        return false;
+    }
+
+    // Whether nothing in `from..to` is a label or could write memory.
+    quietBefore &self inout p:IRProgram from:long to:long -> bool {
+        for ix in from..to {
+            if (p.code[ix].op == IROp.Label || writesMemory(p.code[ix].op)) { return false; }
+        }
+        return true;
+    }
+
+    // Whether `t` and `u` hold one value: one temp, through copies and views, or two reads of the
+    // same word through the same address with no label and nothing that could write memory
+    // between them (`s.len` read twice).
+    sameValue &self inout p:IRProgram t:Temp u:Temp -> bool {
+        if (t == u) { return true; }
+        x: Temp = self.viewRoot(p, t);
+        y: Temp = self.viewRoot(p, u);
+        if (x < 0 || y < 0 || x >= self.defIx.len() || y >= self.defIx.len()) { return false; }
+        dx: long = self.defIx.get(x);
+        dy: long = self.defIx.get(y);
+        if (dx < 0 || dy < 0) { return false; }
+        if (x == y) { return true; }
+        if (p.code[dx].op != IROp.PtrLoad || p.code[dy].op != IROp.PtrLoad) { return false; }
+        if (p.code[dx].x != NO_TEMP || p.code[dy].x != NO_TEMP || p.code[dx].imm != p.code[dy].imm) { return false; }
+        if (kindWidth(p.code[dx].kind) != kindWidth(p.code[dy].kind)) { return false; }
+        bx: Temp = self.viewRoot(p, p.code[dx].a);
+        if (bx != self.viewRoot(p, p.code[dy].a) || bx < 0 || bx >= self.defIx.len() || self.defIx.get(bx) < 0) { return false; }
+        lo: long = dx;
+        hi: long = dy;
+        if (lo > hi) { lo = dy; hi = dx; }
+        if (hi - lo > 64) { return false; }
+        return self.quietBefore(p, lo + 1, hi);
+    }
+
+    // What `t` copies, through copies and view conversions each the temp's one write.
+    viewRoot &self inout p:IRProgram t0:Temp -> Temp {
+        t: Temp = t0;
+        hops: long = 0;
+        while (hops < 8 && t >= 0 && t < self.defIx.len() && self.defIx.get(t) >= 0) {
+            d: long = self.defIx.get(t);
+            if (p.code[d].op != IROp.Mov && !addressConvert(p.code.get(d))) { return t; }
+            t = p.code[d].a;
+            hops = hops + 1;
+        }
+        return t;
+    }
+
+    // Whether address `t` is scratch slot #`slot`, written once.
+    sameSlot &self inout p:IRProgram t:Temp slot:long -> bool {
+        if (t < 0 || t >= self.defIx.len() || self.defIx.get(t) < 0) { return false; }
+        d: long = self.defIx.get(t);
+        return p.code[d].op == IROp.AggSlot && p.code[d].imm == slot;
     }
 
     // Whether the body writes `t` anywhere but at `seedAt`, the instruction that introduced it.

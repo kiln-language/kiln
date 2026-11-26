@@ -111,6 +111,14 @@ pub dumpInstr p:IRProgram inout out:String inout seen:HashMap<long, long> in:Ins
         out.pushStr("], ");
         temp(out, seen, p.args.get(in.firstArg));
     }
+    else if (in.op == IROp.Lea) {
+        out.pushStr(" [");
+        if (in.a != NO_TEMP) { temp(out, seen, in.a); out.pushStr(" + "); }
+        temp(out, seen, in.x);
+        if (in.scale > 1) { out.push('*'); out.pushLong(in.scale); }
+        if (in.imm != 0) { out.pushStr(" + "); out.pushLong(in.imm); }
+        out.push(']');
+    }
     else if (in.op == IROp.PtrLoad || in.op == IROp.PtrStore) {
         out.pushStr(" [");
         temp(out, seen, in.a);
@@ -146,7 +154,7 @@ local gIrOpNames: Vec<str> = irOpNames();
 local irOpNames -> Vec<str> {
     t: Vec<str>;
     i: long = 0;
-    while (i <= (IROp.MemCopy as long)) { t.push("?"); i = i + 1; }
+    while (i <= (IROp.Lea as long)) { t.push("?"); i = i + 1; }
     t.set(IROp.Const as long,        "const");
     t.set(IROp.Load as long,         "load");
     t.set(IROp.Store as long,        "store");
@@ -196,6 +204,7 @@ local irOpNames -> Vec<str> {
     t.set(IROp.FaultEdge as long,    "faultedge");
     t.set(IROp.Atomic as long,       "atomic");
     t.set(IROp.MemCopy as long,      "memcopy");
+    t.set(IROp.Lea as long,          "lea");
     return t;
 }
 

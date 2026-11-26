@@ -17,6 +17,9 @@ for f in $(find tests -name '*.k' ! -name '*_member.k' | grep -Eiv 'err|error' |
     fi
 done
 echo "corpus programs the LLVM path emits: $ok    refused: $bad"
-echo
-echo "what stops the rest:"
-sort /tmp/reasons.txt | uniq -c | sort -rn | head -12
+# The reasons are listed only when something was refused, or with VERBOSE=1.
+if [ "$bad" != 0 ] || [ "${VERBOSE:-0}" = 1 ]; then
+    echo
+    echo "what stops the rest:"
+    sort /tmp/reasons.txt | uniq -c | sort -rn | head -12
+fi

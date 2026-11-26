@@ -5,7 +5,7 @@
 // no symbol is defined in it. The metadata says what the package is and everything a dependent
 // needs in place of compiling it again. A text header, then a binary body:
 //
-//     kiln-klib 9                         the format, refused unless exact
+//     kiln-klib 10                        the format, refused unless exact
 //     package <name>   key <hex>          what was built, and from what (the content key)
 //     dep <name> <key>                    each direct dependency, and the key it was built against
 //     extra <path>                        a module read from below the package's root directory
@@ -42,7 +42,7 @@
 #include <codegen::{asm, irpack, effects}>
 #include <stdlib::{encode, file, textfile, chars, map, option, result, string, vec, hash128, sort}>
 
-pub KLIB_FORMAT: str = "kiln-klib 9";
+pub KLIB_FORMAT: str = "kiln-klib 10";
 pub KLIB_META: str = "kiln.meta";
 
 // The chunk tags. A reader skips a tag it does not know, so a later format can add one.
@@ -570,6 +570,8 @@ pub putFnFact inout out:Encoder fi:long -> void {
     f: FnFact = gOutFacts.fns.get(fi);
     f.divergent.encode(out);
     f.writes.encode(out);
+    f.views.encode(out);
+    f.keeps.encode(out);
     f.retKind.encode(out);
     f.retStruct.encode(out);
     out.putLen(f.paramCount);
@@ -580,6 +582,8 @@ pub putFnFact inout out:Encoder fi:long -> void {
 pub getFnFact inout d:Decoder -> long {
     div: bool = bool.decode(d);
     writes: long = d.getVarint();
+    views: long = d.getVarint();
+    keeps: long = d.getVarint();
     rk: Lit = Lit.decode(d);
     rs: Sym = Sym.decode(d);
     ps: Vec<ParamFact>;
@@ -588,7 +592,7 @@ pub getFnFact inout d:Decoder -> long {
     ds: Vec<DepFact>;
     n = d.getLen();
     for k in 0..n { ds.push(DepFact.decode(d)); }
-    return gFacts.addFn(FnFact { divergent: div, writes: writes, retKind: rk, retStruct: rs,
+    return gFacts.addFn(FnFact { divergent: div, writes: writes, views: views, keeps: keeps, retKind: rk, retStruct: rs,
                                  firstParam: 0, paramCount: 0, firstDep: 0, depCount: 0 }, ps, ds);
 }
 

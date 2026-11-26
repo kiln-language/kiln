@@ -652,3 +652,36 @@ asm_out_undeclared_err	cannot find value `zz` in this scope
 restrict_kept	0
 restrict_mask	0
 restrict_result	0
+fold_inline	0
+self_inline	0
+fuse_loops	0
+reg_hints	0
+spill_bounds	77
+spill_reenter	134
+spill_sig_err	wrong signature for the `@spill` function `keep`
+spill_twice_err	two functions are marked `@spill`
+spill_aligned	70
+view_ok	42
+view_return_err	cannot return a view into `v` from `leak`
+view_return_str_err	cannot return a view into `v` from `leak`
+view_return_temp_err	cannot return a view into a temporary from `leak`
+view_global_err	cannot store a view of `s` in the global `gstr`
+view_global_trait_err	cannot store a view into a temporary in the global `gw`
+view_global_init_err	cannot initialize the global `bad` with a view into a temporary
+view_keep_param_err	cannot store a view into `v` in `self.s`
+view_keep_local_err	cannot store a view into `buf` in `out`
+view_hold_push_err	cannot change `v` while `s` views it
+view_hold_clear_err	cannot change `names[..]` while `s` views it
+view_hold_field_err	cannot change `v` while `h` views it
+view_hold_call_err	cannot change `v` while `s` views it
+view_hold_vec_err	cannot change `v` while `names` views it
+view_hold_scope_err	cannot release `v` while `s` views it
+view_hold_same_call_err	cannot change `v` while `s` views it
+view_hold_elem_err	cannot change `v` while `s` views it
+view_unsafe_ok	42
+partial_inline	0
+lea_sums	0
+pull_result	79
+spill_scratch	0
+promote_lent	0
+promote_lent_recover	0

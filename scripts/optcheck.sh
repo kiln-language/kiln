@@ -18,15 +18,18 @@
 #     // asm-count: <function> <text> <n> exactly n of its lines contain <text>
 #     // asm-first: <function> <text>     its first instruction contains <text>
 #
-# and must also build and exit 0. Run from the repository root; pass the compiler as $1.
+# and must also build and exit 0. A `// flags:` line gives switches to compile it with. Run from the repository root; pass the compiler as $1.
 C=${1:-build/gen1}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 pass=0; fail=0
 for f in selftests/opt/*.k; do
     name=$(basename "$f" .k)
-    if ! "$C" "$f" --emit=ir > "$T/ir" 2>&1; then echo "  $name: --emit=ir failed"; fail=$((fail+1)); continue; fi
+    # A test may name switches it is compiled with (`// flags: --no-self-inline`), to hold one
+    # optimization to its shape without another reshaping the same function.
+    fl=$(sed -n 's#^// flags: ##p' "$f" | head -1)
+    if ! "$C" "$f" --emit=ir $fl > "$T/ir" 2>&1; then echo "  $name: --emit=ir failed"; fail=$((fail+1)); continue; fi
     rm -f "$T/t.s"
-    "$C" "$f" -o "$T/t.s" >/dev/null 2>&1
+    "$C" "$f" -o "$T/t.s" $fl >/dev/null 2>&1
     ok=1
     while IFS= read -r line; do
         akind=$(echo "$line" | sed -n -E 's#^// asm-(has|lacks|count|first):.*#\1#p')

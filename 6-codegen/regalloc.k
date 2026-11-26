@@ -8,7 +8,7 @@
 // its text may change), a callee-saved one, or a caller-saved one with a home in the frame that it
 // is read back from after each call that changes it (`homed`); or the frame.
 #include <{cfg, ir}>
-#include <parse::upstream>
+#include <parse::{registry, types, upstream}>
 #include <support::compiler>
 #include <stdlib::{map, option, vec}>
 
@@ -32,6 +32,16 @@ pub var gIpraOff: bool = false;
 // `--ipra-asm-full`: a function holding an `asm` block may change every caller-saved register,
 // whatever its lines say (asm.k, `finishMask`).
 pub var gIpraAsmFull: bool = false;
+// `--no-hints`: a range takes the first register free for it, never the one its parameter
+// arrives in, a call's argument leaves in or a shift reads its count from (`hint`).
+pub var gHintsOff: bool = false;
+// `--no-result-rax`: a returned constant gets a register and is copied into `rax` from there,
+// and a comparison is never written straight into `rax` (`markArgOnly`, `raxWriter`).
+pub var gResultRaxOff: bool = false;
+// `--no-spill-scratch`: a short-lived temp the scan left in the frame stays there, rather than
+// living in `rax` or `rdx` from its write to its read (`spillScratch`), and a shift by a constant
+// is not one of the instructions that may write or read the value `rax` holds (`raxWriter`).
+pub var gSpillScratchOff: bool = false;
 
 // The physical register numbering the whole back end works in, named here because this is the
 // module `asm.k` includes rather than the other way round. `regNames` in asm.k spells these by
@@ -187,7 +197,19 @@ pub struct RegAlloc {
     anyForeign: bool,               // a call through a pointer may reach foreign code (`clobbersXmm`)
     // What each function already written may change (its name -> a set as MASK_FULL is), filled
     // in by the emitter as it finishes each (`siteMask`).
-    fnMask: HashMap<long, long>
+    fnMask: HashMap<long, long>,
+    // Per temp: the register it would rather have (`hint`), -1 for none, and what having it
+    // saves, weighted as `weight` is. A call's argument is a candidate until its range is known
+    // to end at that call (`candT`, `candR`, `candW`, `candI`: the temp, the register, the weight
+    // and the call's index).
+    hintReg: Vec<long>, hintW: Vec<long>,
+    candT: Vec<long>, candR: Vec<long>, candW: Vec<long>, candI: Vec<long>,
+    // The hinted ranges by register, in the order the scan meets them (`markHints`): register r's
+    // run starts at `hintFirst[r]` and holds `hintCount[r]`, each a start (`hintS`) and a temp
+    // (`hintT`); `hintAt[r]` is the first the scan has not yet passed. `hintMax` is the table of
+    // the heaviest in each stretch, level by level, `hintTotal` entries a level.
+    hintFirst: Vec<long>, hintCount: Vec<long>, hintAt: Vec<long>,
+    hintS: Vec<long>, hintT: Vec<long>, hintMax: Vec<long>, hintTotal: long
 }
 
 methods RegAlloc for Default {
@@ -195,7 +217,10 @@ methods RegAlloc for Default {
         return RegAlloc { tempReg: vec![], base: 0, usedCallee: vec![], intervals: vec![], active: vec![],
                           freeRegs: vec![], endOf: vec![], startOf: vec![], xmmOk: vec![], rematKind: vec![], rematDef: vec![], argOnly: vec![],
                           fused: vec![], fusedAt: vec![], inFrame: vec![], across: vec![], xAcross: vec![], homed: vec![], crossFirst: vec![], crossCount: vec![], crossList: vec![], crossStore: vec![], defW: vec![], crossW: vec![],
-                          foreign: map![], foreignN: -1, anyForeign: true, fnMask: map![] };
+                          foreign: map![], foreignN: -1, anyForeign: true, fnMask: map![],
+                          hintReg: vec![], hintW: vec![], candT: vec![], candR: vec![], candW: vec![], candI: vec![],
+                          hintFirst: vec![], hintCount: vec![], hintAt: vec![],
+                          hintS: vec![], hintT: vec![], hintMax: vec![], hintTotal: 0 };
     }
 }
 
@@ -220,6 +245,7 @@ methods RegAlloc {
         self.markRaxPairs(p, fn);
         self.markArgOnly(p, fn);
         self.markFused(p, fn);
+        self.markHints(fn);
 
         self.freeRegs.clear();
         for i in 0..REG_SLOTS { self.freeRegs.push(false); }
@@ -233,14 +259,172 @@ methods RegAlloc {
             if (self.tempReg.get(cur.temp) == REG_RAX || self.argOnly.get(cur.temp) || self.fused.get(cur.temp)) { continue; }
             self.expireBefore(cur.start);
             if (self.takeOperandReg(p, fn, cur)) { continue; }
-            reg: long = self.pickRegister(cur, self.handedOn(p, fn, cur));
+            later: long = self.handedOn(p, fn, cur);
+            reg: long = self.hintFor(cur, later);
+            if (reg == SPILLED) { reg = self.pickAvoiding(p, fn, cur, later); }
             if (reg != SPILLED) { self.assign(cur, reg); }
             else { self.spillAround(cur); }
         }
         if (!gSecondChanceOff) { self.secondChance(fn); }
+        if (!gSpillScratchOff) { self.spillScratch(p, fn); }
         if (self.reachesForeign(p, fn)) {
             for x in REG_XMM12..REG_SLOTS { self.usedCallee.set(x, true); }
         }
+    }
+
+    // The ranges with a hint (`computeIntervals` gives them: see `hint`), listed by register in
+    // the order the scan meets them, so that a range can leave a register free for one still to
+    // come that wants it (`pickAvoiding`). Over each register's run, a table of the heaviest
+    // weight in each run of 2^l entries answers "what does the heaviest range starting between
+    // here and there save?" in two lookups (`wantedBy`).
+    markHints &self fn:IRFunc -> void {
+        self.hintFirst.clear();
+        self.hintCount.clear();
+        self.hintAt.clear();
+        self.hintS.clear();
+        self.hintT.clear();
+        self.hintMax.clear();
+        for r in 0..REG_SLOTS { self.hintFirst.push(0); self.hintCount.push(0); self.hintAt.push(0); }
+        self.hintTotal = 0;
+        if (gHintsOff) { return; }
+        m: long = self.intervals.len();
+        for k in 0..m {
+            iv: Interval = self.intervals.get(k);
+            r: long = self.hintReg.get(iv.temp);
+            if (r < 0 || !self.mayHint(fn, iv.temp)) { continue; }
+            self.hintCount.set(r, self.hintCount.get(r) + 1);
+        }
+        at: long = 0;
+        longest: long = 0;
+        for r in 0..REG_SLOTS {
+            self.hintFirst.set(r, at);
+            self.hintAt.set(r, at);
+            at = at + self.hintCount.get(r);
+            if (self.hintCount.get(r) > longest) { longest = self.hintCount.get(r); }
+            self.hintCount.set(r, 0);
+        }
+        self.hintTotal = at;
+        if (at == 0) { return; }
+        for k in 0..at { self.hintS.push(0); self.hintT.push(0); self.hintMax.push(0); }
+        for k in 0..m {
+            iv: Interval = self.intervals.get(k);
+            r: long = self.hintReg.get(iv.temp);
+            if (r < 0 || !self.mayHint(fn, iv.temp)) { continue; }
+            j: long = self.hintFirst.get(r) + self.hintCount.get(r);
+            self.hintS.set(j, iv.start);
+            self.hintT.set(j, iv.temp);
+            self.hintMax.set(j, self.hintW.get(iv.temp));
+            self.hintCount.set(r, self.hintCount.get(r) + 1);
+        }
+        // Level l holds, at k, the heaviest of entries k to k + 2^l - 1. Past the end of a run it
+        // mixes in the next run's, but a lookup never reaches past its own run.
+        width: long = 1;
+        prev: long = 0;
+        while (2 * width <= longest) {
+            for k in 0..at {
+                v: long = self.hintMax.get(prev + k);
+                if (k + width < at && self.hintMax.get(prev + k + width) > v) { v = self.hintMax.get(prev + k + width); }
+                self.hintMax.push(v);
+            }
+            prev = prev + at;
+            width = 2 * width;
+        }
+    }
+
+    // `t` (the program's numbering) would rather be in `r`, which saves `w`; the heaviest wins.
+    // `rax` and `rdx` are the emitter's scratch and never anyone's.
+    hint &self t:Temp r:long w:long -> void {
+        x: long = t - self.base;
+        if (t == NO_TEMP || x < 0 || x >= self.hintReg.len()) { return; }
+        if (r == REG_RAX || r == REG_RDX || r < 0 || r >= INT_ARG_REGS) { return; }
+        if (w > self.hintW.get(x)) {
+            self.hintReg.set(x, r);
+            self.hintW.set(x, w);
+        }
+    }
+
+    // Whether the scan gives `x` (this function's numbering) a register at all.
+    mayHint &self fn:IRFunc x:long -> bool {
+        if (fn.holdsRecover && self.inFrame.get(x)) { return false; }
+        return self.tempReg.get(x) != REG_RAX && !self.argOnly.get(x) && !self.fused.get(x);
+    }
+
+    // What the heaviest range that wants `r` and starts within `cur` (from its start to its end)
+    // would save by having it, 0 for none. The scan meets ranges by start, so each register's run
+    // is passed once from the front.
+    wantedBy &self r:long cur:Interval -> long { return self.wantedTo(r, cur, cur.end); }
+    wantedTo &self r:long cur:Interval last:long -> long {
+        end: long = self.hintFirst.get(r) + self.hintCount.get(r);
+        j: long = self.hintAt.get(r);
+        while (j < end && self.hintS.get(j) < cur.start) { j = j + 1; }
+        self.hintAt.set(r, j);
+        if (j >= end || self.hintS.get(j) > last) { return 0; }
+        lo: long = j + 1;
+        hi: long = end;
+        while (lo < hi) {
+            mid: long = (lo + hi) / 2;
+            if (self.hintS.get(mid) <= last) { lo = mid + 1; } else { hi = mid; }
+        }
+        level: long = 0;
+        width: long = 1;
+        while (2 * width <= lo - j) { width = 2 * width; level = level + 1; }
+        a: long = self.hintMax.get(level * self.hintTotal + j);
+        b: long = self.hintMax.get(level * self.hintTotal + lo - width);
+        if (b > a) { return b; }
+        return a;
+    }
+
+    // `cur`'s hint, when that register is free, keeps its value across what `cur` and the range it
+    // hands on to are live across, and no range that starts within `cur` wants it more.
+    hintFor &self cur:Interval later:long -> long {
+        h: long = self.hintReg.get(cur.temp);
+        if (h < 0 || cur.xmm || !self.freeRegs.get(h)) { return SPILLED; }
+        if (!survives(self.clobOf(cur.temp, cur.crossesCall) | later, h)) { return SPILLED; }
+        if (self.wantedBy(h, cur) > self.hintW.get(cur.temp)) { return SPILLED; }
+        return h;
+    }
+
+    // `pickRegister`, leaving alone the caller-saved registers a range that starts within `cur`,
+    // or within the ranges `cur` may hand its register on to (`reachEnd`), wants, unless that leaves `cur` none, or only a callee-saved register no range has taken
+    // yet (one more to save and restore costs more than the copy a hint saves).
+    pickAvoiding &self p:IRProgram fn:IRFunc cur:Interval later:long -> long {
+        if (self.hintTotal == 0) { return self.pickRegister(cur, later); }
+        last: long = self.reachEnd(p, fn, cur);
+        mask: long = 0;
+        for r in REG_RBX..REG_R12 {
+            if (r != REG_RDX && self.freeRegs.get(r) && self.wantedTo(r, cur, last) > 0) {
+                mask = mask | (1 << r);
+                self.freeRegs.set(r, false);
+            }
+        }
+        reg: long = self.pickRegister(cur, later);
+        if (mask == 0) { return reg; }
+        for r in REG_RBX..REG_R12 {
+            if ((mask & (1 << r)) != 0) { self.freeRegs.set(r, true); }
+        }
+        if (reg == SPILLED || (isCalleeSaved(reg) && !self.usedCallee.get(reg))) {
+            self.homed.set(cur.temp, false);
+            reg = self.pickRegister(cur, later);
+        }
+        return reg;
+    }
+
+    // Where the register `cur` is given may be held to: the end of the last range in the chain
+    // that each takes over the register of the one before where it ends (`takeOperandReg`).
+    reachEnd &self p:IRProgram fn:IRFunc cur:Interval -> long {
+        e: long = cur.end;
+        t: long = cur.temp;
+        steps: long = 0;
+        while (steps < 4 && e >= 0 && e < fn.instrCount) {
+            ix: long = fn.firstInstr + e;
+            if (!sharesOperandReg(p.code[ix].op) || p.code[ix].a - self.base != t) { break; }
+            d: long = p.code[ix].dst - self.base;
+            if (d < 0 || d >= self.startOf.len() || self.startOf.get(d) != e) { break; }
+            t = d;
+            e = self.endOf.get(d);
+            steps = steps + 1;
+        }
+        return e;
     }
 
     // Whether a call in this function may reach foreign code (`clobbersXmm`), which need not keep
@@ -333,6 +517,189 @@ methods RegAlloc {
         }
     }
 
+    // A temp still in the frame after the scan and `secondChance`, written once and read by one
+    // instruction a few later, may live in `rax` or `rdx` in between instead: the frame costs a
+    // store and a load back, and those two registers hold nothing between instructions, the
+    // emitter's scratch, free wherever nothing written in between uses them. In a loop that has
+    // every register taken this is where a loaded value or a limit compared at once goes
+    // (`mov eax, [r10]` / `mov edx, [r15]` / `cmp rax, rdx`).
+    //
+    // Three tests, each against where the other operands are now (`scratchWriter`,
+    // `scratchReader`, `scratchQuiet`): the writer leaves its result in the register last, after
+    // any use of the scratch it makes; the reader takes it from there before it writes that
+    // register or fetches anything into it; and each instruction between is one the emitter
+    // writes without that register. Two values in one register may meet only where one is read
+    // and the next written, by one instruction that reads before it writes. The latest start goes
+    // first, so that a value written inside another's range is in its register by the time the
+    // outer one asks whether its writer is quiet. Then every range placed so far starts after the
+    // one being placed, so each register's lowest start placed (`fromRax`, `fromRdx`) says whether
+    // it is free to the end of the new one. A pair `markRaxPairs` made counts as placed when the
+    // walk reaches it: nothing but deleted instructions lies between its write and its read, so no
+    // range starting before it can end inside it.
+    spillScratch &self p:IRProgram fn:IRFunc -> void {
+        fromRax: long = fn.instrCount + 1;
+        fromRdx: long = fn.instrCount + 1;
+        k: long = self.intervals.len() - 1;
+        while (k >= 0) {
+            cur: Interval = self.intervals.get(k);
+            k = k - 1;
+            x: long = cur.temp;
+            if (self.tempReg.get(x) == REG_RAX) { fromRax = cur.start; continue; }
+            if (self.tempReg.get(x) != SPILLED || self.argOnly.get(x) || self.fused.get(x)) { continue; }
+            if (self.rematKind.get(x) != REMAT_NONE || (fn.holdsRecover && self.inFrame.get(x))) { continue; }
+            s: long = cur.start;
+            e: long = cur.end;
+            if (e <= s || self.rematDef.get(x) != s) { continue; }
+            t: Temp = self.base + x;
+            kt: Lit = p.kindOf(t);
+            if (kt == Lit.Void || isFloatLit(kt)
+                || (isAggregate(kt) && kt != Lit.Str && kt != Lit.Slice && kt != Lit.TraitObj)) { continue; }
+            w: Instr = p.code.get(fn.firstInstr + s);
+            rd: Instr = p.code.get(fn.firstInstr + e);
+            if (w.dst != t) { continue; }
+            for q in 0..2 {
+                reg: long = REG_RAX;
+                from: long = fromRax;
+                if (q == 1) { reg = REG_RDX; from = fromRdx; }
+                if (from < e) { continue; }
+                if (!self.scratchWriter(w, reg) || !self.scratchReader(p, rd, t, reg)) { continue; }
+                quiet: bool = true;
+                j: long = s + 1;
+                while (j < e && quiet) {
+                    quiet = self.scratchQuiet(p.code.get(fn.firstInstr + j), reg);
+                    j = j + 1;
+                }
+                if (!quiet) { continue; }
+                self.tempReg.set(x, reg);
+                if (q == 0) { fromRax = s; } else { fromRdx = s; }
+                break;
+            }
+        }
+    }
+
+    // `t` in a general register the scan gave out (not the frame, not computed again where it is
+    // read, not `rax` or `rdx`, not `xmm`), or in any general register, scratch included.
+    inGpr &self t:Temp -> bool {
+        r: long = self.regOf(t);
+        return t != NO_TEMP && r != SPILLED && r != REG_RAX && r != REG_RDX && r < REG_XMM8;
+    }
+    inReg &self t:Temp -> bool {
+        r: long = self.regOf(t);
+        return t != NO_TEMP && r != SPILLED && r < REG_XMM8;
+    }
+
+    // Whether `w` may write its result into scratch register `reg` (`spillScratch`). For `rax`,
+    // `raxWriter`'s list. For `rdx`, each of these fetches what it must first and writes the
+    // destination last: a copy, a load, a conversion of integers, an `lea`, a shift by a
+    // constant; `+ - * & | ^` and a comparison with the right operand an immediate or in a
+    // register, since one in the frame is fetched into `rdx` itself (`rightOperand`).
+    scratchWriter &self w:Instr reg:long -> bool {
+        if (reg == REG_RAX) { return raxWriter(w); }
+        o: IROp = w.op;
+        if (o == IROp.Call || o == IROp.CallIndirect || isFloatLit(w.kind)) { return false; }
+        if (o == IROp.Mov || o == IROp.PtrLoad || o == IROp.Lea) { return true; }
+        if (o == IROp.Load) { return !w.paramSeed; }
+        if (o == IROp.Convert) { return !isFloatLit(w.fromKind) && !isFloatLit(w.toKind); }
+        if (o == IROp.Shl || o == IROp.Shr) { return w.bIsImm; }
+        if (o == IROp.Add || o == IROp.Sub || o == IROp.Mul || o == IROp.BAnd || o == IROp.BOr || o == IROp.BXor
+            || isCompare(o)) {
+            return w.bIsImm || self.inReg(w.b);
+        }
+        return false;
+    }
+
+    // Whether `r` may read `t` from scratch register `reg` (`spillScratch`): it takes it from there
+    // before it writes the register or fetches anything into it.
+    // - `rax`: `raxReader`'s list, and two reads of the right operand where the left one is in a
+    //   register already, so nothing is fetched into `rax` first: a branch's comparison
+    //   (`emitTest`), a store's value with its base in a register (`address`).
+    // - `rdx`, where the emitter fetches into `rax` first and into `rdx` second (`intoScratch`,
+    //   `rightOperand`, the index of an `address`): the value as the operand fetched second, or as
+    //   the one fetched first when what is fetched second is in a register (or an immediate)
+    //   already. A return, a copy, a store to a slot, a test against zero, a conversion and a
+    //   shift read only it. A bounds check's length is fetched into `rdx` only when it is computed
+    //   again, and its report copies the index into `rax` before it reads the length, which so
+    //   must not be there (`emitBounds`).
+    scratchReader &self p:IRProgram r:Instr t:Temp reg:long -> bool {
+        o: IROp = r.op;
+        if (reg == REG_RAX) {
+            if (raxReader(p, r, t)) { return true; }
+            if (isFloatLit(r.kind)) { return false; }
+            if (o == IROp.Jcc) { return !r.bIsImm && r.b == t && r.a != t && self.inGpr(r.a); }
+            if (o == IROp.PtrStore) { return !r.bIsImm && r.b == t && r.a != t && r.x != t && self.inGpr(r.a); }
+            return false;
+        }
+        if (o == IROp.Convert) { return r.a == t && !isFloatLit(r.fromKind) && !isFloatLit(r.toKind); }
+        if (o == IROp.Call || o == IROp.CallIndirect || isFloatLit(r.kind)) { return false; }
+        if (o == IROp.Ret || o == IROp.Mov || o == IROp.Store || o == IROp.Jz) { return r.a == t; }
+        if (o == IROp.Shl || o == IROp.Shr) { return r.bIsImm && r.a == t; }
+        if (o == IROp.Add || o == IROp.Sub || o == IROp.Mul || o == IROp.BAnd || o == IROp.BOr || o == IROp.BXor
+            || isCompare(o)) {
+            if (r.bIsImm) { return r.a == t; }
+            if (r.a == t) { return r.b != t && self.inReg(r.b); }
+            return r.b == t;
+        }
+        if (o == IROp.Jcc) {
+            if (self.isFused(r.a)) { return false; }
+            if (!r.bIsImm && r.b == t) { return r.a != t; }
+            return r.a == t && (r.bIsImm || self.inReg(r.b));
+        }
+        if (o == IROp.Lea) {
+            if (r.x == t) { return r.a != t; }
+            return r.a == t && self.inReg(r.x);
+        }
+        if (o == IROp.PtrLoad) {
+            if (r.dst != NO_TEMP && self.isFused(r.dst)) { return false; }
+            if (r.x == t) { return r.a != t; }
+            return r.a == t && (r.x == NO_TEMP || self.inReg(r.x));
+        }
+        if (o == IROp.PtrStore) {
+            if (r.bIsImm || r.x == t || (r.x != NO_TEMP && !self.inReg(r.x))) { return false; }
+            if (r.b == t) { return r.a != t; }
+            return r.a == t && self.inReg(r.b);
+        }
+        if (o == IROp.Bounds) {
+            if (!r.bIsImm && r.b == t) { return r.a != t; }
+            return r.a == t && (r.bIsImm || (self.rematOf(r.b) == REMAT_NONE && self.regOf(r.b) != REG_RAX));
+        }
+        return false;
+    }
+
+    // Whether the emitter writes `in` without using scratch register `reg` (`spillScratch`): an
+    // instruction it skips (a deleted one, a value computed again where it is read), or a copy, a
+    // load, a store, a conversion of integers, an `lea`, a shift by a constant or `+ - * & | ^`
+    // with every operand in a register the scan gave out and the result in one of those or in
+    // the other scratch register. Each is then one or two instructions among those registers. The
+    // exception is a right operand in the result's register when the two may not be swapped,
+    // which `emitArith` computes in `rax`.
+    scratchQuiet &self in:Instr reg:long -> bool {
+        o: IROp = in.op;
+        if (o == IROp.Nop) { return true; }
+        if (o == IROp.Const || o == IROp.AddrOf || o == IROp.AggSlot || o == IROp.StrLitVal) {
+            return in.dst != NO_TEMP && self.rematOf(in.dst) != REMAT_NONE;
+        }
+        if (isFloatLit(in.kind)) { return false; }
+        if (o == IROp.PtrStore) {
+            return !in.bIsImm && self.inGpr(in.a) && self.inGpr(in.b) && (in.x == NO_TEMP || self.inGpr(in.x));
+        }
+        if (o == IROp.Store) { return self.inGpr(in.a); }
+        if (in.dst == NO_TEMP) { return false; }
+        d: long = self.regOf(in.dst);
+        if (d == SPILLED || d == reg || d >= REG_XMM8) { return false; }
+        if (o == IROp.Load) { return !in.paramSeed; }
+        if (o == IROp.Mov) { return self.inGpr(in.a); }
+        if (o == IROp.Convert) { return !isFloatLit(in.fromKind) && !isFloatLit(in.toKind) && self.inGpr(in.a); }
+        if (o == IROp.PtrLoad) { return self.inGpr(in.a) && (in.x == NO_TEMP || self.inGpr(in.x)); }
+        if (o == IROp.Lea) { return (in.a == NO_TEMP || self.inGpr(in.a)) && self.inGpr(in.x); }
+        if (o == IROp.Shl || o == IROp.Shr) { return in.bIsImm && self.inGpr(in.a); }
+        if (o == IROp.Add || o == IROp.Sub || o == IROp.Mul || o == IROp.BAnd || o == IROp.BOr || o == IROp.BXor) {
+            if (!self.inGpr(in.a)) { return false; }
+            if (in.bIsImm) { return true; }
+            return self.inGpr(in.b) && (self.regOf(in.b) != d || o != IROp.Sub);
+        }
+        return false;
+    }
+
     // For `d = op a, ...` where this is the last read of `a`, `d` takes over `a`'s register as `a`
     // lets go of it, and the emitter's `mov d, a` before a two-operand instruction disappears.
     // This is done only for instructions whose emitter reads every operand before it writes the
@@ -359,6 +726,10 @@ methods RegAlloc {
         reg: long = self.tempReg.get(ra);
         if (reg == SPILLED || reg == REG_RAX || !survives(self.clobOf(cur.temp, cur.crossesCall), reg)) { return false; }
         if (isXmm(reg) && !cur.xmm) { return false; }
+        // A range that starts within this one would rather have the register, and saves more by
+        // it than the copy taking it over saves (`hint`).
+        if (self.hintTotal > 0 && !isXmm(reg) && self.hintReg.get(cur.temp) != reg
+            && self.wantedBy(reg, cur) > self.defW.get(cur.temp)) { return false; }
         for i in 0..self.active.len() {
             if (self.active.get(i).temp == ra) {
                 self.active.removeAt(i);
@@ -383,13 +754,16 @@ methods RegAlloc {
     // scratch, and the reader must read that operand before it writes `rax` or fetches anything
     // else into it. Each instruction below was checked against its emitter for that:
     // - writers: a call (`callResult` then leaves the result where it is), a copy, `+ - * & | ^`,
-    //   a load, a load through a pointer, an integer conversion;
+    //   a load, a load through a pointer, an integer conversion, an integer comparison
+    //   (`emitCompare` reads both operands before it sets `al`), a shift by a constant
+    //   (`emitShift` copies its operand into the result first; not with `--no-spill-scratch`);
     // - readers: a return; a direct call taking the value as its first argument (which goes in
     //   `rax`, or, should its class be a float's, is moved to `xmm0` before any general register
     //   is written), with every argument in a register (a stack argument is staged through
     //   `rax`); `+ - * & | ^` on either side (`emitArith` fetches the left operand into `rdx` when
     //   the right one is in `rax`, and computes in `rdx` when both the right operand and the
-    //   result would be there); a copy, a conversion and a store; a branch, a load or a store
+    //   result would be there); a copy, a conversion, a shift by a constant (the same switch) and
+    //   a store; a branch, a load or a store
     //   through a pointer and a bounds check, each only with the value as the operand read first
     //   (`a`), since a later operand that has to be fetched is fetched into `rax`.
     // A reader may also be the next value's writer (`return f(g(x))`): it reads its operand before
@@ -426,7 +800,8 @@ methods RegAlloc {
     // - a load's or a store's base, when it is a frame slot's address or (with no index) a
     //   global's (`addressInPlace`): `[rbp + rcx*4 - 400000]`, `[rel g + 8]`;
     // - the length a bounds check compares with, when it is a constant that fits the compare's
-    //   sign-extended 32-bit immediate (`immediateIn`): `cmp rcx, 1000`.
+    //   sign-extended 32-bit immediate (`immediateIn`): `cmp rcx, 1000`;
+    // - an integer returned, which `emitInstrOnly` computes straight into `rax`: `xor eax, eax`.
     // Where it is read any other way it is an ordinary temp, given a register if one is free.
     markArgOnly &self p:IRProgram fn:IRFunc -> void {
         n: long = self.tempReg.len();
@@ -436,7 +811,8 @@ methods RegAlloc {
             in: Instr = p.code.get(fn.firstInstr + i);
             if (in.op == IROp.Nop || in.op == IROp.Label) { continue; }
             access: bool = in.op == IROp.PtrLoad || in.op == IROp.PtrStore;
-            if (!access || !self.addressInPlace(p, fn, in.a, in.x)) { self.notArgOnly(in.a); }
+            returned: bool = in.op == IROp.Ret && !gResultRaxOff && !isFloatLit(in.kind);
+            if (!returned && (!access || !self.addressInPlace(p, fn, in.a, in.x))) { self.notArgOnly(in.a); }
             if (!in.bIsImm && !(in.op == IROp.PtrStore && self.storesImmediate(p, fn, in))
                 && !(in.op == IROp.Bounds && self.immediateIn(p, fn, in.b))) { self.notArgOnly(in.b); }
             self.notArgOnly(in.x);
@@ -675,6 +1051,15 @@ methods RegAlloc {
         self.defW.clear();
         for i in 0..n { self.defW.push(0); }
         depthW: Vec<long> = loopWeights(p, fn);
+        self.hintReg.clear();
+        self.hintW.clear();
+        for i in 0..n { self.hintReg.push(-1); self.hintW.push(0); }
+        self.candT.clear();
+        self.candR.clear();
+        self.candW.clear();
+        self.candI.clear();
+        ints: long = 0;            // the general argument registers the parameters so far take
+        seeding: bool = true;      // still in the leading run of parameter seeds
 
         g: CFG;
         g.build(p, fn);
@@ -696,6 +1081,38 @@ methods RegAlloc {
                 markRange(&lo, &hi, p.asmVals.get(in.firstPiece + k) - base, idx);
             }
             markRange(&lo, &hi, in.dst - base, idx);
+            if (!gHintsOff) {
+                // A parameter would rather stay where its argument arrives (`emitSeeds`), a
+                // call's argument be where it leaves from (`emitArgs`) and a shift's count be in
+                // `rcx` (`emitShift`), each numbered as those number them.
+                if (seeding && in.op == IROp.Load && in.paramSeed) {
+                    if (floatClass(in.kind, in.structName) == 0) {
+                        if (in.dst != NO_TEMP && !byValueAggregate(in.kind) && ints < INT_ARG_REGS) {
+                            self.hint(in.dst, ints, depthW.get(idx));
+                        }
+                        ints = ints + 1;
+                    }
+                } else {
+                    seeding = false;
+                    if (in.op == IROp.Call || in.op == IROp.CallIndirect) {
+                        k: long = 0;
+                        for j in 0..in.argCount {
+                            t: Temp = p.args.get(in.firstArg + j);
+                            if (floatClass(p.kindOf(t), p.structOf(t)) > 0) { continue; }
+                            if (k >= INT_ARG_REGS) { break; }
+                            if (k != REG_RAX && k != REG_RDX) {
+                                self.candT.push(t);
+                                self.candR.push(k);
+                                self.candW.push(depthW.get(idx));
+                                self.candI.push(idx);
+                            }
+                            k = k + 1;
+                        }
+                    } else if ((in.op == IROp.Shl || in.op == IROp.Shr) && !in.bIsImm) {
+                        self.hint(in.b, REG_RCX, 3 * depthW.get(idx));
+                    }
+                }
+            }
             if (in.op != IROp.Nop) {
                 w: long = depthW.get(idx);
                 addWeight(&wt, in.a - base, w);
@@ -752,6 +1169,11 @@ methods RegAlloc {
         self.endOf.clear();
         self.startOf.clear();
         for i in 0..n { self.endOf.push(hi.get(i)); self.startOf.push(lo.get(i)); }
+        // An argument whose range goes on past its call would have its register changed by it.
+        for c in 0..self.candT.len() {
+            x: long = self.candT.get(c) - base;
+            if (x >= 0 && x < n && hi.get(x) == self.candI.get(c)) { self.hint(self.candT.get(c), self.candR.get(c), self.candW.get(c)); }
+        }
         self.markXmm(p, fn, n);
         self.markRemat(p, fn, n);
         exact: bool = !gExactCallsOff;
@@ -1198,7 +1620,7 @@ local sharesOperandReg op:IROp -> bool {
     return op == IROp.Mov || op == IROp.Add || op == IROp.Sub || op == IROp.Mul
         || op == IROp.Div || op == IROp.Mod || op == IROp.BAnd || op == IROp.BOr
         || op == IROp.BXor || op == IROp.Shl || op == IROp.Shr || op == IROp.BNot
-        || op == IROp.Convert || op == IROp.PtrLoad || isCompare(op);
+        || op == IROp.Convert || op == IROp.PtrLoad || op == IROp.Lea || isCompare(op);
 }
 
 local isFloatLit k:Lit -> bool { return k == Lit.Float || k == Lit.Double; }
@@ -1253,8 +1675,12 @@ local raxWriter in:Instr -> bool {
     if (isFloatLit(in.kind)) { return false; }
     if (o == IROp.Load) { return !in.paramSeed; }
     if (o == IROp.Convert) { return !isFloatLit(in.fromKind) && !isFloatLit(in.toKind); }
+    if (o == IROp.CmpEq || o == IROp.CmpNe || o == IROp.CmpLt || o == IROp.CmpGt || o == IROp.CmpLe || o == IROp.CmpGe) {
+        return !gResultRaxOff;
+    }
+    if ((o == IROp.Shl || o == IROp.Shr) && in.bIsImm) { return !gSpillScratchOff; }
     return o == IROp.Mov || o == IROp.PtrLoad || o == IROp.Add || o == IROp.Sub || o == IROp.Mul
-        || o == IROp.BAnd || o == IROp.BOr || o == IROp.BXor;
+        || o == IROp.BAnd || o == IROp.BOr || o == IROp.BXor || o == IROp.Lea;
 }
 
 // Whether `in` may read `t` from `rax` (`markRaxPairs`), given where it reads it.
@@ -1274,13 +1700,14 @@ local raxReader p:IRProgram in:Instr t:Temp -> bool {
         return in.a == t || (!in.bIsImm && in.b == t);
     }
     if (o == IROp.Mov || o == IROp.Store || o == IROp.Jz) { return in.a == t; }
+    if (o == IROp.Lea) { return in.a == t || in.x == t; }
+    if ((o == IROp.Shl || o == IROp.Shr) && in.bIsImm) { return !gSpillScratchOff && in.a == t; }
     if (o == IROp.Convert) { return in.a == t && !isFloatLit(in.fromKind) && !isFloatLit(in.toKind); }
     if (o == IROp.Jcc || o == IROp.Bounds) { return in.a == t && (in.bIsImm || in.b != t); }
     if (o == IROp.PtrLoad) { return in.a == t && in.x != t; }
     if (o == IROp.PtrStore) { return in.a == t && in.b != t && in.x != t; }
     return false;
 }
-
 
 // Whether spilling `a` is better than spilling `b`. A value computed again where it is read costs
 // an instruction at each read and no store or slot: about half what a spilled value of the same
@@ -1339,4 +1766,15 @@ pub markRange inout lo:Vec<long> inout hi:Vec<long> t:Temp idx:long -> void {
     if (t < 0 || t >= lo.len()) { return; }
     if (lo.get(t) < 0 || idx < lo.get(t)) { lo.set(t, idx); }
     if (hi.get(t) < 0 || idx > hi.get(t)) { hi.set(t, idx); }
+}
+
+// Whether a value of this type passes as a float (1 an `f64`, 2 an `f32`) or not (0): a backed
+// enum or distinct type by what it is stored as, a borrow of a float scalar as the float.
+pub floatClass k0:Lit s:Sym -> long {
+    k: Lit = k0;
+    if (k == Lit.Struct && s != NO_SYM && namedScalar(k, s)) { k = namedScalarBacking(s); }
+    if (k == Lit.Ref && s != NO_SYM && namesScalar(nameOf(s))) { k = scalarNamed(nameOf(s)); }
+    if (k == Lit.Double) { return 1; }
+    if (k == Lit.Float) { return 2; }
+    return 0;
 }

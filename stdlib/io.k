@@ -86,9 +86,11 @@ pub unsafe writeBytes ptr:long len:long -> void {
 @fini pub flush -> void { with gStdout { gStdout.data.flush(); } }
 pub flushErr -> void { with gStderr { gStderr.data.flush(); } }
 
-// When each stream passes its bytes on. What either holds is flushed first.
-pub setStdoutMode m:BufferMode -> void { with gStdout { gStdout.data.setMode(m); } }
-pub setStderrMode m:BufferMode -> void { with gStderr { gStderr.data.setMode(m); } }
+// When each stream passes its bytes on. What either holds is flushed first. `unsafe`: a
+// `Delimited` mode keeps its text, a view, in a global, so the caller vouches that the text
+// outlives the setting (a literal always does).
+pub unsafe setStdoutMode m:BufferMode -> void { with gStdout { gStdout.data.setMode(m); } }
+pub unsafe setStderrMode m:BufferMode -> void { with gStderr { gStderr.data.setMode(m); } }
 
 // Redirection is `unsafe`: the new sink is a borrowed view stored in a global, so the caller
 // vouches that it outlives the redirection window.

@@ -117,7 +117,7 @@ methods Lowerer {
             st: Stmt = a.stmtAt(page, k);
             if (st.kind == StmtKind.FunctionDef) {
                 self.noteVariadic(a, a.fns.get(st.at));
-                self.noteHook(a.fns.get(st.at));
+                self.noteHook(a.fns.get(st.at), a.stmtPos.get(a.stmtIdAt(page, k)));
                 bk: long = builtinOf(a.fns.get(st.at));
                 if (bk != 0) { self.builtinKinds.put(nameOf(a.fns.get(st.at).name), bk); }
                 self.callConvs.put(a.fns.get(st.at).name as long, callConventionsOf(a, st.at));
@@ -1068,6 +1068,19 @@ methods Lowerer {
         res: Temp = self.ir.newTemp(Lit.Bool, NO_SYM);
         shortL: Sym = self.freshLabel();
         endL:   Sym = self.freshLabel();
+        // Three terms or more of one operator (`op == A || op == B || op == C`): as control flow,
+        // each term a compare and a jump to where the answer is known, and the value written once
+        // on each side. Built a term at a time, each `||` would set a value, test it, jump past
+        // the next term and copy it on: four instructions a term more, on every path through.
+        if (!gCondValueOff && self.chainTerms(a, id, e.op) >= 3) {
+            if (e.op == Op.LogicalOr) { self.branchIf(a, id, shortL); } else { self.branchUnless(a, id, shortL); }
+            self.setBool(res, e.op == Op.LogicalAnd);
+            self.emitJump(IROp.Jmp, endL, NO_TEMP);
+            self.emitLabel(shortL);
+            self.setBool(res, e.op == Op.LogicalOr);
+            self.emitLabel(endL);
+            return res;
+        }
 
         l: Temp = self.lowerExpr(a, e.left);
         self.moveTo(res, l);
@@ -1084,6 +1097,22 @@ methods Lowerer {
         self.emitLabel(shortL);
         self.emitLabel(endL);
         return res;
+    }
+
+    // How many terms a chain of `op` (`&&` or `||`) joins: `a || b || c` is three.
+    chainTerms &self inout a:Ast id:NodeId op:Op -> long {
+        e: Expr = a.expr(id);
+        if (e.op != op) { return 1; }
+        return self.chainTerms(a, e.left, op) + self.chainTerms(a, e.right, op);
+    }
+
+    setBool &self t:Temp v:bool -> void {
+        c: Instr = instr(IROp.Const);
+        c.dst = t;
+        c.imm = 0;
+        if (v) { c.imm = 1; }
+        c.kind = Lit.Bool;
+        self.ir.emit(c);
     }
 
     notOf &self v:Temp -> Temp {
@@ -1327,8 +1356,16 @@ methods Lowerer {
     }
 
     // A startup or shutdown hook, by its declaration (`@init`/`@fini`): `_start` calls them
-    // (`asm.k`), in the order the modules were read.
-    noteHook &self f:FnNode -> void {
+    // (`asm.k`), in the order the modules were read. And the `@spill` function, one at most;
+    // `pos` is where the declaration is, for the error about a second one.
+    noteHook &self f:FnNode pos:long -> void {
+        if ((f.attrs & FN_SPILL) != 0) {
+            if (gSpillFn != NO_SYM && gSpillFn != f.name) {
+                gPos = pos;
+                failStr(format("two functions are marked `@spill`: `{}` and `{}`\nnote: a program may mark one function `@spill`",nameOf(gSpillFn), nameOf(f.name)));
+            }
+            gSpillFn = f.name;
+        }
         if ((f.attrs & FN_INIT) != 0) { gInitHooks.push(f.name); return; }
         if ((f.attrs & FN_FINI) != 0) { gFiniHooks.push(f.name); }
     }
@@ -3045,6 +3082,11 @@ methods Lowerer {
 pub var gInitHooks: Vec<Sym> = vec![];
 pub var gFiniHooks: Vec<Sym> = vec![];
 pub var gUsesFini: bool = false;
+// The `@spill` function, or NO_SYM when the program marks none: what a failed bounds check's
+// report calls first, so that what the program holds back for stdout is written before it.
+pub var gSpillFn: Sym = NO_SYM;
+// `--no-cond-value`: a chain of `&&` or `||` used as a value is built a term at a time.
+pub var gCondValueOff: bool = false;
 
 // The startup initializer's name: `$globalInit` for a whole program, and `$init$<package>` in a
 // package build, where every package has its own and the program's `_start` runs them all.

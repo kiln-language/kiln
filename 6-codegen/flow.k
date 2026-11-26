@@ -205,13 +205,13 @@ pub struct Flow {
     tDec: Vec<long>, tDirty: Vec<bool>, tConst: Vec<bool>, threadSeq: long, tConstReady: bool,
 
     // Scratch for a constant read out of an operand, and an interval read out of the facts.
-    cv: long, lo: long, hi: long,
+    cv: long, lo: long, hi: long, sbOff: long,
     // Copies seen in the block being walked (`noteCopy`).
     eqTo: Vec<long>, eqStamp: Vec<long>, eqPos: Vec<long>, walkStamp: long,
 
     nFolded: long, nAddr: long, nLoads: long, nBranches: long, nChecks: long, nUnreach: long,
-    nStrength: long, nSkipped: long, nMovs: long, nDead: long, nThreads: long, nDeadStores: long, nShared: long,
-    nLentCalls: long, nHoisted: long, nForwarded: long,
+    nStrength: long, nReassoc: long, nSkipped: long, nMovs: long, nDead: long, nThreads: long, nDeadStores: long, nShared: long,
+    nLentCalls: long, nLentLocals: long, nHoisted: long, nForwarded: long,
     // `forwardResults`: reads per temp, and the results built in place (at the call, in the callee).
     rsUse: Vec<long>, nResults: long, nInPlace: long,
     // `buildWhereCopied`: per frame slot, its first and last access and whether it is read or
@@ -256,6 +256,12 @@ pub var gXorBoundsOff: bool = false;  // `--no-xor-bounds`: no upper bound throu
 pub var gWideConstOff: bool = false;  // `--no-wide-const`: a constant past 32 bits is not hoisted (`canHoist`)
 // `0 - x` and `~x + 1` as a product by -1, which the emitter writes as `neg` (`--no-neg`).
 pub var gNegOff: bool = false;
+// `--no-promote-lent`: a local whose address is lent to calls stays in its slot (`promoteLent`).
+pub var gPromoteLentOff: bool = false;
+// `(x + c) - d` as `x + (c - d)`, and `a - (a - b)` as `b` (`--no-reassociate`).
+pub var gReassocOff: bool = false;
+// `--no-literal-bytes`: a read of a string literal's bytes stays a read.
+pub var gLitBytesOff: bool = false;
 pub var gRestrictOff: bool = false;   // `--no-restrict`: no borrowed parameter's bytes trusted to be its own
 pub var gRodataOff: bool = false;     // `--no-rodata`: no immutable global's image trusted
 pub var gResultsOff: bool = false;    // `--no-results`: aggregate results copied through scratch
@@ -283,8 +289,8 @@ methods Flow for Default {
                       oaLo: vec![], oaHi: vec![], obLo: vec![], obHi: vec![], oaUp: vec![],
                       cmFirst: vec![], cmCount: vec![], cmSrc: vec![], cmDst: vec![], cmOn: vec![], bDyn: vec![],
                       copies: vec![], copyAt: vec![], needNonneg: false, tStack: vec![], tWritten: vec![], tDefs: vec![], tSeen: vec![], tDec: vec![], tDirty: vec![], tConst: vec![], threadSeq: 0, tConstReady: false,
-                      cv: 0, lo: 0, hi: 0, eqTo: vec![], eqStamp: vec![], eqPos: vec![], walkStamp: 0,
-                      nFolded: 0, nAddr: 0, nLoads: 0, nBranches: 0, nChecks: 0, nUnreach: 0, nStrength: 0, nSkipped: 0, nMovs: 0, nDead: 0, nThreads: 0, nDeadStores: 0, nShared: 0, nLentCalls: 0, nHoisted: 0, nForwarded: 0, rsUse: vec![], nResults: 0, nInPlace: 0,
+                      cv: 0, lo: 0, hi: 0, sbOff: 0, eqTo: vec![], eqStamp: vec![], eqPos: vec![], walkStamp: 0,
+                      nFolded: 0, nAddr: 0, nLoads: 0, nBranches: 0, nChecks: 0, nUnreach: 0, nStrength: 0, nReassoc: 0, nSkipped: 0, nMovs: 0, nDead: 0, nThreads: 0, nDeadStores: 0, nShared: 0, nLentCalls: 0, nLentLocals: 0, nHoisted: 0, nForwarded: 0, rsUse: vec![], nResults: 0, nInPlace: 0,
                       wcFirst: map![], wcLast: map![], wcNamed: map![], wcLabel: map![], wcJumpLo: map![], wcJumpHi: map![], nBuilt: 0,
                       idom: vec![], rpoNum: vec![], lpHead: vec![], lpFirst: vec![], lpCount: vec![], lpList: vec![], lpMark: vec![], lpOrder: vec![],
                       lpDef: vec![], hMoved: vec![], hOrder: vec![], hLoop: vec![], lpLabel: vec![], blockMark: vec![], hAt: vec![], hBuf: vec![], phSeq: 0, hUse: vec![],
@@ -312,11 +318,206 @@ methods Flow {
             self.roGlobals.set(n as long, true);
             self.roAny = true;
         }
-        for f in 0..p.funcs.len() { self.runOne(p, p.funcs.get(f)); }
+        for f in 0..p.funcs.len() {
+            if (!gPromoteLentOff) { self.promoteLent(p, f); }
+            self.runOne(p, p.funcs.get(f));
+        }
+        if (gTraceOpt) { eprintln("flow: {} locals lent to calls kept in registers between them", self.nLentLocals); }
         if (gTraceOpt) {
             eprintln("flow: {} folded, {} strength-reduced, {} addresses, {} loads, {} branches, {} checks, {} edges threaded, {} unreachable, {} dead stores, {} common subexpressions, {} copies shared, {} hoisted, {} block copies forwarded, {} results into their place, {} built in the caller's, {} built where they are copied, {} functions skipped; {} functions summarized and {} answered \"everything\", {} calls lent a slot, {} parameters taken in place",
                      self.nFolded, self.nStrength, self.nAddr, self.nLoads, self.nBranches, self.nChecks, self.nThreads, self.nUnreach, self.nDeadStores, self.nCse, self.nShared, self.nHoisted, self.nForwarded, self.nResults, self.nInPlace, self.nBuilt, self.nSkipped, gFxCount, gFxTop, self.nLentCalls, gMovedParams);
         }
+    }
+
+    // A scalar local whose address is taken only to be handed to direct calls whose callees keep
+    // no pointer to it lives in its promoted temp like any other local, and its slot holds it only
+    // across those calls: the temp is stored there before each, and read back after each whose
+    // callee may write through the pointer. During such a call the slot is the variable, and no
+    // pointer to it outlives the call, so nothing reads or writes the slot at any other time. That
+    // a parameter does not escape is the callee's summary (`fxEscapes`: stored nowhere, handed
+    // back to no one, given to nothing that keeps it), worked out from the code the callee runs,
+    // so an `unsafe` callee is held to what it does rather than to what it may do. A decoder's
+    // `readVarLen(&ip, ...)` kept `ip` in the frame through the whole loop around it.
+    //
+    // Not where a `recover` is (its handler reads variables in their slots), nor for a parameter
+    // (its seed is its definition), a name an `asm` block or an array access spells, or one read
+    // or written at more than one type. The function's code is copied to the end of the
+    // program's with the copies added, as `Opt.unrollAll` does, before the function's own passes.
+    promoteLent &self inout p:IRProgram f:long -> void {
+        fn: IRFunc = p.funcs.get(f);
+        if (fn.instrCount == 0 || hasRecover(p, fn)) { return; }
+        // Cheapest first: a scalar local still read or written by name. After `Opt.promoteLocals`
+        // that is one it could not promote (its address taken, or an `asm` spelling it); most
+        // functions have none.
+        any: bool = false;
+        for i in 0..fn.instrCount {
+            ix: long = fn.firstInstr + i;
+            o: IROp = p.code[ix].op;
+            if ((o == IROp.Load || o == IROp.Store) && p.code[ix].name != NO_SYM && !p.code[ix].isGlobal && !p.code[ix].paramSeed
+                && (isInteger(p.code[ix].kind) || p.code[ix].kind == Lit.Ptr)) { any = true; break; }
+        }
+        if (!any) { return; }
+        // name -> 1 while a candidate, 0 once refused (`lentRefuse`), and the index of a load or
+        // store of it, for the type it is read and written at. Most addresses taken are an
+        // aggregate's, never read or written by name, so this list usually ends empty here.
+        cand: HashMap<long, long>;
+        kindAt: HashMap<long, long>;
+        seen: Vec<long>;
+        for i in 0..fn.instrCount {
+            ix: long = fn.firstInstr + i;
+            if (p.code[ix].op != IROp.AddrOf || p.code[ix].name == NO_SYM || p.code[ix].isGlobal || p.code[ix].dst == NO_TEMP) { continue; }
+            nm: long = p.code[ix].name as long;
+            if (!cand.has(nm)) { cand.put(nm, 1); seen.push(nm); }
+        }
+        for i in 0..fn.instrCount {
+            ix: long = fn.firstInstr + i;
+            o: IROp = p.code[ix].op;
+            if (o == IROp.Asm) {
+                for k in 0..p.code[ix].pieceCount {
+                    nm: Sym = p.asmNames.get(p.code[ix].firstPiece + k);
+                    if (nm != NO_SYM && cand.has(nm as long)) { self.lentRefuse(&cand, nm as long); }
+                }
+            }
+            if ((o == IROp.ArrLoad || o == IROp.ArrStore) && p.code[ix].name != NO_SYM && cand.has(p.code[ix].name as long)) {
+                self.lentRefuse(&cand, p.code[ix].name as long);
+            }
+            if ((o == IROp.Load || o == IROp.Store) && p.code[ix].name != NO_SYM && cand.has(p.code[ix].name as long)) {
+                nm: long = p.code[ix].name as long;
+                k: Lit = p.code[ix].kind;
+                if (p.code[ix].isGlobal || p.code[ix].paramSeed || !(isInteger(k) || k == Lit.Ptr)) { self.lentRefuse(&cand, nm); }
+                else if (!kindAt.has(nm)) { kindAt.put(nm, i); }
+                else if (p.code[fn.firstInstr + lentGet(kindAt, nm, 0)].kind != k) { self.lentRefuse(&cand, nm); }
+            }
+        }
+        left: bool = false;
+        for q in 0..seen.len() {
+            if (lentGet(cand, seen.get(q), 0) == 1 && kindAt.has(seen.get(q))) { left = true; }
+        }
+        if (!left) { return; }
+        // Per temp of the function, the name whose address it holds, or -1. One temp holding two
+        // names' addresses, an address temp written by anything but its `AddrOf`, or read by
+        // anything but a direct call whose callee keeps nothing (`fxEscapes`), refuses its name.
+        nt: long = fn.tempCount - fn.firstTemp;
+        addr: Vec<long>;
+        for t in 0..nt { addr.push(-1); }
+        for i in 0..fn.instrCount {
+            ix: long = fn.firstInstr + i;
+            if (p.code[ix].op != IROp.AddrOf || p.code[ix].name == NO_SYM || p.code[ix].isGlobal || p.code[ix].dst == NO_TEMP) { continue; }
+            nm: long = p.code[ix].name as long;
+            r: long = p.code[ix].dst - fn.firstTemp;
+            if (r < 0 || r >= nt) { self.lentRefuse(&cand, nm); continue; }
+            if (addr.get(r) >= 0 && addr.get(r) != nm) { self.lentRefuse(&cand, addr.get(r)); self.lentRefuse(&cand, nm); }
+            addr.set(r, nm);
+        }
+        for i in 0..fn.instrCount {
+            ix: long = fn.firstInstr + i;
+            o: IROp = p.code[ix].op;
+            if (o != IROp.AddrOf) { self.lentRead(&cand, addr, fn.firstTemp, p.code[ix].dst); }
+            self.lentRead(&cand, addr, fn.firstTemp, p.code[ix].a);
+            if (!p.code[ix].bIsImm) { self.lentRead(&cand, addr, fn.firstTemp, p.code[ix].b); }
+            self.lentRead(&cand, addr, fn.firstTemp, p.code[ix].x);
+            for k in 0..p.code[ix].pieceCount { self.lentRead(&cand, addr, fn.firstTemp, p.asmVals.get(p.code[ix].firstPiece + k)); }
+            na: long = p.code[ix].argCount;
+            if (na == 0) { continue; }
+            s: long = -2;
+            for k in 0..na {
+                nm: long = lentAddr(addr, fn.firstTemp, p.args.get(p.code[ix].firstArg + k));
+                if (nm < 0) { continue; }
+                if (s == -2) { s = -1; if (o == IROp.Call) { s = fxOfCallee(p, p.code[ix].name); } }
+                if (o != IROp.Call || s < 0 || k >= fxParams(s) || fxEscapes(s, k)) { self.lentRefuse(&cand, nm); }
+            }
+        }
+        // What is left, with its temp and a type to copy it at.
+        names: Vec<long>;
+        temps: HashMap<long, long>;
+        if (self.op.slotTemp.cap() > 512) { self.op.slotTemp = map![]; } else { self.op.slotTemp.clear(); }
+        for q in 0..seen.len() {
+            nm: long = seen.get(q);
+            if (lentGet(cand, nm, 0) != 1 || !kindAt.has(nm)) { continue; }
+            t: Temp = self.op.tempFor(p, fn, nm as Sym);
+            if (t == NO_TEMP) { continue; }
+            temps.put(nm, t as long);
+            names.push(nm);
+        }
+        if (names.len() == 0) { return; }
+        // The copy, the loads and stores of each name its temp's, each call that lends one between
+        // a store of the temp to the slot and (where the callee may write there) a load back.
+        start: long = p.code.len();
+        for i in 0..fn.instrCount {
+            in: Instr = p.code.get(fn.firstInstr + i);
+            nm: long = in.name as long;
+            if ((in.op == IROp.Load || in.op == IROp.Store) && in.name != NO_SYM && !in.isGlobal && temps.has(nm)) {
+                t: Temp = lentGet(temps, nm, 0) as Temp;
+                if (in.op == IROp.Load) {
+                    mv: Instr = instr(IROp.Mov);
+                    mv.dst = in.dst; mv.a = t; mv.kind = in.kind;
+                    mv.structName = in.structName;
+                    p.code.push(mv);
+                } else if (narrowsInto(p.kindOf(in.a), in.kind)) {
+                    cv: Instr = instr(IROp.Convert);
+                    cv.dst = t; cv.a = in.a; cv.kind = in.kind;
+                    cv.fromKind = p.kindOf(in.a); cv.toKind = in.kind;
+                    p.code.push(cv);
+                } else {
+                    mv: Instr = instr(IROp.Mov);
+                    mv.dst = t; mv.a = in.a; mv.kind = in.kind;
+                    mv.structName = in.structName;
+                    p.code.push(mv);
+                }
+                continue;
+            }
+            if (in.op != IROp.Call || in.argCount == 0) { p.code.push(in); continue; }
+            s: long = fxOfCallee(p, in.name);
+            for k in 0..in.argCount {
+                a: Temp = p.args.get(in.firstArg + k);
+                nm2: long = lentAddr(addr, fn.firstTemp, a);
+                if (nm2 < 0 || !temps.has(nm2)) { continue; }
+                // Once per address, however many arguments carry it.
+                again: bool = false;
+                for q in 0..k { if (p.args.get(in.firstArg + q) == a) { again = true; } }
+                if (again) { continue; }
+                st: Instr = instr(IROp.PtrStore);
+                st.a = a;
+                st.b = lentGet(temps, nm2, 0) as Temp;
+                st.kind = p.code[fn.firstInstr + lentGet(kindAt, nm2, 0)].kind;
+                p.code.push(st);
+            }
+            p.code.push(in);
+            for k in 0..in.argCount {
+                a: Temp = p.args.get(in.firstArg + k);
+                nm2: long = lentAddr(addr, fn.firstTemp, a);
+                if (nm2 < 0 || !temps.has(nm2)) { continue; }
+                writes: bool = false;
+                for q in 0..in.argCount {
+                    if (p.args.get(in.firstArg + q) == a && fxWrites(s, q)) { writes = true; }
+                }
+                again: bool = false;
+                for q in 0..k { if (p.args.get(in.firstArg + q) == a) { again = true; } }
+                if (again || !writes) { continue; }
+                ld: Instr = instr(IROp.PtrLoad);
+                ld.dst = lentGet(temps, nm2, 0) as Temp;
+                ld.a = a;
+                ld.kind = p.code[fn.firstInstr + lentGet(kindAt, nm2, 0)].kind;
+                p.code.push(ld);
+            }
+        }
+        fn.firstInstr = start;
+        fn.instrCount = p.code.len() - start;
+        p.funcs.set(f, fn);
+        self.nLentLocals = self.nLentLocals + names.len();
+        // The copies the loads and stores became, propagated as `Opt.promoteLocals` leaves them to be.
+        self.op.base = fn.firstTemp;
+        self.op.propagateCopies(p, fn);
+    }
+
+    // `t`, read or written other than by a direct call's argument list or its `AddrOf`: when it
+    // holds a lent candidate's address, that name is refused (`promoteLent`).
+    lentRead &self inout cand:HashMap<long, long> addr:Vec<long> base:Temp t:Temp -> void {
+        nm: long = lentAddr(addr, base, t);
+        if (nm >= 0) { self.lentRefuse(cand, nm); }
+    }
+    lentRefuse &self inout cand:HashMap<long, long> nm:long -> void {
+        if (nm >= 0) { cand.put(nm, 0); }
     }
 
     runOne &self inout p:IRProgram fn:IRFunc -> void {
@@ -387,6 +588,7 @@ methods Flow {
                 self.computeNonneg(p);
             }
             before: long = self.nLoads + self.nBranches + self.nChecks + self.nStrength;
+            beforeR: long = self.nReassoc;
             self.rewrite(p);
             // A load that became a copy of a constant makes what reads it foldable in turn, and a
             // decided branch leaves code no path reaches.
@@ -396,10 +598,16 @@ methods Flow {
                 self.buildBlocks(p);
                 self.removeUnreachable(p);
             }
-            if (passes == 2 || !self.threadPastSlots(p)) { break; }
-            self.nThreads = self.nThreads + 1;
-            self.buildBlocks(p);
-            self.removeUnreachable(p);
+            if (passes == 2) { break; }
+            if (self.threadPastSlots(p)) {
+                self.nThreads = self.nThreads + 1;
+                self.buildBlocks(p);
+                self.removeUnreachable(p);
+            } else if (self.nReassoc == beforeR) {
+                break;
+            }
+            // Or an address those folds made the same as one already read (`a + n - 4` with `n`
+            // 4 is `a`): the dataflow again, which finds the second read the first.
         }
         self.forwardCopies(p);
         self.dropDeadSlots(p);
@@ -564,6 +772,29 @@ methods Flow {
             d: Instr = p.code.get(self.first + self.defAt.get(r));
             if (d.op == IROp.StrLitVal) { self.cv = d.imm; return true; }
             if (d.op != IROp.Mov && !addressConvert(d)) { return false; }
+            t = d.a;
+            hops = hops + 1;
+        }
+        return false;
+    }
+
+    // `t` is written by exactly one instruction, an address in a string literal's bytes: the
+    // literal's index is left in `cv` and the offset into it in `sbOff`. Through copies, a pointer
+    // taken as a word and back, and constants added or taken away, each the temp's one definition.
+    strBytesAt &self inout p:IRProgram t0:Temp -> bool {
+        t: Temp = t0;
+        off: long = 0;
+        hops: long = 0;
+        while (hops < 8) {
+            r: long = self.rel(t);
+            if (r < 0 || self.defs.get(r) != 1) { return false; }
+            d: Instr = p.code.get(self.first + self.defAt.get(r));
+            if (d.op == IROp.StrAddr) { self.cv = d.imm; self.sbOff = off; return true; }
+            if (d.op == IROp.Add && self.bConst(p, d, 0)) { off = off + self.cv; }
+            else if (d.op == IROp.Sub && self.bConst(p, d, 0)) { off = off - self.cv; }
+            else if (d.op == IROp.Convert && !addressConvert(d)
+                     && (kindWidth(d.fromKind) != 8 || kindWidth(d.toKind) != 8 || isFloatKind(d.fromKind) || isFloatKind(d.toKind))) { return false; }
+            else if (d.op != IROp.Mov && d.op != IROp.Convert) { return false; }
             t = d.a;
             hops = hops + 1;
         }
@@ -786,6 +1017,25 @@ methods Flow {
                 return true;
             }
         }
+        // A read of a string literal's bytes at a known offset: what the assembler writes there.
+        // A `str` is immutable, its literal's bytes read-only data (docs/language.md), so nothing
+        // writes them again.
+        if (o == IROp.PtrLoad && in.x == NO_TEMP && !gLitBytesOff && foldableKind(in.kind) && !isFloatKind(in.kind)
+            && in.kind != Lit.Ptr && in.kind != Lit.Ref && self.strBytesAt(p, in.a)) {
+            text: str = nameOf(p.strings.get(self.cv));
+            off: long = self.sbOff + in.imm;
+            k: long = kindWidth(in.kind);
+            v: long = 0;
+            while (off >= 0 && k > 0) {
+                k = k - 1;
+                b: long = literalByte(text, off + k);
+                if (b < 0) { return false; }
+                v = (v << 8) | b;
+            }
+            if (off < 0) { return false; }
+            makeConst(in, canon(in.kind, v));
+            return true;
+        }
         if (o == IROp.Convert && (isFloatKind(in.fromKind) || isFloatKind(in.toKind))) {
             if (!self.constAt(p, in.a, stamp)) { return false; }
             fromK: Lit = in.fromKind;
@@ -812,6 +1062,7 @@ methods Flow {
             self.decideBranch(in, self.cv == 0);
             return true;
         }
+        if (o == IROp.Jcc && self.xorTest(p, in)) { return true; }
         if (o == IROp.Jcc) {
             if (!self.constAt(p, in.a, stamp)) { return false; }
             x: long = self.cv;
@@ -853,8 +1104,87 @@ methods Flow {
             makeConst(in, self.cv);
             return true;
         }
-        if (!ka && !kb) { return false; }
+        if (!ka && !kb) { return self.subOfSub(p, in); }
         return self.identity(p, in, ka, x, kb, y);
+    }
+
+    // A branch on `(a ^ b) == 0` (or `!=`) is a branch on `a == b`: one compare where the two
+    // took an `xor` and a test. `a` and `b` are each written once, or `b` is a constant.
+    xorTest &self inout p:IRProgram inout in:Instr -> bool {
+        if (gReassocOff || (in.cmpOp != IROp.CmpEq && in.cmpOp != IROp.CmpNe) || isFloatKind(in.kind)) { return false; }
+        if (!self.bConst(p, in, 0) || self.cv != 0) { return false; }
+        r: long = self.rel(in.a);
+        if (r < 0 || self.defs.get(r) != 1) { return false; }
+        def: Instr = p.code.get(self.first + self.defAt.get(r));
+        hops: long = 0;
+        while (def.op == IROp.Mov && def.kind == in.kind && hops < 4) {
+            r = self.rel(def.a);
+            if (r < 0 || self.defs.get(r) != 1) { return false; }
+            def = p.code.get(self.first + self.defAt.get(r));
+            hops = hops + 1;
+        }
+        if (def.op != IROp.BXor || def.kind != in.kind) { return false; }
+        ra: long = self.rel(def.a);
+        if (ra < 0 || self.defs.get(ra) != 1) { return false; }
+        if (!def.bIsImm) {
+            rb: long = self.rel(def.b);
+            if (rb < 0 || self.defs.get(rb) != 1) { return false; }
+        }
+        in.a = def.a;
+        in.b = def.b;
+        in.bIsImm = def.bIsImm;
+        in.bImm = def.bImm;
+        self.nReassoc = self.nReassoc + 1;
+        return true;
+    }
+
+    // `a - (a - b)` is `b`: a view's length after its start, `s[s.len - n..]`. `a` and `b` are
+    // each written once, so each holds one value at both instructions.
+    // And `t | t`, `t & t` (`t`), `t ^ t` (0): the same temp read by one instruction is one value.
+    subOfSub &self inout p:IRProgram inout in:Instr -> bool {
+        if (in.bIsImm || gReassocOff || isFloatKind(in.kind)) { return false; }
+        if (in.a == in.b && in.a != NO_TEMP) {
+            if (in.op == IROp.BXor) { makeConst(in, 0); self.nReassoc = self.nReassoc + 1; return true; }
+            if ((in.op == IROp.BOr || in.op == IROp.BAnd) && p.kindOf(in.a) == in.kind) {
+                makeMov(in, in.a);
+                self.nMovs = self.nMovs + 1;
+                self.nReassoc = self.nReassoc + 1;
+                return true;
+            }
+        }
+        if (in.op != IROp.Sub || kindWidth(in.kind) != 8) { return false; }
+        r: long = self.rel(in.b);
+        ra: long = self.rel(in.a);
+        if (r < 0 || ra < 0 || self.defs.get(r) != 1 || self.defs.get(ra) != 1) { return false; }
+        def: Instr = p.code.get(self.first + self.defAt.get(r));
+        if (def.op != IROp.Sub || def.kind != in.kind) { return false; }
+        if (def.a != in.a) {
+            root: Temp = self.copyRoot(p, in.a);
+            rr: long = self.rel(root);
+            if (root != self.copyRoot(p, def.a) || rr < 0 || self.defs.get(rr) != 1) { return false; }
+        }
+        self.nReassoc = self.nReassoc + 1;
+        if (def.bIsImm) { makeConst(in, def.bImm); return true; }
+        rb: long = self.rel(def.b);
+        if (rb < 0 || self.defs.get(rb) != 1) { return false; }
+        makeMov(in, def.b);
+        self.nMovs = self.nMovs + 1;
+        return true;
+    }
+
+    // What `t` is a copy of, through copies each the temp's one definition: `t` itself if none.
+    copyRoot &self inout p:IRProgram t0:Temp -> Temp {
+        t: Temp = t0;
+        hops: long = 0;
+        while (hops < 8) {
+            r: long = self.rel(t);
+            if (r < 0 || self.defs.get(r) != 1) { return t; }
+            ix: long = self.first + self.defAt.get(r);
+            if (p.code[ix].op != IROp.Mov) { return t; }
+            t = p.code[ix].a;
+            hops = hops + 1;
+        }
+        return t;
     }
 
     // One operand constant: the algebraic identities, and a multiply by a power of two as a
@@ -897,6 +1227,26 @@ methods Flow {
             return false;
         }
         keep: bool = sameWidth || p.kindOf(in.a) == in.kind;
+        // `(x + c) - c`, `(x - c) + c` and the rest: `x`, with `x` written once so it holds the
+        // same value at both. What a view's start and length leave behind once a constant length
+        // reaches them (`a + n - 4` with `n` 4).
+        if ((o == IROp.Add || o == IROp.Sub) && sameWidth && !gReassocOff) {
+            r: long = self.rel(in.a);
+            if (r >= 0 && self.defs.get(r) == 1) {
+                def: Instr = p.code.get(self.first + self.defAt.get(r));
+                xr: long = self.rel(def.a);
+                if ((def.op == IROp.Add || def.op == IROp.Sub) && def.kind == in.kind && xr >= 0 && self.defs.get(xr) == 1
+                    && def.a != in.dst && self.bConst(p, def, 0)) {
+                    c: long = self.cv;
+                    if (def.op == IROp.Sub) { c = 0 - c; }
+                    if (o == IROp.Add) { c = c + y; } else { c = c - y; }
+                    // Only where the constants cancel: a step folded into one nearer `x` makes the
+                    // value-range walks (`interval`) go through it again from every reader, which
+                    // on this compiler cost more than the steps saved.
+                    if (c == 0) { makeMov(in, def.a); self.nMovs = self.nMovs + 1; self.nReassoc = self.nReassoc + 1; return true; }
+                }
+            }
+        }
         // `~x + 1` is `x * -1`, with `x` written once so it is the same value at both: one `neg`
         // where the two took a copy, a `not` and an `add`.
         if (o == IROp.Add && y == 1 && !gNegOff) {
@@ -5323,7 +5673,7 @@ local mix h:long x:long -> long {
     return (h ^ x) * 1099511628211 + 1469598103934665603;
 }
 
-local isArith o:IROp -> bool {
+pub isArith o:IROp -> bool {
     return o == IROp.Add || o == IROp.Sub || o == IROp.Mul || o == IROp.Div || o == IROp.Mod
         || o == IROp.BAnd || o == IROp.BOr || o == IROp.BXor || o == IROp.Shl || o == IROp.Shr;
 }
@@ -5346,7 +5696,7 @@ local convertible k:Lit -> bool { return foldableKind(k) || k == Lit.Struct; }
 // each answer is kept, by tag, the first time it is asked.
 local var gKindCode: Vec<long>;
 
-local kindCode k:Lit -> long {
+pub kindCode k:Lit -> long {
     i: long = k as long;
     if (i < gKindCode.len() && gKindCode.get(i) > 0) { return gKindCode.get(i); }
     ti: TypeInfo = typeInfo(k);
@@ -5361,8 +5711,8 @@ local kindCode k:Lit -> long {
     return c;
 }
 
-local kindWidth k:Lit -> long { return kindCode(k) / 2; }
-local kindUnsigned k:Lit -> bool { return kindCode(k) % 2 == 1; }
+pub kindWidth k:Lit -> long { return kindCode(k) / 2; }
+pub kindUnsigned k:Lit -> bool { return kindCode(k) % 2 == 1; }
 
 // What a load of this type leaves in a register depends on its width and on how it extends.
 // The least 2^k - 1 at or above `v` (v >= 0): every bit below its highest set.
@@ -5444,7 +5794,7 @@ local kindMax k:Lit -> long {
 }
 
 // A value as a register of type `k` holds it: the low bytes, extended by the type's signedness.
-local canon k:Lit v:long -> long {
+pub canon k:Lit v:long -> long {
     w: long = kindWidth(k);
     if (w >= 8) { return v; }
     bitsN: long = w * 8;
@@ -5467,6 +5817,20 @@ local makeConst inout in:Instr v:long -> void {
     in.structName = s;
 }
 
+// The name whose address temp `t` holds (`promoteLent`'s table by temp), or -1.
+local lentAddr addr:Vec<long> base:Temp t:Temp -> long {
+    r: long = t - base;
+    if (t == NO_TEMP || r < 0 || r >= addr.len()) { return -1; }
+    return addr.get(r);
+}
+
+// `m[k]`, or `dflt` where there is none (`promoteLent`'s tables).
+local lentGet m:HashMap<long, long> k:long dflt:long -> long {
+    hit: Option<long> = m.find(k);
+    match hit { Some(v) { return v; } None { } }
+    return dflt;
+}
+
 local makeMov inout in:Instr src:Temp -> void {
     d: Temp = in.dst;
     k: Lit = in.kind;
@@ -5487,7 +5851,7 @@ local log2Exact v:long -> long {
     return k;
 }
 
-local compareHolds op:IROp x:long y:long uns:bool -> bool {
+pub compareHolds op:IROp x:long y:long uns:bool -> bool {
     if (op == IROp.CmpEq) { return x == y; }
     if (op == IROp.CmpNe) { return x != y; }
     if (uns) {

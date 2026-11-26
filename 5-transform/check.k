@@ -4652,7 +4652,10 @@ help: add `#include <stdlib::recover>`"));
             }
             if (added == 0) { rounds = MAX_DIVERGE_ROUNDS; } else { rounds = rounds + 1; }
         }
-        gNoReturnFns = self.diverging.clone();
+        // The global outlives this checker, so it keeps the interner's copy of each name.
+        gNoReturnFns.clear();
+        names: Vec<str> = self.diverging.keys();
+        for n in names { gNoReturnFns.put(keep(n), true); }
         i: long = 0;
         while (i < a.fns.len()) {
             f: FnNode = a.fns.get(i);

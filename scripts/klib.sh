@@ -41,6 +41,7 @@
 #               a fn value, through a trait object) into a writer of the global is refused; one
 #               calling a dependency's function that calls nothing back is not
 #   hooks       `@init`/`@fini` in two packages run in order, built as packages and whole
+#   spill       a dependent's failed bounds check calls the `@spill` function a dependency marks
 #   manifests   a file named by an absolute path outside any package is its own package; a
 #               manifest above the working directory claims the files below it
 #   open        a package's dispatch, fn value and by-value parameter stay open to what its
@@ -72,8 +73,10 @@ W=$OUT/klibtest
 rm -rf "$W"; mkdir -p "$W/util" "$W/mid" "$W/app"
 CACHE=$W/cache
 fails=0
+passed=0
 failed=""
-ok()   { echo "  ok    $1"; }
+# A check that passes prints only with VERBOSE=1; a failure always prints, with what it saw.
+ok()   { passed=$((passed+1)); [ "${VERBOSE:-0}" = 1 ] && echo "  ok    $1"; return 0; }
 bad()  { echo "  FAIL  $1"; fails=$((fails+1)); failed="$failed
     - $1"; }
 # The package lines of a build's report, as "built:util,built:mid,..." for comparing.
@@ -163,7 +166,8 @@ echo "$msg" | grep -q "(1 modules parsed, [1-9][0-9]* read from a .klib" && ok "
     || bad "a dependency's module was parsed: $(echo "$msg" | grep 'modules parsed')"
 
 # An archive whose metadata names another format but is otherwise the same bytes, so only the
-# version line can be what refuses it. The body is binary, so the digit is patched in place.
+# version line can be what refuses it. The body is binary, so the digit is patched in place
+# (format 10 read as `kiln-klib 00`).
 T=$(mktemp -d)
 (cd "$T" && ar x "$ROOT/$CACHE/util.klib" kiln.meta && printf 0 | dd of=kiln.meta bs=1 seek=10 count=1 conv=notrunc 2>/dev/null \
     && head -c 12 kiln.meta | grep -q "^kiln-klib 0" && ar rcsD foreign.klib kiln.meta)
@@ -172,7 +176,7 @@ T=$(mktemp -d)
     && printf '\377' | dd of=kiln.meta bs=1 seek=$((n - 3)) count=1 conv=notrunc 2>/dev/null && ar rcsD ../corrupt.klib kiln.meta)
 cp "$T/foreign.klib" "$CACHE/util.klib"
 r=$(build); s=$(echo "$r" | summary)
-echo "$s" | grep -q "built:util" && echo "$r" | grep -qF 'note: rebuilding `util`: its cached .klib was written in another format (`kiln-klib 0`' \
+echo "$s" | grep -q "built:util" && echo "$r" | grep -qF 'note: rebuilding `util`: its cached .klib was written in another format (`kiln-klib 00`' \
     && ok "foreign: a cached archive of another format is rebuilt, and the build says why" || { bad "foreign-format archive was trusted, or rebuilt without a note: $s"; echo "$r"; }
 
 echo "not an archive" > "$CACHE/mid.klib"
@@ -206,7 +210,7 @@ flipByte "$CACHE/util.klib" $((m + n - 3))
 rebuilt "flipped" "is damaged (its body does not hash to what its header says)"
 m=$(metaAt "$CACHE/util.klib")
 printf 6 | dd of="$CACHE/util.klib" bs=1 seek=$((m + 10)) count=1 conv=notrunc 2>/dev/null
-rebuilt "format" 'was written in another format (`kiln-klib 6`; this compiler reads `kiln-klib 9`)'
+rebuilt "format" 'was written in another format (`kiln-klib 60`; this compiler reads `kiln-klib 10`)'
 # The object names the scratch directory its assembly was in, which differs from run to run, so
 # the metadata is what is compared.
 [ "$(ar p "$CACHE/util.klib" kiln.meta | sha1sum)" = "$(ar p "$T/util-good.klib" kiln.meta | sha1sum)" ] \
@@ -229,7 +233,7 @@ echo "$msg" | grep -qF "cannot use \`$W/mid-old.klib\` for package \`mid\`: it i
 
 msg=$("$C" --klib "$W/app/main.k" --extern stdlib="$CACHE/stdlib.klib" --extern util="$T/foreign.klib" \
       --extern mid="$CACHE/mid.klib" -o "$T/x.s" 2>&1)
-echo "$msg" | grep -qF "cannot use \`$T/foreign.klib\` for package \`util\`: it was written in another format (\`kiln-klib 0\`" \
+echo "$msg" | grep -qF "cannot use \`$T/foreign.klib\` for package \`util\`: it was written in another format (\`kiln-klib 00\`" \
     && ok "refused: a compile handed a foreign-format .klib stops, naming it" || bad "foreign archive accepted: $msg"
 
 msg=$("$C" --klib "$W/app/main.k" --extern stdlib="$CACHE/stdlib.klib" --extern util="$T/corrupt.klib" \
@@ -559,6 +563,21 @@ syms() { nm "$1" 2>/dev/null | awk '{print $NF}' | grep -v '\.end' | grep -E '\$
     && ok "hooks: @init/@fini across two packages run in order, the same built as packages and whole (symbols: $(syms "$W/happ.bin"))" \
     || bad "hooks: package build printed <$hp>, whole-program <$hw>, symbols <$(syms "$W/happ.bin")> vs <$(syms "$W/happw.bin")>"
 
+# spill: a bounds check failing in a dependent's own code calls the `@spill` function a dependency
+# marks, from the dependent's object, before the report. That function ends the process with 77
+# (the report's own status is 134), built as packages and whole.
+mkdir -p "$W/sdep" "$W/sapp"
+printf 'package sdep;\n' > "$W/sdep/package.kiln"
+printf 'pub unsafe builtin syscall nr:long args:...long -> long;\npub var gHeld: long = 0;\n@spill pub keep -> void { unsafe { syscall(60, 70 + gHeld); } }\n' > "$W/sdep/spill.k"
+printf 'package sapp;\ndepend sdep ../sdep\n' > "$W/sapp/package.kiln"
+printf '#include <sdep::spill>\nmain -> int { a: [long; 4]; for i in 0..4 { a[i] = i; } gHeld = 7;\n    s: long = 0; for i in 0..5 { s = s + a[i]; } return s as int; }\n' > "$W/sapp/main.k"
+r=$("$C" build "$W/sapp" --cache "$CACHE" -o "$W/sapp.bin" 2>&1); "$W/sapp.bin" >/dev/null 2>&1; sp=$?
+"$C" "$W/sapp/main.k" -o "$W/sapp.s" >/dev/null 2>&1 && nasm -O1 -felf64 "$W/sapp.s" -o "$W/sapp.o" && ld "$W/sapp.o" -o "$W/sappw.bin" \
+    && { "$W/sappw.bin" >/dev/null 2>&1; sw=$?; } || sw="whole-program build failed"
+[ "$sp" = 77 ] && [ "$sw" = 77 ] \
+    && ok "spill: a dependent's bounds failure calls the dependency's @spill function first, built as packages and whole" \
+    || bad "spill: package build exited <$sp> ($r), whole-program <$sw>, wanted 77"
+
 # manifests: a file is in the package whose manifest is above it in the filesystem, or in none.
 # Named by an absolute path outside any package, it is its own package wherever the compiler runs
 # (it was taken into this tree's `kiln`, the working directory's); a relative path that climbs out
@@ -720,4 +739,4 @@ if [ $CORPUS = 1 ]; then
                     || bad "$differ of $n programs print something else against stdlib.klib"
 fi
 
-[ $fails = 0 ] && echo "klib: all checks passed" || { echo "klib: $fails check(s) FAILED:$failed"; exit 1; }
+[ $fails = 0 ] && echo "klib: all checks passed ($passed)" || { echo "klib: $fails check(s) FAILED, $passed passed:$failed"; exit 1; }

@@ -8,3 +8,6 @@ a.out
 *.klib
 
 __pycache__/
+
+# Working notes for whoever is changing the compiler: orientation, rules, history. Local only.
+/docs/

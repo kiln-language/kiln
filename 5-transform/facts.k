@@ -256,6 +256,10 @@ pub struct DepFact { param: long, trait: Sym, slot: long, pos: long }
 pub struct FnFact {
     divergent: bool,
     writes: long,                    // the guard's mask: bit k = writes through parameter k
+    // Where a view the function returns may point (`ConstGuard.vwSummaries`): bit k, at what
+    // parameter k holds; bit 31 + k, into parameter k's own storage; `VIEWS_ALL`, anywhere.
+    views: long,
+    keeps: long,                     // bit k: a view parameter k holds may be kept where a lent parameter reaches
     retKind: Lit, retStruct: Sym,
     firstParam: long, paramCount: long,
     firstDep: long, depCount: long
@@ -363,7 +367,7 @@ pub var gVtableTrait: Vec<Sym> = vec![];
 
 pub noteVtablePair label:str concrete:Sym trait:Sym -> void {
     if (gVtablePairs.has(label)) { return; }
-    gVtablePairs.put(label, gVtableConcrete.len());
+    gVtablePairs.put(keep(label), gVtableConcrete.len());     // the global outlives the caller's text
     gVtableConcrete.push(concrete);
     gVtableTrait.push(trait);
 }
@@ -386,7 +390,7 @@ methods Facts {
         self.params.extend(ps);
         firstDep: long = self.deps.len();
         self.deps.extend(ds);
-        self.fns.push(FnFact { divergent: f.divergent, writes: f.writes,
+        self.fns.push(FnFact { divergent: f.divergent, writes: f.writes, views: f.views, keeps: f.keeps,
                                retKind: f.retKind, retStruct: f.retStruct,
                                firstParam: first, paramCount: ps.len(),
                                firstDep: firstDep, depCount: ds.len() });

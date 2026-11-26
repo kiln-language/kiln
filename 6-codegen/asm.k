@@ -16,6 +16,9 @@ pub var gEmitLibrary: bool = false;
 
 // `--no-rotate`: every loop keeps its jump back to the test at its top (`markRotations`).
 pub var gRotateOff: bool = false;
+// `--no-rotate-join`: a loop whose last block is a join some branch reaches conditionally keeps
+// its jump back (`markRotations`).
+pub var gRotateJoinOff: bool = false;
 
 // `--no-select`: every branch is written as a branch, none as conditional moves (`markSelects`).
 pub var gSelectOff: bool = false;
@@ -26,6 +29,9 @@ pub var gShortCopyOff: bool = false;
 // `--no-set-in-place`: a comparison's truth value and a `~` are formed in rax and copied out
 // (`emitCompare`, `BNot`).
 pub var gSetInPlaceOff: bool = false;
+// `--no-frame-operand`: a right operand in the frame is loaded into rdx before a comparison or
+// `+ - * & | ^` reads it, rather than read where it lies (`rightInPlace`).
+pub var gFrameOperandOff: bool = false;
 // `--trace-ipra`: print what a call to each function may change (`finishMask`).
 pub var gTraceIpra: bool = false;
 
@@ -561,6 +567,7 @@ methods Emitter {
         }
         // Functions and images feed each other (a function reads a global whose image holds a
         // function's address), so both queues drain together.
+        spillReached: bool = false;
         while (work.len() > 0 || images.len() > 0) {
             while (images.len() > 0) {
                 im: long = images.pop();
@@ -616,6 +623,12 @@ methods Emitter {
                 if (in.op == IROp.Call || in.op == IROp.FnAddr) { self.reachName(nameOf(in.name), &byName, &work); continue; }
                 if (in.op == IROp.VtableAddr) { self.reachVtable(nameOf(in.name), &vtImpl, &byName, &work); continue; }
                 if (in.op == IROp.StrLitVal || in.op == IROp.StrAddr) { self.liveStr.set(in.imm, true); continue; }
+                // A bounds check's report calls the `@spill` function (`emitBoundsFail`).
+                if (in.op == IROp.Bounds && gSpillFn != NO_SYM && !spillReached) {
+                    spillReached = true;
+                    self.reachName(nameOf(gSpillFn), &byName, &work);
+                    continue;
+                }
                 if (in.isGlobal && (in.op == IROp.Load || in.op == IROp.Store || in.op == IROp.AddrOf)) {
                     self.reachGlobal(p, nameOf(in.name), &globalAt, &images);
                     continue;
@@ -712,6 +725,11 @@ methods Emitter {
     // allocator and no buffered sink and writes straight to fd 2, because a failed bounds check is
     // exactly when the rest of the program's state stops being worth trusting.
     //
+    // The one thing it does call is the program's `@spill` function, when it has one, before the
+    // report: the bytes the program printed and still holds back for stdout (a pipe or a file)
+    // would otherwise be lost, or land after the report that followed them. That function takes
+    // no lock, and is called once: a check failing inside it reports without calling it again.
+    //
     // Exits 134, the status of a process killed by SIGABRT, so a caller testing for a crash still
     // sees one.
     emitBoundsFail &self -> void {
@@ -720,6 +738,26 @@ methods Emitter {
         if ((self.needSlice & 2) != 0) { self.emitFailReport("__methRangeFail", "__methRngHead", "__methBndMid"); }
         if ((self.needSlice & 4) != 0) { self.emitFailReport("__methOrderFail", "__methStartHead", "__methOrdMid"); }
         if ((self.needSlice & 8) != 0) { self.emitFailReport("__methStartFail", "__methStartHead", "__methBndMid"); }
+
+        // The `@spill` call, once. The report was called from wherever the check failed, so the
+        // stack is aligned here for the call by hand; r12 to r15, which hold the report's numbers,
+        // are callee-saved and come back as they were. Nothing returns to the failed check, so
+        // nothing else needs keeping.
+        if (self.spillHere()) {
+            self.putLine("__methSpill:");
+            self.putLine("cmp byte [rel __methSpilled], 0");
+            self.putLine("jne .spilled");
+            self.putLine("mov byte [rel __methSpilled], 1");
+            self.putLine("push rbp");
+            self.putLine("mov rbp, rsp");
+            self.putLine("and rsp, -16");
+            self.put("call ");
+            self.putLine(fnLabelOf(gSpillFn));
+            self.putLine("mov rsp, rbp");
+            self.putLine("pop rbp");
+            self.putLine(".spilled:");
+            self.putLine("ret");
+        }
 
         // write(2, rsi, rdx)
         self.putLine("__methBndPut:");
@@ -765,8 +803,16 @@ methods Emitter {
         self.putLine("ret");
     }
 
+    // Whether the reports call the `@spill` function: the program has one, and `markReachable`
+    // reached it from a bounds check (here, or defined in another object).
+    spillHere &self -> bool {
+        if (gSpillFn == NO_SYM) { return false; }
+        return self.live.has(nameOf(gSpillFn)) || self.liveExtern.has(nameOf(gSpillFn));
+    }
+
     // `<label>:` with rdi = the index, rsi = the length and rdx:rcx = the {bytes, length} of a
-    // `file:line`, or zero for none. Prints the head, the index, the middle, the length, then
+    // `file:line`, or zero for none. Calls the `@spill` function if there is one (`__methSpill`),
+    // then prints the head, the index, the middle, the length, then
     // ` at <where>` when there is a location, and a newline, and exits 134.
     emitFailReport &self label:str head:str mid:str -> void {
         self.put(label);
@@ -775,6 +821,7 @@ methods Emitter {
         self.putLine("mov r13, rsi");
         self.putLine("mov r14, rdx");
         self.putLine("mov r15, rcx");
+        if (self.spillHere()) { self.putLine("call __methSpill"); }
         self.emitPutText(head);
         self.putLine("mov rdi, r12");
         self.putLine("call __methBndNum");
@@ -977,6 +1024,9 @@ methods Emitter {
             self.putLine("");
         }
         self.putLine("__methBndNl: db 10");
+        // Set once the `@spill` function has been called, so a check failing inside it reports
+        // without calling it again.
+        if (self.spillHere()) { self.putLine("__methSpilled: db 0"); }
     }
     emitTextLabel &self label:str -> void {
         self.put(label);
@@ -1653,14 +1703,18 @@ methods Emitter {
                 || p.code[fn.firstInstr + x].name != p.code[fn.firstInstr + t].name) { continue; }
             // The jump back's own block: where it starts, and whether paths meet there.
             k: long = self.blockLabel(p, fn, i);
+            // Where that block cannot be copied into each way in (one is a conditional branch,
+            // `if` without `else`), the jump back is still turned round: every way in reaches
+            // the turned test, which decides what the jump and the test at the top decided.
             if (k >= 0 && self.joinsAt(p, fn, k, refs)) {
-                if (!self.copiesTail(p, fn, k, i, h, refs, jumps)) { continue; }
-                for j in h..k {
-                    if (p.code[fn.firstInstr + j].op == IROp.Jmp && p.code[fn.firstInstr + j].name == p.code[fn.firstInstr + k].name
-                        && !self.selIn.get(j)) {
-                        self.dupTo.set(j, i);
+                if (self.copiesTail(p, fn, k, i, h, refs, jumps)) {
+                    for j in h..k {
+                        if (p.code[fn.firstInstr + j].op == IROp.Jmp && p.code[fn.firstInstr + j].name == p.code[fn.firstInstr + k].name
+                            && !self.selIn.get(j)) {
+                            self.dupTo.set(j, i);
+                        }
                     }
-                }
+                } else if (gRotateJoinOff) { continue; }
             }
             if (self.rotLabel.get(t) == NO_SYM) {
                 self.coldSeq = self.coldSeq + 1;
@@ -2548,6 +2602,16 @@ methods Emitter {
         return self.numText(in.bImm);
     }
 
+    // Whether operand `b` of an integer comparison or `+ - * & | ^` may be read where it lies in
+    // the frame (`cmp rbx, [rbp - 64]`) instead of through rdx. A temp the allocator left in the
+    // frame has a slot of its own that every write of it stores to and nothing else writes, so
+    // the slot holds its value wherever it is read. Not one computed again where it is read (no
+    // slot), one with a register and a home (the home may be behind), or a float.
+    rightInPlace &self in:Instr -> bool {
+        return !gFrameOperandOff && !in.bIsImm && in.b != NO_TEMP && !isFloat(in.kind)
+            && self.ra.regOf(in.b) == SPILLED && !self.isRemat(in.b);
+    }
+
     // A small immediate as text, built once and kept. This compiler's own output has some
     // twenty-four thousand immediate operands, almost all between -128 and 1024, and calling
     // `format` and interning the result for every one of them is wasted work.
@@ -2869,6 +2933,7 @@ methods Emitter {
         if (in.op == IROp.Asm) { self.emitAsmBlock(p, fn, in); return; }
         if (in.op == IROp.Atomic) { self.emitAtomic(p, in); return; }
         if (in.op == IROp.MemCopy) { self.emitMemCopy(p, fn, in); return; }
+        if (in.op == IROp.Lea) { self.emitLea(in); return; }
         if (in.op == IROp.Call) { self.emitCall(p, in); return; }
         if (in.op == IROp.CallIndirect) { self.emitCallIndirect(p, in); return; }
         if (in.op == IROp.FnAddr) {
@@ -3028,7 +3093,8 @@ methods Emitter {
             self.putLine(l);
             return;
         }
-        r: str = self.rightOperand(in, SCRATCH2);
+        r: str = "";
+        if (self.rightInPlace(in)) { r = self.place(in.b); } else { r = self.rightOperand(in, SCRATCH2); }
         self.put("cmp ");
         self.put(l);
         self.put(", ");
@@ -3217,6 +3283,7 @@ methods Emitter {
         if (!in.bIsImm && in.b != NO_TEMP && in.b != in.a && self.ra.regOf(in.b) == self.ra.regOf(in.dst)) { return false; }
         if (in.op == IROp.Const) { return true; }
         if (in.op == IROp.Mov) { return self.isRemat(in.a) || self.selInReg(in.a); }
+        if (in.op == IROp.Lea) { return (in.a == NO_TEMP || self.selInReg(in.a)) && self.selInReg(in.x); }
         if (!self.selInReg(in.a)) { return false; }
         if (in.bIsImm) { return in.bImm != 0 - 2147483648; }
         if (in.op == IROp.Shl || in.op == IROp.Shr) { return false; }
@@ -3230,8 +3297,11 @@ methods Emitter {
 
     // Whether the comparison the region writes leaves rax alone, which holds the early arm's
     // value by then: its operands in registers, and no division (whose result is formed there).
+    // A right operand may be the value `rax` holds (`RegAlloc.spillScratch`), which the early arm
+    // would destroy.
     selCompareSparesRax &self p:IRProgram fn:IRFunc r:SelRegion -> bool {
         br: Instr = p.code.get(fn.firstInstr + r.br);
+        if (br.op == IROp.Jcc && !br.bIsImm && self.ra.regOf(br.b) == REG_RAX) { return false; }
         if (r.start == r.br) { return self.selInReg(br.a); }
         w: Instr = p.code.get(fn.firstInstr + r.start);
         if (w.op == IROp.BAnd) { return self.selInReg(w.a); }
@@ -3339,6 +3409,16 @@ methods Emitter {
                 self.put(", ");
                 self.putLine(regName64(self.ra.regOf(in.a)));
             }
+            return;
+        }
+        if (o == IROp.Lea) {
+            base: str = "";
+            if (in.a != NO_TEMP) { base = regName64(self.ra.regOf(in.a)); }
+            self.put("lea ");
+            self.put(rn);
+            self.put(", [");
+            self.putLeaSum(base, regName64(self.ra.regOf(in.x)), in.scale, in.imm);
+            self.putLine("]");
             return;
         }
         if (selFlagFree(in)) {
@@ -4281,7 +4361,8 @@ methods Emitter {
     emitCompare &self in:Instr -> void {
         if (isFloat(in.kind)) { self.emitFloatCompare(in); return; }
         l: str = self.intoScratch(in.a, SCRATCH);
-        r: str = self.rightOperand(in, SCRATCH2);
+        r: str = "";
+        if (self.rightInPlace(in)) { r = self.place(in.b); } else { r = self.rightOperand(in, SCRATCH2); }
         // Into the destination's own register: its low byte set, the rest cleared before the
         // comparison where it holds no operand, else widened after.
         d: long = self.ra.regOf(in.dst);
@@ -4317,6 +4398,7 @@ methods Emitter {
         self.put(setSuffix(in.op, typeInfo(in.kind).unsignedNum));
         self.putLine(" al");
         self.putLine("movzx eax, al");
+        if (d == REG_RAX) { return; }
         self.put("mov ");
         self.put(self.place(in.dst));
         self.putLine(", rax");
@@ -4667,7 +4749,12 @@ methods Emitter {
         lw: long = SCRATCH;
         if (bRax) { lw = SCRATCH2; }
         l: str = self.intoScratch(in.a, lw);
-        r: str = self.rightOperand(in, SCRATCH2);
+        // A right operand in the frame is read where it lies, except as the second term of a sum
+        // written as one `lea` (`threeOperand`), which takes registers only.
+        r: str = "";
+        dr: long = self.ra.regOf(in.dst);
+        if (self.rightInPlace(in) && !(in.op == IROp.Add && dr != SPILLED && !(regName64(dr) == l))) { r = self.place(in.b); }
+        else { r = self.rightOperand(in, SCRATCH2); }
         // Straight into the destination register where there is one and it holds nothing this
         // instruction has still to read: two instructions rather than three, and one when the
         // left operand is already sitting there, which after promotion is the common shape of
@@ -4777,6 +4864,47 @@ methods Emitter {
         self.putLine(", rax");
     }
 
+    // `dst = a + x*scale + imm` (`IROp.Lea`): one `lea` into the destination's register, or into
+    // `rax` and then its slot. An operand in the frame is fetched into a scratch register first.
+    // An operand may be the one value `rax` holds (`markRaxPairs`): the other is then fetched into
+    // `rdx`, and a destination in the frame is computed in `rdx` too.
+    emitLea &self in:Instr -> void {
+        idxRax: bool = self.ra.regOf(in.x) == REG_RAX;
+        base: str = "";
+        if (in.a != NO_TEMP) {
+            if (idxRax) { base = self.intoScratch(in.a, SCRATCH2); } else { base = self.intoScratch(in.a, SCRATCH); }
+        }
+        idx: str = "rax";
+        if (!idxRax) { idx = self.intoScratch(in.x, SCRATCH2); }
+        d: long = self.ra.regOf(in.dst);
+        inFrame: bool = d == SPILLED || isXmm(d);
+        dn: str = "rdx";
+        if (!inFrame) { dn = regName64(d); }
+        self.put("lea ");
+        self.put(dn);
+        self.put(", [");
+        self.putLeaSum(base, idx, in.scale, in.imm);
+        self.putLine("]");
+        if (inFrame) {
+            self.put("mov ");
+            self.put(self.place(in.dst));
+            self.putLine(", rdx");
+        }
+    }
+    putLeaSum &self base:str idx:str scale:long disp:long -> void {
+        if (base.len > 0) {
+            self.put(base);
+            self.put(" + ");
+        }
+        self.put(idx);
+        if (scale > 1) {
+            self.put("*");
+            self.putNum(scale);
+        }
+        if (disp > 0) { self.put(" + "); self.putNum(disp); }
+        else if (disp < 0) { self.put(" - "); self.putNum(0 - disp); }
+    }
+
     // `dst = l op r` written as one instruction, when there is a form for it; false when not.
     threeOperand &self in:Instr dn:str l:str r:str -> bool {
         if (in.op == IROp.Add || (in.op == IROp.Sub && in.bIsImm)) {
@@ -4854,6 +4982,37 @@ methods Emitter {
             self.putNum(in.bImm % 64);
             self.putLine("");
             self.canonicalize(d, in.kind);
+            return;
+        }
+        // A count the allocator left in `rcx` (`hint`) is read where it is, with nothing in `rcx`
+        // to save first and put back after; into a register destination other than `rcx`, the
+        // value is shifted where it lands.
+        if (!gHintsOff && !in.bIsImm && !self.isRemat(in.b) && self.ra.regOf(in.b) == REG_RCX) {
+            if (d != SPILLED && d != REG_RCX && !isXmm(d)) {
+                dn: str = regName64(d);
+                if (!(dn == l)) {
+                    self.put("mov ");
+                    self.put(dn);
+                    self.put(", ");
+                    self.putLine(l);
+                }
+                self.put(mn);
+                self.put(" ");
+                self.put(dn);
+                self.putLine(", cl");
+                self.canonicalize(d, in.kind);
+                return;
+            }
+            if (!(l == "rax")) {
+                self.put("mov rax, ");
+                self.putLine(l);
+            }
+            self.put(mn);
+            self.putLine(" rax, cl");
+            self.canonicalize(SCRATCH, in.kind);
+            self.put("mov ");
+            self.put(self.place(in.dst));
+            self.putLine(", rax");
             return;
         }
         if (!(l == "rax")) {
@@ -5237,14 +5396,14 @@ local MAX_SEL_BOTH: long = 4;
 local selOp o:IROp -> bool {
     return o == IROp.Nop || o == IROp.Const || o == IROp.Mov || o == IROp.Add || o == IROp.Sub
         || o == IROp.Mul || o == IROp.BAnd || o == IROp.BOr || o == IROp.BXor || o == IROp.Shl
-        || o == IROp.Shr;
+        || o == IROp.Shr || o == IROp.Lea;
 }
 
 // What `selCompute` writes without touching the flags: a constant or a copy (`mov`), and a sum, a
 // difference with a constant, a product by 3, 5 or 9 or a shift left by 1 to 3 (`lea`).
 local selFlagFree in:Instr -> bool {
     o: IROp = in.op;
-    if (o == IROp.Const || o == IROp.Mov) { return true; }
+    if (o == IROp.Const || o == IROp.Mov || o == IROp.Lea) { return true; }
     if (o == IROp.Add) { return !in.bIsImm || in.bImm != 0 - 2147483648; }
     if (o == IROp.Sub) { return in.bIsImm && in.bImm != 0 - 2147483648; }
     if (o == IROp.Mul) { return in.bIsImm && (in.bImm == 3 || in.bImm == 5 || in.bImm == 9); }
@@ -5253,8 +5412,9 @@ local selFlagFree in:Instr -> bool {
 }
 
 // A general register a value of its own may be written to and read from: not rax, which the
-// emitter computes in.
-local selReg r:long -> bool { return r != SPILLED && r != REG_RAX && !isXmm(r); }
+// emitter computes in, nor rdx, the other scratch, which holds a value only between its write and
+// its read (`RegAlloc.spillScratch`).
+local selReg r:long -> bool { return r != SPILLED && r != REG_RAX && r != REG_RDX && !isXmm(r); }
 
 // The instructions of `lo..hi` that are not deleted: how many, the only one (-1: not exactly one),
 // the last, and whether all of them leave the flags alone.
@@ -5314,7 +5474,7 @@ local repeatable in:Instr -> bool {
     return o == IROp.Const || o == IROp.Mov || o == IROp.Store || o == IROp.Add || o == IROp.Sub
         || o == IROp.Mul || o == IROp.BAnd || o == IROp.BOr || o == IROp.BXor || o == IROp.Shl
         || o == IROp.Shr || o == IROp.BNot || isCompare(o) || o == IROp.Convert || o == IROp.PtrLoad
-        || o == IROp.PtrStore || o == IROp.AddrOf || o == IROp.StrAddr || o == IROp.AggSlot;
+        || o == IROp.Lea || o == IROp.PtrStore || o == IROp.AddrOf || o == IROp.StrAddr || o == IROp.AggSlot;
 }
 
 // k when v is 2^k (k >= 1), else -1.
@@ -5328,17 +5488,6 @@ local exactLog2 v:long -> long {
 // An integer operation whose operands may be swapped.
 local isCommutative op:IROp -> bool {
     return op == IROp.Add || op == IROp.Mul || op == IROp.BAnd || op == IROp.BOr || op == IROp.BXor;
-}
-
-// Whether a value of this type passes as a float (1 an `f64`, 2 an `f32`) or not (0): a backed
-// enum or distinct type by what it is stored as, a borrow of a float scalar as the float.
-pub floatClass k0:Lit s:Sym -> long {
-    k: Lit = k0;
-    if (k == Lit.Struct && s != NO_SYM && namedScalar(k, s)) { k = namedScalarBacking(s); }
-    if (k == Lit.Ref && s != NO_SYM && namesScalar(nameOf(s))) { k = scalarNamed(nameOf(s)); }
-    if (k == Lit.Double) { return 1; }
-    if (k == Lit.Float) { return 2; }
-    return 0;
 }
 
 // ─── names ───────────────────────────────────────────────────────────────────

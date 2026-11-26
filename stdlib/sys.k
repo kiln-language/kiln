@@ -57,11 +57,12 @@ pub unsafe syscall6 nr:Syscall a:long b:long c:long d:long e:long f:long -> long
 // hold it, mid-print), can write them out before its message. Raw addresses rather than a
 // function to call: a function whose address is taken could be reached from any indirect call,
 // and this one writes stdout by name. All 0 until io sets them, at compile time, and once stdout
-// is redirected, which makes `spillStdoutNow` nothing.
+// is redirected, which makes `spillStdoutNow` nothing. `@spill`: the compiler's own failed checks
+// (an index out of range) call it before their report too.
 pub var gStdoutBufAt: long = 0;      // the buffer's first byte
 pub var gStdoutPosAt: long = 0;      // the long counting how many bytes it holds
 pub var gStdoutCap: long = 0;
-pub spillStdoutNow -> void {
+@spill pub spillStdoutNow -> void {
     unsafe {
         if (gStdoutPosAt == 0) { return; }
         n: long = *(gStdoutPosAt as *long);

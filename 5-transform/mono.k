@@ -706,7 +706,7 @@ methods Mono {
         first: long = gLaterKeys.len();
         keys: Vec<str> = self.subst.keys();
         for k in 0..keys.len() {
-            gLaterKeys.push(keys.get(k));
+            gLaterKeys.push(keep(keys.get(k)));         // the global outlives `subst`
             gLaterVals.push(self.subst.get(keys.get(k)));
         }
         gLaterAt.put(at, gLater.len());

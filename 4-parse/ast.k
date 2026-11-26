@@ -309,6 +309,10 @@ pub FN_PANIC: long = 8;
 // `@recover`: what a `recover` statement calls to link its record into this thread's chain and
 // to unlink it again (`rec:long -> long`, answering the record it replaced).
 pub FN_RECOVER: long = 16;
+// `@spill`: what the code the compiler writes for a failed bounds check calls before its report,
+// to write out what the program holds back for stdout (`name -> void`). It must take no lock: the
+// failing thread may hold one.
+pub FN_SPILL: long = 32;
 // `builtin name params -> T;`: a declaration whose body the compiler provides. Which primitive is
 // in the bits above `BUILTIN_SHIFT`, one of the `BI_` kinds.
 pub BUILTIN_SHIFT: long = 8;

@@ -284,7 +284,9 @@ pub var gBodiesRead: long = 0;              // bodies read because something nee
 pub noteLazyBody fi:long b:LazyBody -> void {
     while (gLazyAt.len() <= fi) { gLazyAt.push(-1); }
     gLazyAt.set(fi, gLazyBodies.len());
-    gLazyBodies.push(b);
+    // The global outlives the caller's text, so it keeps the interner's copy of the origin.
+    gLazyBodies.push(LazyBody { at: b.at, len: b.len, symBase: b.symBase, symCount: b.symCount, fnBase: b.fnBase,
+                                origin: keep(b.origin) });
 }
 
 // Reads function `fi`'s body into the tree if it is not there yet, and returns the function as it

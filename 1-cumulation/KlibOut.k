@@ -40,7 +40,7 @@ local fnFactHere inout a:Ast inout ck:Checker inout cg:ConstGuard at:long -> lon
         p: VarDeclNode = a.paramAt(f, k);
         ps.push(ParamFact { conv: p.conv, kind: p.kind });
     }
-    return gOutFacts.addFn(FnFact { divergent: ck.isDivergingFn(f.name), writes: cg.writesOf(at),
+    return gOutFacts.addFn(FnFact { divergent: ck.isDivergingFn(f.name), writes: cg.writesOf(at), views: cg.viewsOf(at), keeps: cg.keepsOf(at),
                                     retKind: f.returnKind, retStruct: f.returnStruct,
                                     firstParam: 0, paramCount: 0, firstDep: 0, depCount: 0 },
                            ps, cg.depsOf(at));

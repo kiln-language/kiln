@@ -83,7 +83,13 @@ pub enum IROp: int {
     // `memcpy`: from address `b` to address `a`, as many bytes as its one argument says, the two
     // ranges apart. It writes the destination range and nothing else, so that is all it ends
     // (`flow.k`).
-    MemCopy
+    MemCopy,
+
+    // `dst = a + x*scale + imm`, a sum of up to three terms (`a` may be NO_TEMP) as one `lea`.
+    // Made by the scaler from the arithmetic every analysis has finished with (`Scaler.foldArith`),
+    // so only the passes after it, the allocator and the emitter meet one. Integers a full word
+    // wide only: the width `lea` adds in.
+    Lea
 }
 
 // What a `Bounds` check holds, in its `imm`, and so what its report says when it fails. An index
@@ -291,6 +297,24 @@ pub literalLength text:str -> long {
         i = i + 1;
     }
     return n;
+}
+
+// Byte `k` of a string literal as the emitter writes it (`asm.k` `emitBytes`, a backslash escape
+// one byte), or -1 past its end.
+pub literalByte text:str k:long -> long {
+    n: long = 0;
+    i: long = 0;
+    while (i < text.len) {
+        c: long = charAt(text, i);
+        if (c == 92 && i + 1 < text.len) {
+            i = i + 1;
+            c = escapeByte(charAt(text, i));
+        }
+        if (n == k) { return c & 255; }
+        n = n + 1;
+        i = i + 1;
+    }
+    return -1;
 }
 
 // One function's lowered body.

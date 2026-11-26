@@ -2,8 +2,8 @@
 # A differential check for the LLVM back end: each program is compiled down BOTH paths and the
 # exit codes are compared, with the native path as the oracle. The programs are small ones written
 # inline (scalars, structs, arrays, pointers, fn values, floats, one `asm` syscall, narrow `asm`
-# outputs and ones into globals, the atomics, `memcpy`); none needs the standard library's
-# runtime, so clang links each module on its own with `-nostdlib`.
+# outputs and ones into globals, the atomics, `memcpy`, a bounds failure's `@spill` call); none
+# needs the standard library's runtime, so clang links each module on its own with `-nostdlib`.
 cd "$(dirname "$0")/.."
 # The compiler is built here rather than passed in, because WSL clears /tmp between invocations.
 ./bootstrap/kilnc main.k -o /tmp/lvc.s > /dev/null
@@ -24,7 +24,7 @@ check () {   # check <name> <source>
         printf "  %-22s native REFUSED: %s\n" "$name" "$(sed "s|.*/p.k:|p.k:|" "$D/err" | head -c 80)"; fail=$((fail+1)); return
     fi
     nasm -O1 -felf64 "$D/p.s" -o "$D/p.o" 2>/dev/null && ld "$D/p.o" -o "$D/native" 2>/dev/null
-    "$D/native"; local nrc=$?
+    "$D/native" 2>/dev/null; local nrc=$?
 
     # llvm
     if ! "$C" "$D/p.k" --emit=llvm -o /dev/null > "$D/p.ll" 2>"$D/lerr"; then
@@ -37,10 +37,12 @@ check () {   # check <name> <source>
     if ! clang -O2 -w -nostdlib -static -no-pie "$D/p.ll" -o "$D/llvm" 2>"$D/cerr"; then
         printf "  %-22s clang failed: %s\n" "$name" "$(head -c 90 "$D/cerr")"; fail=$((fail+1)); return
     fi
-    "$D/llvm"; local lrc=$?
+    "$D/llvm" 2>/dev/null; local lrc=$?
 
     if [ "$nrc" = "$lrc" ]; then
-        printf "  %-22s native=%-4s llvm=%-4s  agree\n" "$name" "$nrc" "$lrc"; pass=$((pass+1))
+        # An agreeing case prints only with VERBOSE=1; every problem always prints.
+        [ "${VERBOSE:-0}" = 1 ] && printf "  %-22s native=%-4s llvm=%-4s  agree\n" "$name" "$nrc" "$lrc"
+        pass=$((pass+1))
     else
         printf "  %-22s native=%-4s llvm=%-4s  DISAGREE\n" "$name" "$nrc" "$lrc"; fail=$((fail+1))
     fi
@@ -157,6 +159,21 @@ main -> int { a: [long; 4] = [1, 2, 3, 4]; b: [long; 4] = [0, 0, 0, 0];
     unsafe { memcpy(&b[0] as long, &a[0] as long, 0); memcpy(&b[0] as long, &a[1] as long, 8);
         memcpy(&b[1] as long, &a[0] as long, 24); }
     return (b[0] * 1000 + b[1] * 100 + b[2] * 10 + b[3]) as int; }'
+
+# A failed bounds check calls the program's `@spill` function before its report (exit 77 here,
+# not the report's 134), and only once: a check failing inside it reports with 134.
+check spill_bounds    'pub unsafe builtin syscall nr:long args:...long -> long;
+var gHeld: long = 0;
+@spill keep -> void { unsafe { syscall(60, 70 + gHeld); } }
+main -> int { a: [long; 4]; for i in 0..4 { a[i] = i; } gHeld = 7;
+    s: long = 0; for i in 0..5 { s = s + a[i]; } return s as int; }'
+check spill_reenter   'pub unsafe builtin syscall nr:long args:...long -> long;
+var gCalls: long = 0;
+var gTable: [long; 3];
+@spill keep -> void { gCalls = gCalls + 1; if (gCalls > 1) { unsafe { syscall(60, 99); } }
+    s: long = 0; for i in 0..gCalls + 3 { s = s + gTable[i]; } gTable[0] = s; }
+main -> int { a: [long; 4]; for i in 0..4 { a[i] = i; }
+    s: long = 0; for i in 0..5 { s = s + a[i]; } return s as int; }'
 
 echo
 echo "  agree: $pass   problems: $fail"

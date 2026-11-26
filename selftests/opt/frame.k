@@ -5,7 +5,10 @@
 // added to the first where it arrives (in `rax`). `fib` is the same with its second call a loop
 // (`opt/accumulate`): the test copied ahead of the loop is still made before anything is saved.
 // `pick` has no frame at all, and its parameters reach their registers by moves between
-// registers, none through a slot. `keep` holds an array, so it keeps its frame.
+// registers, none through a slot. `keep` holds an array, so it keeps its frame. Built without
+// copying a function's body into its own calls (`selfInline`), which would give `both` and `fib`
+// more registers to save and fewer calls, and is held to its own shape in `opt/self_copy`.
+// flags: --no-self-inline
 // asm-first: frame::both cmp rax, 2
 // asm-has: frame::both .GX
 // asm-lacks: frame::both rbp
